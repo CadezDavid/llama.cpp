@@ -28,6 +28,8 @@ layout (binding = 1) readonly buffer K_PACKED_Q5_1 { block_q5_1_packed16 data[];
 layout (binding = 2) readonly buffer V_PACKED_Q5_1 { block_q5_1_packed16 data[]; } v_packed_q5_1;
 layout (binding = 1) readonly buffer K_PACKED_Q8_0 { block_q8_0_packed16 data[]; } k_packed_q8_0;
 layout (binding = 2) readonly buffer V_PACKED_Q8_0 { block_q8_0_packed16 data[]; } v_packed_q8_0;
+layout (binding = 1) readonly buffer K_PACKED_BF16 { u16vec4 data[]; } k_packed_bf16;
+layout (binding = 2) readonly buffer V_PACKED_BF16 { u16vec4 data[]; } v_packed_bf16;
 #endif  // !DATA_A_TURBO3_0
 
 // TurboQuant3 K/V (50-byte blocks) — used for asymmetric K=q8_0 V=turbo3
@@ -180,6 +182,9 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
     }
 }
 #else
+#define FA_DEQUANT4_BF16(BUF) \
+    return FLOAT_TYPEV4(bf16_to_fp32(uvec4(BUF.data[(a_offset + ib) / 4])));
+
 FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
     if (binding_idx == BINDING_IDX_K) {
         switch (FaTypeK) {
@@ -189,6 +194,7 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
             case FA_TYPE_Q5_0: FA_DEQUANT4_Q5_0(k_packed_q5_0)
             case FA_TYPE_Q5_1: FA_DEQUANT4_Q5_1(k_packed_q5_1)
             case FA_TYPE_Q8_0: FA_DEQUANT4_Q8_0(k_packed_q8_0)
+            case FA_TYPE_BF16: FA_DEQUANT4_BF16(k_packed_bf16)
             case 42u:          FA_DEQUANT4_TURBO2_0(k_packed_turbo2_0)  // GGML_TYPE_TURBO2_0
             case 43u:          FA_DEQUANT4_TURBO3_0(k_packed_turbo3_0)  // GGML_TYPE_TURBO3_0
             case 44u:          FA_DEQUANT4_TURBO4_0(k_packed_turbo4_0)  // GGML_TYPE_TURBO4_0
@@ -201,6 +207,7 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
             case FA_TYPE_Q5_0: FA_DEQUANT4_Q5_0(v_packed_q5_0)
             case FA_TYPE_Q5_1: FA_DEQUANT4_Q5_1(v_packed_q5_1)
             case FA_TYPE_Q8_0: FA_DEQUANT4_Q8_0(v_packed_q8_0)
+            case FA_TYPE_BF16: FA_DEQUANT4_BF16(v_packed_bf16)
             case 42u:          FA_DEQUANT4_TURBO2_0(v_packed_turbo2_0)  // GGML_TYPE_TURBO2_0
             case 43u:          FA_DEQUANT4_TURBO3_0(v_packed_turbo3_0)  // GGML_TYPE_TURBO3_0
             case 44u:          FA_DEQUANT4_TURBO4_0(v_packed_turbo4_0)  // GGML_TYPE_TURBO4_0
