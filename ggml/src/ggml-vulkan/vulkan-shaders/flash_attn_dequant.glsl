@@ -195,9 +195,9 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
             case FA_TYPE_Q5_1: FA_DEQUANT4_Q5_1(k_packed_q5_1)
             case FA_TYPE_Q8_0: FA_DEQUANT4_Q8_0(k_packed_q8_0)
             case FA_TYPE_BF16: FA_DEQUANT4_BF16(k_packed_bf16)
-            case 42u:          FA_DEQUANT4_TURBO2_0(k_packed_turbo2_0)  // GGML_TYPE_TURBO2_0
-            case 43u:          FA_DEQUANT4_TURBO3_0(k_packed_turbo3_0)  // GGML_TYPE_TURBO3_0
-            case 44u:          FA_DEQUANT4_TURBO4_0(k_packed_turbo4_0)  // GGML_TYPE_TURBO4_0
+            case FA_TYPE_TURBO2_0: FA_DEQUANT4_TURBO2_0(k_packed_turbo2_0)
+            case FA_TYPE_TURBO3_0: FA_DEQUANT4_TURBO3_0(k_packed_turbo3_0)
+            case FA_TYPE_TURBO4_0: FA_DEQUANT4_TURBO4_0(k_packed_turbo4_0)
         }
     } else {
         switch (FaTypeV) {
@@ -208,9 +208,9 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
             case FA_TYPE_Q5_1: FA_DEQUANT4_Q5_1(v_packed_q5_1)
             case FA_TYPE_Q8_0: FA_DEQUANT4_Q8_0(v_packed_q8_0)
             case FA_TYPE_BF16: FA_DEQUANT4_BF16(v_packed_bf16)
-            case 42u:          FA_DEQUANT4_TURBO2_0(v_packed_turbo2_0)  // GGML_TYPE_TURBO2_0
-            case 43u:          FA_DEQUANT4_TURBO3_0(v_packed_turbo3_0)  // GGML_TYPE_TURBO3_0
-            case 44u:          FA_DEQUANT4_TURBO4_0(v_packed_turbo4_0)  // GGML_TYPE_TURBO4_0
+            case FA_TYPE_TURBO2_0: FA_DEQUANT4_TURBO2_0(v_packed_turbo2_0)
+            case FA_TYPE_TURBO3_0: FA_DEQUANT4_TURBO3_0(v_packed_turbo3_0)
+            case FA_TYPE_TURBO4_0: FA_DEQUANT4_TURBO4_0(v_packed_turbo4_0)
         }
     }
     return FLOAT_TYPEV4(0);

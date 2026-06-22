@@ -163,7 +163,11 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
-    const uint32_t n_layer = hparams.n_layer_all;
+    // #24060/MTP fix: iterate ALL layers (incl. nextn) so an all-nextn draft
+    // (gemma4-assistant: n_layer()==0) registers its KV layers; has_kv() still
+    // gates per-layer. Upstream loops the full hparams.n_layer member here.
+    const uint32_t n_layer    = hparams.n_layer_all;
+    const uint32_t n_layer_kv = hparams.n_layer_kv();
 
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
     struct ggml_backend_buft_comparator {
@@ -179,7 +183,7 @@ llama_kv_cache::llama_kv_cache(
         if (it == ctx_map.end()) {
             ggml_init_params params = {
                 // +3 for turbo rotation matrices (turbo_rotation + turbo_rotation_inv + turbo_innerq_scale_inv)
-                /*.mem_size   =*/ size_t((2u*(1 + n_stream)*n_layer + 3)*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t((2u*(1 + n_stream)*n_layer_kv + 3)*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -499,6 +503,8 @@ llama_kv_cache::llama_kv_cache(
     }
 
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+    // KV-cache sharing (MTP draft): a shared cache inherits head dims and the
+    // resolved rotation policy from its parent so draft and target agree.
     if (other) {
         n_embd_head_k_all = other->n_embd_head_k_all;
         n_embd_head_v_all = other->n_embd_head_v_all;
@@ -506,18 +512,44 @@ llama_kv_cache::llama_kv_cache(
         attn_rot_k = other->attn_rot_k;
         attn_rot_v = other->attn_rot_v;
     } else {
-        // TurboQuant: attention rotation is OFF by default on this fork.
-        // Enable per side with LLAMA_ATTN_ROT_K_OVERRIDE=1 and/or
-        // LLAMA_ATTN_ROT_V_OVERRIDE=1 after validating a model+KV combo.
+        // TurboQuant: master's #21038 attention rotation is OFF by default on this
+        // fork. Enable per-side via LLAMA_ATTN_ROT_K_OVERRIDE=1 and/or
+        // LLAMA_ATTN_ROT_V_OVERRIDE=1 if your specific model+KV combo benefits.
+        //
+        // Why default OFF: empirical PPL+KLD testing on 7 model families
+        // (gemma-4 26B-A4B/31B/E2B, Qwen2.5-7B, Qwen3.5-2B, Mistral-Small-24B,
+        // phi-4, on q8/turbo4 KV) showed the optimal rotation policy is highly
+        // model-and-quant specific:
+        //
+        //   • gemma-4 31B Q8 q8/turbo4: V-only rotation gives -43% PPL (huge win).
+        //   • gemma-4 26B-A4B Q8 q8/turbo4: V-only gives -3.9%.
+        //   • gemma-4 E2B Q4_K_L q8/turbo4: V-only HURTS by +6.7%.
+        //   • phi-4 Q8 q8/turbo4: V-side rotation crashes (graph hash overflow).
+        //   • Qwen2.5/3.5/Mistral: rotation effect is within standard error.
+        //
+        // No single default is correct everywhere, including within the same
+        // architecture family (gemma-4 above shows three distinct optima across
+        // three sizes). Per-arch heuristics in code would silently regress users
+        // on variants we haven't tested. Default OFF + per-side env knobs lets
+        // each user tune for their specific config; documented findings in the
+        // README guide the choice.
+        //
+        // Reported by @erazortt (TheTom/turboquant_plus#88).
+        //
+        // LLAMA_ATTN_ROT_DISABLE retained as a hard lock-out: =1 forces rotation
+        // off on both sides and blocks the per-side overrides below.
         const char * LLAMA_ATTN_ROT_DISABLE = getenv("LLAMA_ATTN_ROT_DISABLE");
         const bool attn_rot_disable = LLAMA_ATTN_ROT_DISABLE ? (atoi(LLAMA_ATTN_ROT_DISABLE) != 0) : false;
-        if (attn_rot_disable) {
-            LLAMA_LOG_WARN("%s: attention rotation force disabled (LLAMA_ATTN_ROT_DISABLE)\n", __func__);
-        }
 
+        // Default: rotation OFF on both sides (safe across all tested model families).
+        // Override per side via env vars below.
         attn_rot_k = false;
         attn_rot_v = false;
 
+        // Per-side overrides. Set LLAMA_ATTN_ROT_K_OVERRIDE=1 / LLAMA_ATTN_ROT_V_OVERRIDE=1
+        // to enable rotation. The cache type and head-dim alignment guards below
+        // still apply: rotation only takes effect on quantized types with
+        // head_dim % 64 == 0 (master's #21038 requirements).
         const char * ROT_K_OV = getenv("LLAMA_ATTN_ROT_K_OVERRIDE");
         if (ROT_K_OV && atoi(ROT_K_OV) != 0 && !attn_rot_disable) {
             attn_rot_k =
@@ -525,18 +557,21 @@ llama_kv_cache::llama_kv_cache(
                 ggml_is_quantized(type_k) &&
                 hparams.n_embd_head_k() % 64 == 0;
         }
-
-        // always create Hadamard rotation tensors for DeepSeek V3.2 DSA lightning indexer
-        if (model.arch == LLM_ARCH_DEEPSEEK32 && hparams.n_embd_head_k_full == hparams.indexer_head_size) {
-            attn_rot_k = true;
-        }
-
         const char * ROT_V_OV = getenv("LLAMA_ATTN_ROT_V_OVERRIDE");
         if (ROT_V_OV && atoi(ROT_V_OV) != 0 && !attn_rot_disable) {
             attn_rot_v =
                 n_embd_head_v_all > 0 &&
                 ggml_is_quantized(type_v) &&
                 hparams.n_embd_head_v() % 64 == 0;
+        }
+
+        // always create Hadamard rotation tensors for DeepSeek V3.2 DSA lightning
+        // indexer: this is a functional requirement for the model, not optional
+        // tuning, so it overrides the default-off policy (still respects the hard
+        // LLAMA_ATTN_ROT_DISABLE lock-out).
+        if (!attn_rot_disable && model.arch == LLM_ARCH_DEEPSEEK32 &&
+            hparams.n_embd_head_k_full == hparams.indexer_head_size) {
+            attn_rot_k = true;
         }
     }
 
