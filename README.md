@@ -2,6 +2,8 @@
 
 > Production-grade KV-cache and weight quantization for llama.cpp, with cross-backend kernel support for Apple Silicon, NVIDIA CUDA, AMD ROCm, and Vulkan.
 
+![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
+
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Status: WIP](https://img.shields.io/badge/status-work--in--progress-yellow.svg)](https://github.com/TheTom/llama-cpp-turboquant)
 [![Codec papers](https://img.shields.io/badge/codec-turboquant__plus-orange.svg)](https://github.com/TheTom/turboquant_plus)
@@ -193,7 +195,7 @@ MIT, same as upstream llama.cpp.
 
 Getting started with llama.cpp is straightforward. Here are several ways to install it on your machine:
 
-- Install `llama.cpp` using [brew, nix or winget](docs/install.md)
+- Install `llama.cpp` using [brew, nix, winget, or conda-forge](docs/install.md)
 - Run with Docker - see our [Docker documentation](docs/docker.md)
 - Download pre-built binaries from the [releases page](https://github.com/ggml-org/llama.cpp/releases)
 - Build from source by cloning this repository - check out [our build guide](docs/build.md)
