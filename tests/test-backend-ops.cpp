@@ -6744,6 +6744,74 @@ struct test_set_rows_turbo3 : public test_case {
     }
 };
 
+// Test SET_ROWS with turbo4 destination, then dequantize and compare.
+// Mirrors test_set_rows_turbo3 for the 4-bit PolarQuant type: f32 -> WHT ->
+// 16-centroid quantize -> turbo4, then turbo4 -> f32, compared against the
+// CPU backend. Because `out` covers all ne1 rows, the rows NOT written by
+// SET_ROWS pass through from the CPU-quantized initial upload; a backend
+// whose shader block stride disagrees with the 66-byte C layout dequantizes
+// those rows to garbage, so this also catches cross-backend layout drift.
+struct test_set_rows_turbo4 : public test_case {
+    const ggml_type type_idx;
+    const int64_t ne0; // head dim (must be multiple of 128)
+    const int64_t ne1; // rows in dst
+    const int r;       // rows to write
+
+    std::string vars() override {
+        return VARS_TO_STR4(type_idx, ne0, ne1, r);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SET_ROWS_TURBO4";
+    }
+
+    test_set_rows_turbo4(ggml_type type_idx = GGML_TYPE_I32,
+            int64_t ne0 = 128, int64_t ne1 = 8, int r = 4)
+        : type_idx(type_idx), ne0(ne0), ne1(ne1), r(r) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        // dst: the turbo4 KV cache buffer
+        ggml_tensor * dst = ggml_new_tensor_2d(ctx, GGML_TYPE_TURBO4_0, ne0, ne1);
+        ggml_set_name(dst, "dst");
+
+        // src: f32 values to quantize into the cache
+        ggml_tensor * src = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, r);
+        ggml_set_name(src, "src");
+
+        // row indices
+        ggml_tensor * row_idxs = ggml_new_tensor_1d(ctx, type_idx, r);
+        ggml_set_name(row_idxs, "row_idxs");
+
+        // Write f32 data into turbo4 dst via SET_ROWS (includes WHT + quantize)
+        ggml_tensor * written = ggml_set_rows(ctx, dst, src, row_idxs);
+
+        // Read it back by dequantizing the written rows to f32
+        ggml_tensor * out = ggml_cpy(ctx, written, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, ne1));
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I64 || t->type == GGML_TYPE_I32) {
+                if (ggml_is_view_op(t->op)) continue;
+                init_set_rows_row_ids(t, ne1);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    double max_nmse_err() override {
+        // 4-bit PolarQuant round-trips tighter than turbo3's 3 bits; reuse
+        // the same generous bound. A layout mismatch produces errors orders
+        // of magnitude beyond it, so the bound is not load-bearing for the
+        // layout regression.
+        return 0.05;
+    }
+};
+
 // Test SET_ROWS with TQ4_1S destination (weight quantization), then dequantize and compare.
 // Validates: f32 -> WHT forward -> 16-centroid quantize -> nibble pack -> SET_ROWS
 // followed by: GET_ROWS/CPY -> WHT inverse -> f32 dequant. Round-trip error is bounded.
@@ -9473,6 +9541,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_set_rows_turbo3(GGML_TYPE_I32, 256, 2048, 512));
     test_cases.emplace_back(new test_set_rows_turbo3(GGML_TYPE_I32, 512, 1024, 256));
 
+    // SET_ROWS with turbo4 destination: quantize then dequant round-trip
+    for (ggml_type idx_type : {GGML_TYPE_I32, GGML_TYPE_I64}) {
+        for (int64_t ne0 : {128, 256, 512}) {
+            for (int r : {1, 4, 7}) {
+                test_cases.emplace_back(new test_set_rows_turbo4(idx_type, ne0, 16, r));
+            }
+        }
+    }
+    // Large tensors -- exercises 2D dispatch grid and pushes 68-byte-stride
+    // addressing past the 66-byte-sized allocation (the gfx1151 bug)
+    test_cases.emplace_back(new test_set_rows_turbo4(GGML_TYPE_I32, 128, 4096, 1024));
+    test_cases.emplace_back(new test_set_rows_turbo4(GGML_TYPE_I32, 256, 2048, 512));
+    test_cases.emplace_back(new test_set_rows_turbo4(GGML_TYPE_I32, 512, 1024, 256));
+
     // SET_ROWS with TQ4_1S destination: quantize then dequant round-trip
     for (ggml_type idx_type : {GGML_TYPE_I32, GGML_TYPE_I64}) {
         for (int64_t ne0 : {32, 64, 128, 256}) {
@@ -9514,8 +9596,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                             for (int nb : { 1, 3, 32, 75, }) {
                                                 for (ggml_prec prec : {GGML_PREC_F32, GGML_PREC_DEFAULT}) {
                                                     if (hsk != 128 && prec == GGML_PREC_DEFAULT) continue;
-                                                    for (ggml_type type_KV : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL, GGML_TYPE_TURBO3_0}) {
-                                                        if (type_KV == GGML_TYPE_TURBO3_0 && hsk < 128) continue;
+                                                    for (ggml_type type_KV : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0}) {
+                                                        if ((type_KV == GGML_TYPE_TURBO3_0 || type_KV == GGML_TYPE_TURBO4_0) && hsk < 128) continue;
                                                         if (type_KV != GGML_TYPE_F16 && hsk != 64 && hsk != 72 && hsk != 128) continue;
                                                         test_cases.emplace_back(new test_flash_attn_ext(
                                                                     hsk, hsv, nh, {nr2, nr3}, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_KV, type_KV));

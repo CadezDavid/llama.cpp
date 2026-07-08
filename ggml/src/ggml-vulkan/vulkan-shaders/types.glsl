@@ -1781,7 +1781,6 @@ struct block_turbo2_0
 struct block_turbo4_0
 {
     float16_t norm;
-    float16_t rnorm;    // reserved in 4-bit mode (kept for ABI parity with legacy)
     uint8_t qs[64];     // 4-bit centroid indices, nibble-packed (2 per byte), 128/2 = 64 bytes
 };
 #if defined(DATA_A_TURBO4_0)

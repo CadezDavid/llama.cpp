@@ -583,8 +583,7 @@ void main() {
 #elif defined(SET_ROWS) && defined(DATA_A_TURBO4_0)
 // Mirror of the TURBO3_0 block above, adapted for turbo4 (16 centroids,
 // 4-bit nibble pack, no signs byte). WHT tables and reduction structure
-// are identical (QK = 128 for both). The block struct keeps a reserved
-// rnorm field for ABI parity with the legacy 3-bit + QJL layout.
+// are identical (QK = 128 for both).
 const float TS1_T4[128] = float[128](
     -1,  1,  1, -1, -1,  1, -1,  1, -1, -1,  1,  1,  1,  1,  1,  1,
      1, -1,  1, -1,  1, -1, -1,  1,  1,  1, -1,  1,  1, -1, -1, -1,
@@ -608,17 +607,17 @@ const float TS2_T4[128] = float[128](
 const float TINV_T4 = 0.08838834764831845;  // 1 / sqrt(128)
 // Lloyd-Max centroids for N(0, 1/128), 16 levels (matches CENTROIDS_4BIT in C ref)
 const float TC4[16] = float[16](
-    -0.173926, -0.117195, -0.089527, -0.068756,
-    -0.051262, -0.035597, -0.020989, -0.006938,
-     0.006938,  0.020989,  0.035597,  0.051262,
-     0.068756,  0.089527,  0.117195,  0.173926
+    -0.241529, -0.182877, -0.143016, -0.111036,
+    -0.083292, -0.058050, -0.034299, -0.011349,
+     0.011349,  0.034299,  0.058050,  0.083292,
+     0.111036,  0.143016,  0.182877,  0.241529
 );
-// 15 midpoints between adjacent centroids
+// 15 midpoints between adjacent centroids (matches nearest_centroid_4bit in C ref)
 const float TM4[15] = float[15](
-    -0.145561, -0.103361, -0.079142, -0.060009,
-    -0.043430, -0.028293, -0.013964,  0.0,
-     0.013964,  0.028293,  0.043430,  0.060009,
-     0.079142,  0.103361,  0.145561
+    -0.212203, -0.162947, -0.127026, -0.097164,
+    -0.070671, -0.046174, -0.022824,  0.0,
+     0.022824,  0.046174,  0.070671,  0.097164,
+     0.127026,  0.162947,  0.212203
 );
 
 shared float wht_t4[128];
@@ -688,11 +687,6 @@ void main() {
     uint qs_byte = pair_low | (pair_high << 4u);
     if (sg_lane % 2u == 0u) {
         data_q[db].qs[t / 2u] = uint8_t(qs_byte);
-    }
-
-    // Reset rnorm field (reserved in 4-bit mode)
-    if (t == 0u) {
-        data_q[db].rnorm = float16_t(0.0);
     }
 
     // Reconstruction norm via subgroup reduction

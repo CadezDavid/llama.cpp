@@ -154,19 +154,19 @@ layout (binding = 1) readonly buffer K_PACKED_Q5_1_P32 { block_q5_1_packed32 dat
 // TurboQuant4 dequant: 4-bit indices, 2 per byte. iqs%4==0 means the 4
 // elements span 2 consecutive qs bytes (each holds 2 nibbles).
 #define FA_DEQUANT4_TURBO4_0(BUF) {                                                               \
-    const float c[16] = float[16](                                                                 \
-        -0.173926, -0.117195, -0.089527, -0.068756,                                                \
-        -0.051262, -0.035597, -0.020989, -0.006938,                                                \
-         0.006938,  0.020989,  0.035597,  0.051262,                                                \
-         0.068756,  0.089527,  0.117195,  0.173926);                                               \
-    const float norm = float(BUF.data[a_offset + ib].norm);                                        \
-    const uint b0 = uint(BUF.data[a_offset + ib].qs[iqs / 2    ]);                                 \
-    const uint b1 = uint(BUF.data[a_offset + ib].qs[iqs / 2 + 1]);                                 \
-    const uint i0 = (b0     ) & 0xFu;                                                               \
-    const uint i1 = (b0 >> 4) & 0xFu;                                                               \
-    const uint i2 = (b1     ) & 0xFu;                                                               \
-    const uint i3 = (b1 >> 4) & 0xFu;                                                               \
-    return FLOAT_TYPE(norm) * FLOAT_TYPEV4(c[i0], c[i1], c[i2], c[i3]);                            \
+    const float c[16] = float[16](                                                                \
+        -0.241529, -0.182877, -0.143016, -0.111036,                                               \
+        -0.083292, -0.058050, -0.034299, -0.011349,                                               \
+         0.011349,  0.034299,  0.058050,  0.083292,                                                \
+         0.111036,  0.143016,  0.182877,  0.241529);                                              \
+    const float norm = float(BUF.data[a_offset + ib].norm);                                       \
+    const uint b0 = uint(BUF.data[a_offset + ib].qs[iqs / 2    ]);                                \
+    const uint b1 = uint(BUF.data[a_offset + ib].qs[iqs / 2 + 1]);                                \
+    const uint i0 = (b0     ) & 0xFu;                                                              \
+    const uint i1 = (b0 >> 4) & 0xFu;                                                              \
+    const uint i2 = (b1     ) & 0xFu;                                                              \
+    const uint i3 = (b1 >> 4) & 0xFu;                                                              \
+    return FLOAT_TYPE(norm) * FLOAT_TYPEV4(c[i0], c[i1], c[i2], c[i3]);                           \
 }
 
 #if defined(DATA_A_TURBO3_0)
