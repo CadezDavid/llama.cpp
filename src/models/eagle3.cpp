@@ -3,16 +3,28 @@
 void llama_model_eagle3::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
 
-    ml.get_key_or_arr(LLM_KV_EAGLE3_EXTRACT_LAYERS, hparams.eagle3_extract_layers, 3, true);
+    if (!ml.get_arr(LLM_KV_EAGLE3_EXTRACT_LAYERS, target_layer_ids, false) &&
+        !ml.get_arr(LLM_KV_TARGET_LAYERS, target_layer_ids, false)) {
+        throw std::runtime_error("EAGLE3 model requires 'extract_layers' / 'target_layers' in GGUF metadata");
+    }
+    if (target_layer_ids.size() != hparams.eagle3_extract_layers.size()) {
+        throw std::runtime_error("EAGLE3 requires exactly 3 entries in 'extract_layers' / 'target_layers'");
+    }
+    for (size_t i = 0; i < target_layer_ids.size(); ++i) {
+        hparams.eagle3_extract_layers[i] = target_layer_ids[i];
+    }
+    LLAMA_LOG_INFO("%s: EAGLE3 extract_layers = [%d, %d, %d]\n", __func__,
+            target_layer_ids[0],
+            target_layer_ids[1],
+            target_layer_ids[2]);
 
-    ml.get_key(LLM_KV_EAGLE3_TARGET_HIDDEN_SIZE, hparams.eagle3_target_hidden_size);
+    if (!ml.get_key(LLM_KV_EAGLE3_TARGET_HIDDEN_SIZE, hparams.eagle3_target_hidden_size, false)) {
+        ml.get_key(LLM_KV_TARGET_HIDDEN_SIZE, hparams.eagle3_target_hidden_size);
+    }
     LLAMA_LOG_INFO("%s: EAGLE3 target_hidden_size = %u (draft n_embd = %u)\n", __func__,
                    hparams.eagle3_target_hidden_size, hparams.n_embd);
 
-    ml.get_key(LLM_KV_TARGET_HIDDEN_SIZE, n_embd_tgt);
-    LLAMA_LOG_INFO("%s: EAGLE3 n_embd_tgt = %u (draft n_embd = %u)\n", __func__, n_embd_tgt, hparams.n_embd);
-
-    hparams.n_embd_inp_enc_impl = (uint32_t) target_layer_ids.size() * n_embd_tgt;
+    hparams.n_embd_inp_enc_impl = (uint32_t) target_layer_ids.size() * hparams.eagle3_target_hidden_size;
 
     // eagle3 norm_before_residual (optional, default false)
     // compatible with Readhat eagle3 speculator model
