@@ -19,7 +19,6 @@
   vulkan-loader,
   openssl,
   shaderc,
-  spirv-headers,
   nodejs,
   importNpmLock,
   useBlas ?
