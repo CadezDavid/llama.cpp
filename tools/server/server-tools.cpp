@@ -627,7 +627,23 @@ struct server_tool_exec_shell_command : server_tool {
 #ifdef _WIN32
         std::vector<std::string> args = {"cmd", "/c", command};
 #else
-        std::vector<std::string> args = {"sh", "-c", command};
+        std::vector<std::string> args = {
+            "bwrap",
+            "--die-with-parent",
+            "--unshare-net",
+            "--ro-bind", "/usr", "/usr",
+            "--ro-bind", "/bin", "/bin",
+            "--ro-bind", "/lib", "/lib",
+            "--ro-bind", "/lib64", "/lib64",
+            "--proc", "/proc",
+            "--dev", "/dev",
+            "--tmpfs", "/tmp",
+            "--chdir", "/tmp",
+            "--clearenv",
+            "--setenv", "HOME", "/tmp",
+            "--setenv", "PATH", "/usr/local/bin:/usr/bin:/bin",
+            "sh", "-c", command,
+        };
 #endif
 
         auto io = make_tools_io(params);
