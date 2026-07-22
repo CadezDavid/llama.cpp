@@ -164,19 +164,20 @@ describe('ChatContextService', () => {
 		expect(transcript[1].content).toBe('Current');
 	});
 
-	it('does not inject retrieval into an assistant continuation', async () => {
+	it('injects retrieval into the latest user turn for an assistant continuation', async () => {
 		const transcript = [
 			message('1', MessageRole.USER, 'Question'),
 			message('2', MessageRole.ASSISTANT, 'Partial answer')
 		];
 
-		await expect(
-			ChatContextService.prepare({
+		const result = await ChatContextService.prepare({
 				transcriptMessages: transcript,
 				contextBlocks: [
 					{ id: 'recall-1', source: 'conversation-recall', content: 'Historical text' }
 				]
-			})
-		).rejects.toThrow('current message to be a user message');
+			});
+
+		expect(result.requestMessages[0].content).toContain('Historical text');
+		expect(result.requestMessages[1].content).toBe('Partial answer');
 	});
 });

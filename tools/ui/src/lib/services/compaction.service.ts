@@ -59,6 +59,7 @@ export class CompactionService {
 		mode?: string;
 		contextSize: number;
 		maxOutputTokens?: number;
+		retrievalReserveTokens?: number;
 		triggerPercent?: number;
 		targetPercent?: number;
 		protectedTurns?: number;
@@ -79,11 +80,19 @@ export class CompactionService {
 				? Math.floor(input.maxOutputTokens)
 				: fallbackOutput;
 		const safetyMarginTokens = Math.max(256, Math.floor(contextSize * 0.02));
-		const usableInputTokens = Math.max(1, contextSize - outputReserveTokens - safetyMarginTokens);
+		const retrievalReserveTokens = Math.max(
+			0,
+			Math.min(8192, Math.floor(input.retrievalReserveTokens ?? 2500))
+		);
+		const usableInputTokens = Math.max(
+			1,
+			contextSize - outputReserveTokens - retrievalReserveTokens - safetyMarginTokens
+		);
 		return {
 			mode,
 			contextSize,
 			outputReserveTokens,
+			retrievalReserveTokens,
 			safetyMarginTokens,
 			usableInputTokens,
 			triggerPercent,

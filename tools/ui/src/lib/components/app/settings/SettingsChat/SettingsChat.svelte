@@ -4,6 +4,7 @@
 		SettingsChatFields,
 		SettingsChatImportExportTab,
 		SettingsChatMobileHeader,
+		SettingsMemoryManager,
 		SettingsChatToolsTab,
 		SettingsFooter
 	} from '$lib/components/app/settings';
@@ -163,6 +164,10 @@
 								onConfigChange={handleConfigChange}
 								onThemeChange={handleThemeChange}
 							/>
+
+							{#if currentSection.title === SETTINGS_SECTION_TITLES.MEMORY}
+								<SettingsMemoryManager />
+							{/if}
 
 							{#if currentSection.title === SETTINGS_SECTION_TITLES.GENERAL}
 								<div class="flex justify-end">

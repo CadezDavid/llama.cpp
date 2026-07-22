@@ -89,6 +89,24 @@ export interface ChatMessagePreparationOptions {
 }
 
 export class ChatService {
+	private static promptMeasurementCache = new Map<string, ApiPromptTokenMeasurement>();
+	private static promptMeasurementCacheHits = 0;
+	private static promptMeasurementCacheMisses = 0;
+
+	static clearPromptMeasurementCache(): void {
+		ChatService.promptMeasurementCache.clear();
+		ChatService.promptMeasurementCacheHits = 0;
+		ChatService.promptMeasurementCacheMisses = 0;
+	}
+
+	static getPromptMeasurementCacheMetrics(): { hits: number; misses: number; size: number } {
+		return {
+			hits: ChatService.promptMeasurementCacheHits,
+			misses: ChatService.promptMeasurementCacheMisses,
+			size: ChatService.promptMeasurementCache.size
+		};
+	}
+
 	static findLatestAssistantModel(messages: DatabaseMessage[]): string | null {
 		for (let index = messages.length - 1; index >= 0; index--) {
 			const message = messages[index];
@@ -285,6 +303,20 @@ export class ChatService {
 		options: SettingsChatServiceOptions = {},
 		signal?: AbortSignal
 	): Promise<ApiPromptTokenMeasurement> {
+		const cacheKey = signal
+			? null
+			: JSON.stringify({
+					messages,
+					request: ChatService.buildChatCompletionRequest(messages, options)
+				});
+		if (cacheKey) {
+			const cached = ChatService.promptMeasurementCache.get(cacheKey);
+			if (cached) {
+				ChatService.promptMeasurementCacheHits++;
+				return { ...cached };
+			}
+			ChatService.promptMeasurementCacheMisses++;
+		}
 		const prompt = await ChatService.applyChatTemplate(messages, options, signal);
 		const tokenCount = await ChatService.tokenizePrompt(prompt, options.model, signal);
 		const hasNonTextContent = messages.some(
@@ -292,7 +324,15 @@ export class ChatService {
 				Array.isArray(message.content) &&
 				message.content.some((part) => part.type !== ContentPartType.TEXT)
 		);
-		return { tokenCount, hasNonTextContent, exactForTextOnly: !hasNonTextContent };
+		const result = { tokenCount, hasNonTextContent, exactForTextOnly: !hasNonTextContent };
+		if (cacheKey) {
+			ChatService.promptMeasurementCache.set(cacheKey, result);
+			if (ChatService.promptMeasurementCache.size > 64) {
+				const oldest = ChatService.promptMeasurementCache.keys().next().value;
+				if (oldest !== undefined) ChatService.promptMeasurementCache.delete(oldest);
+			}
+		}
+		return result;
 	}
 	/**
 	 *

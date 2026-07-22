@@ -41,6 +41,7 @@ export interface CompactionPreflightInput {
 	model?: string;
 	contextSize: number;
 	maxOutputTokens?: number;
+	retrievalReserveTokens?: number;
 	mode: CompactionMode;
 	triggerPercent: number;
 	targetPercent: number;
@@ -535,7 +536,8 @@ class CompactionStore {
 			this.policy = CompactionService.createPolicy({
 				mode: String(currentConfig.compactionMode ?? 'ask'),
 				contextSize: this.contextSize,
-				maxOutputTokens: Number(currentConfig.max_tokens) || undefined,
+			maxOutputTokens: Number(currentConfig.max_tokens) || undefined,
+			retrievalReserveTokens: Number(currentConfig.totalRecallTokenBudget) || 2500,
 				triggerPercent: Number(currentConfig.compactionTriggerPercent) || 78,
 				targetPercent: Number(currentConfig.compactionTargetPercent) || 50,
 				protectedTurns: Number(currentConfig.compactionProtectedTurns) || 8

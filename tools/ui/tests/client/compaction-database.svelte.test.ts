@@ -81,6 +81,12 @@ describe('compaction database persistence', () => {
 			strictRetryUsed: true
 		});
 		expect(event).toMatchObject({ action: 'apply', compactionId: pending.id });
+		const archive = await DatabaseService.getConversationArchiveChunks(conversation.id);
+		expect(archive).toHaveLength(2);
+		expect(new Set(archive.map((chunk) => chunk.sourceMessageIds[0]))).toEqual(
+			new Set([user.id, assistant.id])
+		);
+		expect(archive.every((chunk) => chunk.embeddingStatus === 'pending')).toBe(true);
 	});
 
 	it('records restore as a later path projection event', async () => {

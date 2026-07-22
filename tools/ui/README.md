@@ -573,6 +573,19 @@ still unchanged, marks its IndexedDB record ready, and appends a path-local proj
 stored message tree is not rewritten. A later restore event exposes the original path again, and
 JSON/JSONL export, import, deletion, and forking carry the related metadata and diagnostics.
 
+Activation also indexes the literal source text in a local conversation archive.
+Each inference request searches recent conversation context against that archive
+and, when enabled, a Spomin server. Local keyword recall remains available if
+the embedding endpoint is offline. Selected excerpts are added to the latest
+user turn inside an untrusted historical-context envelope and are never stored
+as chat messages.
+
+The Memory settings page controls provider URLs, thresholds, result limits, and
+token budgets. It provides explicit Spomin memory management and recent recall
+diagnostics. Spomin defaults to `http://127.0.0.1:8084`; the OpenAI-compatible
+embedding endpoint defaults to `http://127.0.0.1:8081/v1`. Provider failures are
+fail-open, and automatic recall never writes memories.
+
 ### 6. Server Role Abstraction
 
 Single codebase handles both MODEL and ROUTER modes:

@@ -777,6 +777,20 @@ class ConversationsStore {
 		}
 	}
 
+	async setMemoryProject(project: string | undefined): Promise<void> {
+		if (!this.activeConversation) return;
+		const memoryProject = project?.trim() || undefined;
+		await DatabaseService.updateConversation(this.activeConversation.id, { memoryProject });
+		this.activeConversation = { ...this.activeConversation, memoryProject };
+		const index = this.conversations.findIndex(
+			(conversation) => conversation.id === this.activeConversation?.id
+		);
+		if (index >= 0) {
+			this.conversations[index] = { ...this.conversations[index], memoryProject };
+			this.conversations = [...this.conversations];
+		}
+	}
+
 	/**
 	 * Toggles MCP server enabled state for the active conversation.
 	 * @param serverId - The server ID to toggle

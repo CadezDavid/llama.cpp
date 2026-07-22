@@ -15,7 +15,11 @@ export const IDXDB_TABLES = {
 	conversations: 'conversations',
 	messages: 'messages',
 	compactions: 'compactions',
-	compactionProjectionEvents: 'compactionProjectionEvents'
+	compactionProjectionEvents: 'compactionProjectionEvents',
+	archiveChunks: 'archiveChunks',
+	archiveTerms: 'archiveTerms',
+	retrievalTraces: 'retrievalTraces',
+	retrievalHitUsage: 'retrievalHitUsage'
 } as const;
 
 /** IndexedDB store schemas */
@@ -24,7 +28,11 @@ export const IDXDB_STORE_SCHEMAS = {
 	messages: 'id, convId, type, role, timestamp, parent, children',
 	compactions: 'id, conversationId, status, createdAt, [conversationId+createdAt]',
 	compactionProjectionEvents:
-		'id, conversationId, anchorMessageId, createdAt, [conversationId+anchorMessageId]'
+		'id, conversationId, anchorMessageId, createdAt, [conversationId+anchorMessageId]',
+	archiveChunks: 'id, conversationId, compactionId, embeddingStatus, createdAt',
+	archiveTerms: 'id, conversationId, chunkId, term, [conversationId+term]',
+	retrievalTraces: 'id, conversationId, anchorMessageId, createdAt',
+	retrievalHitUsage: 'id, conversationId, hitId, updatedAt'
 } as const;
 
 export const IDXDB_STORES_V1 = {
@@ -38,4 +46,12 @@ export const IDXDB_STORES = {
 	[IDXDB_TABLES.messages]: IDXDB_STORE_SCHEMAS.messages,
 	[IDXDB_TABLES.compactions]: IDXDB_STORE_SCHEMAS.compactions,
 	[IDXDB_TABLES.compactionProjectionEvents]: IDXDB_STORE_SCHEMAS.compactionProjectionEvents
+} as const;
+
+export const IDXDB_STORES_V3 = {
+	...IDXDB_STORES,
+	[IDXDB_TABLES.archiveChunks]: IDXDB_STORE_SCHEMAS.archiveChunks,
+	[IDXDB_TABLES.archiveTerms]: IDXDB_STORE_SCHEMAS.archiveTerms,
+	[IDXDB_TABLES.retrievalTraces]: IDXDB_STORE_SCHEMAS.retrievalTraces,
+	[IDXDB_TABLES.retrievalHitUsage]: IDXDB_STORE_SCHEMAS.retrievalHitUsage
 } as const;

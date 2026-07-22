@@ -438,6 +438,139 @@ const SETTINGS_REGISTRY: Record<string, SettingsSectionEntry> = {
 				type: SettingsFieldType.INPUT,
 				section: SETTINGS_SECTION_SLUGS.MEMORY,
 				isPositiveInteger: true
+			},
+			{
+				key: SETTINGS_KEYS.SPOMIN_ENABLED,
+				label: 'Use Spomin long-term memory',
+				help: 'Retrieve from a Spomin server when it is reachable. Failures never block chat requests.',
+				defaultValue: true,
+				type: SettingsFieldType.CHECKBOX,
+				section: SETTINGS_SECTION_SLUGS.MEMORY
+			},
+			{
+				key: SETTINGS_KEYS.SPOMIN_BASE_URL,
+				label: 'Spomin URL',
+				help: 'REST endpoint for the Spomin server.',
+				defaultValue: 'http://127.0.0.1:8084',
+				type: SettingsFieldType.INPUT,
+				section: SETTINGS_SECTION_SLUGS.MEMORY,
+				dependsOn: SETTINGS_KEYS.SPOMIN_ENABLED
+			},
+			{
+				key: SETTINGS_KEYS.SPOMIN_API_TOKEN,
+				label: 'Spomin API token',
+				help: 'Optional bearer token. It remains in this browser profile.',
+				defaultValue: '',
+				type: SettingsFieldType.INPUT,
+				section: SETTINGS_SECTION_SLUGS.MEMORY,
+				dependsOn: SETTINGS_KEYS.SPOMIN_ENABLED
+			},
+			{
+				key: SETTINGS_KEYS.SPOMIN_PROJECT,
+				label: 'Default Spomin project',
+				help: 'Optional project scope. A conversation-specific override can replace it.',
+				defaultValue: '',
+				type: SettingsFieldType.INPUT,
+				section: SETTINGS_SECTION_SLUGS.MEMORY,
+				dependsOn: SETTINGS_KEYS.SPOMIN_ENABLED
+			},
+			{
+				key: SETTINGS_KEYS.SPOMIN_RESULT_LIMIT,
+				label: 'Spomin result limit',
+				help: 'Maximum long-term memories considered for one request.',
+				defaultValue: 3,
+				type: SettingsFieldType.INPUT,
+				section: SETTINGS_SECTION_SLUGS.MEMORY,
+				isPositiveInteger: true,
+				dependsOn: SETTINGS_KEYS.SPOMIN_ENABLED
+			},
+			{
+				key: SETTINGS_KEYS.SPOMIN_TOKEN_BUDGET,
+				label: 'Spomin token budget',
+				help: 'Maximum approximate tokens injected from Spomin per request.',
+				defaultValue: 1000,
+				type: SettingsFieldType.INPUT,
+				section: SETTINGS_SECTION_SLUGS.MEMORY,
+				isPositiveInteger: true,
+				dependsOn: SETTINGS_KEYS.SPOMIN_ENABLED
+			},
+			{
+				key: SETTINGS_KEYS.SPOMIN_TIMEOUT_MS,
+				label: 'Spomin timeout (ms)',
+				help: 'Short deadline for fail-open retrieval and memory management requests.',
+				defaultValue: 750,
+				type: SettingsFieldType.INPUT,
+				section: SETTINGS_SECTION_SLUGS.MEMORY,
+				isPositiveInteger: true,
+				dependsOn: SETTINGS_KEYS.SPOMIN_ENABLED
+			},
+			{
+				key: SETTINGS_KEYS.EMBEDDING_BASE_URL,
+				label: 'Embedding API URL',
+				help: 'OpenAI-compatible embedding endpoint used for local semantic recall.',
+				defaultValue: 'http://127.0.0.1:8081/v1',
+				type: SettingsFieldType.INPUT,
+				section: SETTINGS_SECTION_SLUGS.MEMORY
+			},
+			{
+				key: SETTINGS_KEYS.EMBEDDING_MODEL,
+				label: 'Embedding model',
+				help: 'Model name sent to the embedding endpoint.',
+				defaultValue: 'embeddinggemma-300M-Q8_0.gguf',
+				type: SettingsFieldType.INPUT,
+				section: SETTINGS_SECTION_SLUGS.MEMORY
+			},
+			{
+				key: SETTINGS_KEYS.EMBEDDING_TIMEOUT_MS,
+				label: 'Embedding timeout (ms)',
+				help: 'Deadline for semantic recall. Lexical recall remains available on timeout.',
+				defaultValue: 1200,
+				type: SettingsFieldType.INPUT,
+				section: SETTINGS_SECTION_SLUGS.MEMORY,
+				isPositiveInteger: true
+			},
+			{
+				key: SETTINGS_KEYS.LOCAL_RECALL_RESULT_LIMIT,
+				label: 'Conversation recall result limit',
+				help: 'Maximum compacted conversation fragments considered per request.',
+				defaultValue: 5,
+				type: SettingsFieldType.INPUT,
+				section: SETTINGS_SECTION_SLUGS.MEMORY,
+				isPositiveInteger: true
+			},
+			{
+				key: SETTINGS_KEYS.LOCAL_RECALL_TOKEN_BUDGET,
+				label: 'Conversation recall token budget',
+				help: 'Maximum approximate tokens injected from compacted conversation history.',
+				defaultValue: 1500,
+				type: SettingsFieldType.INPUT,
+				section: SETTINGS_SECTION_SLUGS.MEMORY,
+				isPositiveInteger: true
+			},
+			{
+				key: SETTINGS_KEYS.TOTAL_RECALL_TOKEN_BUDGET,
+				label: 'Total recall token budget',
+				help: 'Shared cap across conversation recall and Spomin.',
+				defaultValue: 2500,
+				type: SettingsFieldType.INPUT,
+				section: SETTINGS_SECTION_SLUGS.MEMORY,
+				isPositiveInteger: true
+			},
+			{
+				key: SETTINGS_KEYS.SEMANTIC_RECALL_THRESHOLD,
+				label: 'Semantic recall threshold',
+				help: 'Minimum cosine similarity for a local semantic match.',
+				defaultValue: 0.62,
+				type: SettingsFieldType.INPUT,
+				section: SETTINGS_SECTION_SLUGS.MEMORY
+			},
+			{
+				key: SETTINGS_KEYS.LEXICAL_RECALL_THRESHOLD,
+				label: 'Lexical recall threshold',
+				help: 'Minimum query-term coverage for a local keyword match.',
+				defaultValue: 0.34,
+				type: SettingsFieldType.INPUT,
+				section: SETTINGS_SECTION_SLUGS.MEMORY
 			}
 		]
 	},
