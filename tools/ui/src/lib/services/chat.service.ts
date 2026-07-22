@@ -42,7 +42,8 @@ import type {
 import type {
 	AudioInputFormat,
 	DatabaseMessageExtraMcpPrompt,
-	DatabaseMessageExtraMcpResource
+	DatabaseMessageExtraMcpResource,
+	DatabaseMessage
 } from '$lib/types';
 import { modelsStore } from '$lib/stores/models.svelte';
 import { settingsStore } from '../stores/settings.svelte';
@@ -88,6 +89,14 @@ export interface ChatMessagePreparationOptions {
 }
 
 export class ChatService {
+	static findLatestAssistantModel(messages: DatabaseMessage[]): string | null {
+		for (let index = messages.length - 1; index >= 0; index--) {
+			const message = messages[index];
+			if (message.role === MessageRole.ASSISTANT && message.model) return message.model;
+		}
+		return null;
+	}
+
 	static async prepareMessages(
 		messages: ChatMessageInput[],
 		options: ChatMessagePreparationOptions = {}

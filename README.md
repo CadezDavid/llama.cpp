@@ -2,6 +2,11 @@
 
 > Production-grade KV-cache and weight quantization for llama.cpp, with cross-backend kernel support for Apple Silicon, NVIDIA CUDA, AMD ROCm, and Vulkan.
 
+> [!NOTE]
+> This fork extends llama.cpp with long-context compaction, conversation recall,
+> and optional Spomin-backed memory. See [FORK.md](FORK.md) for the roadmap,
+> branch guide, and current implementation status.
+
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
