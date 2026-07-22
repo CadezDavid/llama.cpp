@@ -62,7 +62,7 @@ function record(source: DatabaseMessage[], id = 'compact-1'): DatabaseCompaction
 describe('CompactionService', () => {
 	afterEach(() => vi.restoreAllMocks());
 
-	it('derives a usable input budget from context, output reserve, and safety margin', () => {
+	it('reserves output, retrieval, and safety capacity from usable input', () => {
 		const policy = CompactionService.createPolicy({
 			mode: 'automatic',
 			contextSize: 32768,
@@ -76,8 +76,9 @@ describe('CompactionService', () => {
 			mode: 'automatic',
 			contextSize: 32768,
 			outputReserveTokens: 4096,
+			retrievalReserveTokens: 2500,
 			safetyMarginTokens: 655,
-			usableInputTokens: 28017,
+			usableInputTokens: 25517,
 			triggerPercent: 80,
 			targetPercent: 50,
 			protectedTurns: 10
