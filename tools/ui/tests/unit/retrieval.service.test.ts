@@ -111,4 +111,51 @@ describe('RetrievalService', () => {
 			reason: 'exact-prompt-budget'
 		});
 	});
+
+	it('applies semantic and lexical thresholds independently to Spomin results', async () => {
+		vi.spyOn(DatabaseService, 'getConversationArchiveChunks').mockResolvedValue([]);
+		vi.spyOn(DatabaseService, 'getRetrievalHitUsage').mockResolvedValue([]);
+		vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+			new Response(
+				JSON.stringify({
+					query: 'database',
+					semantic_available: true,
+					results: [
+						{
+							id: 'below-thresholds',
+							text: 'Do not include this result.',
+							source: 'test',
+							tier: 'archive',
+							created_at: new Date().toISOString(),
+							score: 0.9,
+							semantic_score: 0.5,
+							lexical_coverage: 0.1
+						},
+						{
+							id: 'lexical-match',
+							text: 'SQLite was selected for the local database.',
+							source: 'test',
+							tier: 'archive',
+							created_at: new Date().toISOString(),
+							score: 0.4,
+							semantic_score: null,
+							lexical_coverage: 0.4
+						}
+					]
+				}),
+				{ status: 200, headers: { 'content-type': 'application/json' } }
+			)
+		);
+
+		const result = await RetrievalService.prepare({
+			conversationId: 'chat-1',
+			anchorMessageId: 'user-1',
+			messages: [message('user-1', MessageRole.USER, 'Which database did we choose?')],
+			compactionGeneration: 0,
+			settings: { ...settings, spominEnabled: true }
+		});
+
+		expect(result.blocks).toHaveLength(1);
+		expect(result.blocks[0].id).toBe('spomin:lexical-match');
+	});
 });
