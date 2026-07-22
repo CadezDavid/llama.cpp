@@ -1149,9 +1149,12 @@ class ChatStore {
 				await modelsStore.fetchModelProps(effectiveModel);
 		}
 
+		const perChatOverrides = conversationsStore.getAllMcpServerOverrides();
+		const promptTools = await agenticStore.preparePromptTools(perChatOverrides);
 		const apiOptions = {
 			...this.getApiOptions(),
-			...(effectiveModel ? { model: effectiveModel } : {})
+			...(effectiveModel ? { model: effectiveModel } : {}),
+			...(promptTools.length > 0 ? { tools: promptTools } : {})
 		} as SettingsChatServiceOptions;
 		const anchorMessageId = allMessages.at(-1)?.id;
 		if (
@@ -1489,8 +1492,6 @@ class ChatStore {
 				if (onError) onError(error);
 			}
 		};
-
-		const perChatOverrides = conversationsStore.getAllMcpServerOverrides();
 
 		{
 			const agenticResult = await agenticStore.runAgenticFlow({

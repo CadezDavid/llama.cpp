@@ -296,6 +296,20 @@ class AgenticStore {
 		};
 	}
 
+	async preparePromptTools(
+		perChatOverrides?: McpServerOverride[]
+	): Promise<ReturnType<typeof toolsStore.getEnabledToolsForLLM>> {
+		if (!this.getConfig(config(), perChatOverrides).enabled) return [];
+		if (toolsStore.builtinTools.length === 0 && !toolsStore.loading) {
+			await toolsStore.fetchBuiltinTools();
+		}
+		if (mcpStore.hasEnabledServers(perChatOverrides)) {
+			const initialized = await mcpStore.ensureInitialized(perChatOverrides);
+			if (!initialized) console.log('[AgenticStore] MCP not initialized');
+		}
+		return toolsStore.getEnabledToolsForLLM();
+	}
+
 	private parseToolArguments(args: string | Record<string, unknown>): Record<string, unknown> {
 		if (typeof args === 'object') return args;
 		const trimmed = args.trim();
@@ -396,24 +410,11 @@ class AgenticStore {
 		this._continueResolvers.delete(conversationId);
 		this._steeringMessages.delete(conversationId);
 
-		// Ensure built-in tools are fetched before checking if agentic is enabled
-		if (toolsStore.builtinTools.length === 0 && !toolsStore.loading) {
-			await toolsStore.fetchBuiltinTools();
-		}
-
 		const agenticConfig = this.getConfig(config(), perChatOverrides);
 		if (!agenticConfig.enabled) return { handled: false };
 
 		const hasMcpServers = mcpStore.hasEnabledServers(perChatOverrides);
-		if (hasMcpServers) {
-			const initialized = await mcpStore.ensureInitialized(perChatOverrides);
-
-			if (!initialized) {
-				console.log('[AgenticStore] MCP not initialized');
-			}
-		}
-
-		const tools = toolsStore.getEnabledToolsForLLM();
+		const tools = await this.preparePromptTools(perChatOverrides);
 		if (tools.length === 0) {
 			return { handled: false };
 		}
