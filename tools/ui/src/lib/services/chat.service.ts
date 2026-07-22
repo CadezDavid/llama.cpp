@@ -2,6 +2,7 @@ import { getAuthHeaders, getJsonHeaders } from '$lib/utils/api-headers';
 import { formatAttachmentText } from '$lib/utils/formatters';
 import { isAbortError } from '$lib/utils/abort';
 import { streamIdentity } from '$lib/utils/stream-identity';
+import { apiPost } from '$lib/utils/api-fetch';
 import {
 	ATTACHMENT_LABEL_PDF_FILE,
 	ATTACHMENT_LABEL_MCP_PROMPT,
@@ -29,9 +30,13 @@ import {
 	StreamConnectionState
 } from '$lib/enums';
 import type {
+	ApiApplyTemplateResponse,
+	ApiChatCompletionRequest,
 	ApiChatMessageContentPart,
 	ApiChatMessageData,
 	ApiChatCompletionToolCall,
+	ApiPromptTokenMeasurement,
+	ApiTokenizeResponse,
 	ApiStreamSession
 } from '$lib/types/api';
 import type {
@@ -73,7 +78,213 @@ function streamStorageKey(conversationId: string): string {
 	return STREAM_RESUME_LOCALSTORAGE_KEY_PREFIX + conversationId;
 }
 
+export type ChatMessageInput =
+	| ApiChatMessageData
+	| (DatabaseMessage & { extra?: DatabaseMessageExtra[] });
+
+export interface ChatMessagePreparationOptions {
+	model?: string | null;
+	excludeReasoning?: boolean;
+}
+
 export class ChatService {
+	static async prepareMessages(
+		messages: ChatMessageInput[],
+		options: ChatMessagePreparationOptions = {}
+	): Promise<ApiChatMessageData[]> {
+		const converted = await Promise.all(
+			messages.map(async (message) => {
+				if ('id' in message && 'convId' in message && 'timestamp' in message) {
+					return ChatService.convertDbMessageToApiChatMessageData(message);
+				}
+
+				return ChatService.cloneApiMessage(message);
+			})
+		);
+
+		return converted
+			.filter((message) => {
+				if (message.role !== MessageRole.SYSTEM) return true;
+				return typeof message.content === 'string' && message.content.trim().length > 0;
+			})
+			.map((message) => {
+				let content = message.content;
+				if (options.model && !modelsStore.modelSupportsVision(options.model)) {
+					if (Array.isArray(content)) {
+						content = content.filter((part) => part.type !== ContentPartType.IMAGE_URL);
+						if (
+							content.length === 1 &&
+							content[0].type === ContentPartType.TEXT &&
+							typeof content[0].text === 'string'
+						) {
+							content = content[0].text;
+						}
+					}
+				}
+
+				if (options.excludeReasoning) {
+					content = ChatService.stripReasoningContent(content);
+				}
+
+				return {
+					...message,
+					content,
+					reasoning_content: options.excludeReasoning ? undefined : message.reasoning_content
+				};
+			});
+	}
+
+	private static cloneApiMessage(message: ApiChatMessageData): ApiChatMessageData {
+		return {
+			...message,
+			content:
+				typeof message.content === 'string'
+					? message.content
+					: message.content.map((part) => ({
+							...part,
+							image_url: part.image_url ? { ...part.image_url } : undefined,
+							input_audio: part.input_audio ? { ...part.input_audio } : undefined,
+							input_video: part.input_video ? { ...part.input_video } : undefined
+						})),
+			tool_calls: message.tool_calls?.map((call) => ({
+				...call,
+				function: call.function ? { ...call.function } : undefined
+			}))
+		};
+	}
+
+	static buildChatCompletionRequest(
+		messages: ApiChatMessageData[],
+		options: SettingsChatServiceOptions = {}
+	): ApiChatCompletionRequest {
+		const requestBody: ApiChatCompletionRequest = {
+			messages: messages.map((message) => ({
+				role: message.role,
+				content: message.content,
+				reasoning_content: message.reasoning_content,
+				tool_calls: message.tool_calls,
+				tool_call_id: message.tool_call_id
+			})),
+			stream: options.stream,
+			return_progress: options.stream ? true : undefined,
+			sse_ping_interval: options.stream ? 1 : undefined,
+			tools: options.tools && options.tools.length > 0 ? options.tools : undefined,
+			model: options.model,
+			reasoning_format: options.disableReasoningParsing
+				? ReasoningFormat.NONE
+				: ReasoningFormat.AUTO,
+			chat_template_kwargs: { enable_thinking: options.enableThinking },
+			reasoning_control: true
+		};
+
+		const reasoningBudgetTokens =
+			options.enableThinking && options.reasoningEffort
+				? (REASONING_EFFORT_TOKENS[options.reasoningEffort] ?? -1)
+				: -1;
+		if (reasoningBudgetTokens >= 0) requestBody.thinking_budget_tokens = reasoningBudgetTokens;
+		if (options.continueFinalMessage) {
+			requestBody.continue_final_message = true;
+			requestBody.add_generation_prompt = false;
+		}
+
+		if (options.temperature !== undefined) requestBody.temperature = options.temperature;
+		if (options.max_tokens !== undefined) {
+			requestBody.max_tokens =
+				options.max_tokens !== null && options.max_tokens !== 0 ? options.max_tokens : -1;
+		}
+		if (options.dynatemp_range !== undefined) requestBody.dynatemp_range = options.dynatemp_range;
+		if (options.dynatemp_exponent !== undefined)
+			requestBody.dynatemp_exponent = options.dynatemp_exponent;
+		if (options.top_k !== undefined) requestBody.top_k = options.top_k;
+		if (options.top_p !== undefined) requestBody.top_p = options.top_p;
+		if (options.min_p !== undefined) requestBody.min_p = options.min_p;
+		if (options.xtc_probability !== undefined)
+			requestBody.xtc_probability = options.xtc_probability;
+		if (options.xtc_threshold !== undefined) requestBody.xtc_threshold = options.xtc_threshold;
+		if (options.typ_p !== undefined) requestBody.typ_p = options.typ_p;
+		if (options.repeat_last_n !== undefined) requestBody.repeat_last_n = options.repeat_last_n;
+		if (options.repeat_penalty !== undefined) requestBody.repeat_penalty = options.repeat_penalty;
+		if (options.presence_penalty !== undefined)
+			requestBody.presence_penalty = options.presence_penalty;
+		if (options.frequency_penalty !== undefined)
+			requestBody.frequency_penalty = options.frequency_penalty;
+		if (options.dry_multiplier !== undefined) requestBody.dry_multiplier = options.dry_multiplier;
+		if (options.dry_base !== undefined) requestBody.dry_base = options.dry_base;
+		if (options.dry_allowed_length !== undefined)
+			requestBody.dry_allowed_length = options.dry_allowed_length;
+		if (options.dry_penalty_last_n !== undefined)
+			requestBody.dry_penalty_last_n = options.dry_penalty_last_n;
+		if (options.samplers !== undefined) {
+			requestBody.samplers =
+				typeof options.samplers === 'string'
+					? options.samplers.split(';').filter((sampler: string) => sampler.trim())
+					: options.samplers;
+		}
+		if (options.backend_sampling !== undefined)
+			requestBody.backend_sampling = options.backend_sampling;
+		if (options.timings_per_token !== undefined)
+			requestBody.timings_per_token = options.timings_per_token;
+
+		const custom = options.custom ?? options.customJson;
+		if (custom) {
+			try {
+				Object.assign(requestBody, typeof custom === 'string' ? JSON.parse(custom) : custom);
+			} catch (error) {
+				console.warn('Failed to parse custom parameters:', error);
+			}
+		}
+		return requestBody;
+	}
+
+	static async applyChatTemplate(
+		messages: ApiChatMessageData[],
+		options: SettingsChatServiceOptions = {},
+		signal?: AbortSignal
+	): Promise<string> {
+		const request = ChatService.buildChatCompletionRequest(messages, options);
+		const response = await apiPost<ApiApplyTemplateResponse, ApiChatCompletionRequest>(
+			API_CHAT.APPLY_TEMPLATE,
+			request,
+			{ signal }
+		);
+		return response.prompt;
+	}
+
+	static async tokenizePrompt(
+		prompt: string,
+		model?: string | null,
+		signal?: AbortSignal
+	): Promise<number> {
+		const response = await apiPost<
+			ApiTokenizeResponse,
+			{ content: string; add_special: false; parse_special: true; model?: string }
+		>(
+			API_CHAT.TOKENIZE,
+			{
+				content: prompt,
+				add_special: false,
+				parse_special: true,
+				model: model || undefined
+			},
+			{ signal }
+		);
+		return response.tokens.length;
+	}
+
+	static async measurePrompt(
+		messages: ApiChatMessageData[],
+		options: SettingsChatServiceOptions = {},
+		signal?: AbortSignal
+	): Promise<ApiPromptTokenMeasurement> {
+		const prompt = await ChatService.applyChatTemplate(messages, options, signal);
+		const tokenCount = await ChatService.tokenizePrompt(prompt, options.model, signal);
+		const hasNonTextContent = messages.some(
+			(message) =>
+				Array.isArray(message.content) &&
+				message.content.some((part) => part.type !== ContentPartType.TEXT)
+		);
+		return { tokenCount, hasNonTextContent, exactForTextOnly: !hasNonTextContent };
+	}
 	/**
 	 *
 	 *
@@ -129,15 +340,14 @@ export class ChatService {
 	/**
 	 * Sends a chat completion request to the llama-server.
 	 * Supports both streaming and non-streaming responses with comprehensive parameter configuration.
-	 * Automatically converts database messages with attachments to the appropriate API format.
 	 *
-	 * @param messages - Array of chat messages to send to the API (supports both ApiChatMessageData and DatabaseMessage with attachments)
+	 * @param messages - Prepared API chat messages
 	 * @param options - Configuration options for the chat completion request. See `SettingsChatServiceOptions` type for details.
 	 * @returns {Promise<string | void>} that resolves to the complete response string (non-streaming) or void (streaming)
 	 * @throws {Error} if the request fails or is aborted
 	 */
 	static async sendMessage(
-		messages: ApiChatMessageData[] | (DatabaseMessage & { extra?: DatabaseMessageExtra[] })[],
+		messages: ApiChatMessageData[],
 		options: SettingsChatServiceOptions = {},
 		conversationId?: string,
 		signal?: AbortSignal
@@ -152,185 +362,9 @@ export class ChatService {
 			onToolCallChunk,
 			onModel,
 			onCompletionId,
-			onTimings,
-			// Tools for function calling
-			tools,
-			// Generation parameters
-			temperature,
-			max_tokens,
-			// Sampling parameters
-			dynatemp_range,
-			dynatemp_exponent,
-			top_k,
-			top_p,
-			min_p,
-			xtc_probability,
-			xtc_threshold,
-			typ_p,
-			// Penalty parameters
-			repeat_last_n,
-			repeat_penalty,
-			presence_penalty,
-			frequency_penalty,
-			dry_multiplier,
-			dry_base,
-			dry_allowed_length,
-			dry_penalty_last_n,
-			// Other parameters
-			samplers,
-			backend_sampling,
-			custom,
-			timings_per_token,
-			// Config options
-			disableReasoningParsing,
-			excludeReasoningFromContext,
-			enableThinking,
-			reasoningEffort,
-			continueFinalMessage
+			onTimings
 		} = options;
-
-		const normalizedMessages: ApiChatMessageData[] = (
-			await Promise.all(
-				messages.map((msg) => {
-					if ('id' in msg && 'convId' in msg && 'timestamp' in msg) {
-						const dbMsg = msg as DatabaseMessage & { extra?: DatabaseMessageExtra[] };
-
-						return ChatService.convertDbMessageToApiChatMessageData(dbMsg);
-					} else {
-						return msg as ApiChatMessageData;
-					}
-				})
-			)
-		).filter((msg: { role: ChatRole; content: string | ApiChatMessageContentPart[] }) => {
-			// Filter out empty system messages
-			if (msg.role === MessageRole.SYSTEM) {
-				const content = typeof msg.content === 'string' ? msg.content : '';
-
-				return content.trim().length > 0;
-			}
-
-			return true;
-		});
-
-		// Filter out image attachments if the model doesn't support vision
-		if (options.model && !modelsStore.modelSupportsVision(options.model)) {
-			normalizedMessages.forEach((msg) => {
-				if (Array.isArray(msg.content)) {
-					msg.content = msg.content.filter((part: ApiChatMessageContentPart) => {
-						if (part.type === ContentPartType.IMAGE_URL) {
-							console.info(
-								`[ChatService] Skipping image attachment in message history (model "${options.model}" does not support vision)`
-							);
-
-							return false;
-						}
-
-						return true;
-					});
-					// If only text remains and it's a single part, simplify to string
-					if (
-						msg.content.length === 1 &&
-						msg.content[0].type === ContentPartType.TEXT &&
-						typeof msg.content[0].text === 'string'
-					) {
-						msg.content = msg.content[0].text;
-					}
-				}
-			});
-		}
-
-		const requestBody: ApiChatCompletionRequest = {
-			messages: normalizedMessages.map((msg: ApiChatMessageData) => {
-				const mapped: ApiChatCompletionRequest['messages'][0] = {
-					role: msg.role,
-					content: msg.content,
-					tool_calls: msg.tool_calls,
-					tool_call_id: msg.tool_call_id
-				};
-				// Include reasoning_content from the dedicated field
-				if (!excludeReasoningFromContext && msg.reasoning_content) {
-					mapped.reasoning_content = msg.reasoning_content;
-				}
-				return mapped;
-			}),
-			stream,
-			return_progress: stream ? true : undefined,
-			sse_ping_interval: stream ? 1 : undefined,
-			tools: tools && tools.length > 0 ? tools : undefined
-		};
-
-		// Include model in request if provided (required in ROUTER mode)
-		if (options.model) {
-			requestBody.model = options.model;
-		}
-
-		requestBody.reasoning_format = disableReasoningParsing
-			? ReasoningFormat.NONE
-			: ReasoningFormat.AUTO;
-
-		const reasoningBudgetTokens =
-			enableThinking && reasoningEffort ? (REASONING_EFFORT_TOKENS[reasoningEffort] ?? -1) : -1;
-
-		requestBody.chat_template_kwargs = {
-			...(requestBody.chat_template_kwargs ?? {}),
-			enable_thinking: enableThinking
-		};
-
-		if (reasoningBudgetTokens >= 0) {
-			requestBody.thinking_budget_tokens = reasoningBudgetTokens;
-		}
-
-		// arms the budget sampler so reasoning can be ended at runtime via the control endpoint
-		requestBody.reasoning_control = true;
-
-		if (continueFinalMessage) {
-			requestBody.continue_final_message = true;
-			requestBody.add_generation_prompt = false;
-		}
-
-		if (temperature !== undefined) requestBody.temperature = temperature;
-		if (max_tokens !== undefined) {
-			// Set max_tokens to -1 (infinite) when explicitly configured as 0 or null
-			requestBody.max_tokens = max_tokens !== null && max_tokens !== 0 ? max_tokens : -1;
-		}
-
-		if (dynatemp_range !== undefined) requestBody.dynatemp_range = dynatemp_range;
-		if (dynatemp_exponent !== undefined) requestBody.dynatemp_exponent = dynatemp_exponent;
-		if (top_k !== undefined) requestBody.top_k = top_k;
-		if (top_p !== undefined) requestBody.top_p = top_p;
-		if (min_p !== undefined) requestBody.min_p = min_p;
-		if (xtc_probability !== undefined) requestBody.xtc_probability = xtc_probability;
-		if (xtc_threshold !== undefined) requestBody.xtc_threshold = xtc_threshold;
-		if (typ_p !== undefined) requestBody.typ_p = typ_p;
-
-		if (repeat_last_n !== undefined) requestBody.repeat_last_n = repeat_last_n;
-		if (repeat_penalty !== undefined) requestBody.repeat_penalty = repeat_penalty;
-		if (presence_penalty !== undefined) requestBody.presence_penalty = presence_penalty;
-		if (frequency_penalty !== undefined) requestBody.frequency_penalty = frequency_penalty;
-		if (dry_multiplier !== undefined) requestBody.dry_multiplier = dry_multiplier;
-		if (dry_base !== undefined) requestBody.dry_base = dry_base;
-		if (dry_allowed_length !== undefined) requestBody.dry_allowed_length = dry_allowed_length;
-		if (dry_penalty_last_n !== undefined) requestBody.dry_penalty_last_n = dry_penalty_last_n;
-
-		if (samplers !== undefined) {
-			requestBody.samplers =
-				typeof samplers === 'string'
-					? samplers.split(';').filter((s: string) => s.trim())
-					: samplers;
-		}
-
-		if (backend_sampling !== undefined) requestBody.backend_sampling = backend_sampling;
-
-		if (timings_per_token !== undefined) requestBody.timings_per_token = timings_per_token;
-
-		if (custom) {
-			try {
-				const customParams = typeof custom === 'string' ? JSON.parse(custom) : custom;
-				Object.assign(requestBody, customParams);
-			} catch (error) {
-				console.warn('Failed to parse custom parameters:', error);
-			}
-		}
+		const requestBody = ChatService.buildChatCompletionRequest(messages, options);
 
 		try {
 			const headers: Record<string, string> = { ...getJsonHeaders() };
@@ -615,43 +649,20 @@ export class ChatService {
 	}
 
 	static async preEncode(
-		messages: ApiChatMessageData[] | (DatabaseMessage & { extra?: DatabaseMessageExtra[] })[],
+		messages: ApiChatMessageData[],
 		model?: string | null,
-		excludeReasoning?: boolean,
 		signal?: AbortSignal
 	): Promise<void> {
-		const normalizedMessages: ApiChatMessageData[] = (
-			await Promise.all(
-				messages.map((msg) => {
-					if ('id' in msg && 'convId' in msg && 'timestamp' in msg) {
-						return ChatService.convertDbMessageToApiChatMessageData(
-							msg as DatabaseMessage & { extra?: DatabaseMessageExtra[] }
-						);
-					}
-
-					return msg as ApiChatMessageData;
-				})
-			)
-		).filter((msg: { role: ChatRole; content: string | ApiChatMessageContentPart[] }) => {
-			if (msg.role === MessageRole.SYSTEM) {
-				const content = typeof msg.content === 'string' ? msg.content : '';
-
-				return content.trim().length > 0;
-			}
-
-			return true;
-		});
-
 		const requestBody: Record<string, unknown> = {
-			messages: normalizedMessages.map((msg: ApiChatMessageData) => {
+			messages: messages.map((msg: ApiChatMessageData) => {
 				const mapped: Record<string, unknown> = {
 					role: msg.role,
-					content: excludeReasoning ? ChatService.stripReasoningContent(msg.content) : msg.content,
+					content: msg.content,
 					tool_calls: msg.tool_calls,
 					tool_call_id: msg.tool_call_id
 				};
 
-				if (!excludeReasoning && msg.reasoning_content) {
+				if (msg.reasoning_content) {
 					mapped.reasoning_content = msg.reasoning_content;
 				}
 

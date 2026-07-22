@@ -58,6 +58,7 @@
  * @see conversationsStore in stores/conversations.svelte.ts — provides message context
  */
 export { ChatService } from './chat.service';
+export { ChatContextService } from './chat-context.service';
 
 /**
  * **DatabaseService** - IndexedDB persistence layer via Dexie ORM
@@ -276,7 +277,7 @@ export { MCPService } from './mcp.service';
  * - **toolsStore**: Exposes the tool definition when the sandbox is enabled
  * - **agenticStore**: Dispatches ToolSource.FRONTEND calls here
  *
- * @see SANDBOX_TOOL_DEFINITION in constants/sandbox.ts - tool schema sent to the LLM
+ * @see buildSandboxToolDefinition in constants/sandbox.ts - tool schema sent to the LLM
  * @see agenticStore in stores/agentic.svelte.ts - tool dispatch
  */
 export { SandboxService } from './sandbox.service';
