@@ -59,6 +59,7 @@
  */
 export { ChatService } from './chat.service';
 export { ChatContextService } from './chat-context.service';
+export { CompactionService } from './compaction.service';
 
 /**
  * **DatabaseService** - IndexedDB persistence layer via Dexie ORM

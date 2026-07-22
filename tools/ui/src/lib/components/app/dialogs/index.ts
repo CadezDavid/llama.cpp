@@ -122,6 +122,7 @@ export { default as DialogConfirmation } from './DialogConfirmation.svelte';
  * ```
  */
 export { default as DialogConversationRename } from './DialogConversationRename.svelte';
+export { default as DialogConversationCompaction } from './DialogConversationCompaction.svelte';
 
 /**
  *

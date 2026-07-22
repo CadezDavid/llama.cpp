@@ -15,6 +15,8 @@ import { SvelteMap, SvelteSet } from 'svelte/reactivity';
 import { DatabaseService } from '$lib/services/database.service';
 import { ChatService } from '$lib/services/chat.service';
 import { ChatContextService } from '$lib/services/chat-context.service';
+import { CompactionService } from '$lib/services/compaction.service';
+import { compactionStore } from '$lib/stores/compaction.svelte';
 import { streamIdentity } from '$lib/utils/stream-identity';
 import { getAuthHeaders } from '$lib/utils/api-headers';
 import { conversationsStore } from '$lib/stores/conversations.svelte';
@@ -54,7 +56,9 @@ import type {
 	ApiProcessingState,
 	ApiStreamSession,
 	DatabaseMessage,
-	DatabaseMessageExtra
+	DatabaseMessageExtra,
+	PreparedChatContext,
+	CompactionMode
 } from '$lib/types';
 import {
 	ContinueIntentKind,
@@ -115,6 +119,67 @@ class ChatStore {
 		string,
 		{ content: string; extras?: DatabaseMessageExtra[] }
 	>();
+
+	private async prepareConversationContext(
+		conversationId: string,
+		messages: DatabaseMessage[],
+		model?: string | null,
+		excludeReasoning?: boolean
+	): Promise<PreparedChatContext> {
+		const activeCompaction = await CompactionService.resolveActiveCompaction(
+			conversationId,
+			messages
+		);
+		return await ChatContextService.prepare({
+			transcriptMessages: messages,
+			model,
+			excludeReasoning,
+			projections: activeCompaction ? [CompactionService.toProjection(activeCompaction)] : []
+		});
+	}
+
+	private async runCompactionPreflight(
+		conversationId: string,
+		messages: DatabaseMessage[],
+		model?: string | null,
+		modeOverride?: CompactionMode,
+		measurementOptions?: SettingsChatServiceOptions
+	): Promise<boolean> {
+		const anchorMessageId = messages.at(-1)?.id;
+		if (!anchorMessageId) return true;
+		const currentConfig = config();
+		const modelContextSize = isRouterMode()
+			? ((model ? modelsStore.getModelContextSize(model) : null) ?? selectedModelContextSize() ?? 0)
+			: (contextSize() ?? 0);
+		if (!modelContextSize) return true;
+		return await compactionStore.preflight({
+			conversationId,
+			anchorMessageId,
+			messages,
+			model: model ?? undefined,
+			contextSize: modelContextSize,
+			maxOutputTokens: Number(currentConfig.max_tokens) || undefined,
+			mode: modeOverride ?? (String(currentConfig.compactionMode ?? 'ask') as CompactionMode),
+			triggerPercent: Number(currentConfig.compactionTriggerPercent) || 78,
+			targetPercent: Number(currentConfig.compactionTargetPercent) || 50,
+			protectedTurns: Number(currentConfig.compactionProtectedTurns) || 8,
+			measurementOptions
+		});
+	}
+
+	private async removeCancelledAssistant(
+		assistantMessage: DatabaseMessage,
+		anchorMessageId: string
+	): Promise<void> {
+		await DatabaseService.deleteMessage(assistantMessage.id);
+		const index = conversationsStore.findMessageIndex(assistantMessage.id);
+		if (index >= 0) conversationsStore.removeMessageAtIndex(index);
+		await DatabaseService.updateCurrentNode(assistantMessage.convId, anchorMessageId);
+		if (conversationsStore.activeConversation?.id === assistantMessage.convId) {
+			await conversationsStore.updateCurrentNode(anchorMessageId);
+		}
+		this.setChatLoading(assistantMessage.convId, false);
+	}
 
 	private setChatLoading(convId: string, loading: boolean): void {
 		this.touchConversationState(convId);
@@ -1084,15 +1149,34 @@ class ChatStore {
 				await modelsStore.fetchModelProps(effectiveModel);
 		}
 
+		const perChatOverrides = conversationsStore.getAllMcpServerOverrides();
+		const promptTools = await agenticStore.preparePromptTools(perChatOverrides);
 		const apiOptions = {
 			...this.getApiOptions(),
-			...(effectiveModel ? { model: effectiveModel } : {})
+			...(effectiveModel ? { model: effectiveModel } : {}),
+			...(promptTools.length > 0 ? { tools: promptTools } : {})
 		} as SettingsChatServiceOptions;
-		const preparedContext = await ChatContextService.prepare({
-			transcriptMessages: allMessages,
-			model: effectiveModel,
-			excludeReasoning: !!apiOptions.excludeReasoningFromContext
-		});
+		const anchorMessageId = allMessages.at(-1)?.id;
+		if (
+			anchorMessageId &&
+			!(await this.runCompactionPreflight(
+				assistantMessage.convId,
+				allMessages,
+				effectiveModel,
+				undefined,
+				apiOptions
+			))
+		) {
+			await this.removeCancelledAssistant(assistantMessage, anchorMessageId);
+			return;
+		}
+
+		const preparedContext = await this.prepareConversationContext(
+			assistantMessage.convId,
+			allMessages,
+			effectiveModel,
+			!!apiOptions.excludeReasoningFromContext
+		);
 		const preparedMessages = preparedContext.requestMessages;
 
 		// Mutable state for the current message being streamed
@@ -1320,6 +1404,47 @@ class ChatStore {
 				lastCreatedInFlow = msg.id;
 				return msg;
 			},
+			prepareMessages: async () => {
+				const conversation = await DatabaseService.getConversation(convId);
+				if (!conversation?.currNode) return null;
+				const storedMessages = await DatabaseService.getConversationMessages(convId);
+				const activePath = filterByLeafNodeId(
+					storedMessages,
+					conversation.currNode,
+					false
+				) as DatabaseMessage[];
+				const trailing = activePath.at(-1);
+				const transcript =
+					trailing?.id === currentMessageId &&
+					trailing.role === MessageRole.ASSISTANT &&
+					!trailing.content &&
+					!trailing.toolCalls
+						? activePath.slice(0, -1)
+						: activePath;
+				const anchorMessageId = transcript.at(-1)?.id;
+				if (!anchorMessageId) return null;
+				if (
+					!(await this.runCompactionPreflight(
+						convId,
+						transcript,
+						effectiveModel,
+						undefined,
+						apiOptions
+					))
+				) {
+					if (trailing?.id === currentMessageId) {
+						await this.removeCancelledAssistant(trailing, anchorMessageId);
+					}
+					return null;
+				}
+				const refreshed = await this.prepareConversationContext(
+					convId,
+					transcript,
+					effectiveModel,
+					!!apiOptions.excludeReasoningFromContext
+				);
+				return refreshed.requestMessages;
+			},
 			onFlowComplete: (finalTimings?: ChatMessageTimings) => {
 				if (finalTimings) {
 					const idx = conversationsStore.findMessageIndex(assistantMessage.id);
@@ -1367,8 +1492,6 @@ class ChatStore {
 				if (onError) onError(error);
 			}
 		};
-
-		const perChatOverrides = conversationsStore.getAllMcpServerOverrides();
 
 		{
 			const agenticResult = await agenticStore.runAgenticFlow({
@@ -1912,11 +2035,24 @@ class ChatStore {
 				...this.getApiOptions(),
 				continueFinalMessage: true
 			} as SettingsChatServiceOptions;
-			const preparedContext = await ChatContextService.prepare({
-				transcriptMessages: contextWithContinue,
-				model: continueOptions.model,
-				excludeReasoning: !!continueOptions.excludeReasoningFromContext
-			});
+			if (
+				!(await this.runCompactionPreflight(
+					msg.convId,
+					contextWithContinue,
+					continueOptions.model,
+					undefined,
+					continueOptions
+				))
+			) {
+				this.setChatLoading(msg.convId, false);
+				return;
+			}
+			const preparedContext = await this.prepareConversationContext(
+				msg.convId,
+				contextWithContinue,
+				continueOptions.model,
+				!!continueOptions.excludeReasoningFromContext
+			);
 
 			await ChatService.sendMessage(
 				preparedContext.requestMessages,
@@ -2370,11 +2506,7 @@ class ChatStore {
 	}
 
 	getConversationModel(messages: DatabaseMessage[]): string | null {
-		for (let i = messages.length - 1; i >= 0; i--) {
-			const message = messages[i];
-			if (message.role === MessageRole.ASSISTANT && message.model) return message.model;
-		}
-		return null;
+		return ChatService.findLatestAssistantModel(messages);
 	}
 
 	private getApiOptions(): Record<string, unknown> {
@@ -2488,11 +2620,24 @@ class ChatStore {
 				conversation.currNode,
 				false
 			) as DatabaseMessage[];
-			const preparedContext = await ChatContextService.prepare({
-				transcriptMessages: activePath,
+			if (
+				config().compactionMode === 'automatic' &&
+				!(await this.runCompactionPreflight(
+					conversationId,
+					activePath,
+					model,
+					'automatic',
+					this.getApiOptions()
+				))
+			) {
+				return;
+			}
+			const preparedContext = await this.prepareConversationContext(
+				conversationId,
+				activePath,
 				model,
 				excludeReasoning
-			});
+			);
 
 			await ChatService.preEncode(preparedContext.stableMessages, model, signal);
 		} catch (err) {

@@ -322,13 +322,14 @@ Components are organized in `app/` (application-specific) and `ui/` (shadcn-svel
 
 **Dialog Components** (`app/dialogs/`):
 
-| Component                       | Responsibility                                           |
-| ------------------------------- | -------------------------------------------------------- |
-| `DialogChatSettings`            | Full-screen settings configuration                       |
-| `DialogModelInformation`        | Model details (context size, modalities, parallel slots) |
-| `DialogChatAttachmentPreview`   | Full preview for images, PDFs (text or page view), code  |
-| `DialogConfirmation`            | Generic confirmation for destructive actions             |
-| `DialogConversationTitleUpdate` | Edit conversation title                                  |
+| Component                       | Responsibility                                            |
+| ------------------------------- | --------------------------------------------------------- |
+| `DialogChatSettings`            | Full-screen settings configuration                        |
+| `DialogModelInformation`        | Model details (context size, modalities, parallel slots)  |
+| `DialogChatAttachmentPreview`   | Full preview for images, PDFs (text or page view), code   |
+| `DialogConfirmation`            | Generic confirmation for destructive actions              |
+| `DialogConversationTitleUpdate` | Edit conversation title                                   |
+| `DialogConversationCompaction`  | Confirm, preview, inspect, and restore prompt compactions |
 
 **Server/Model Components** (`app/server/`, `app/models/`):
 
@@ -360,17 +361,19 @@ Components are organized in `app/` (application-specific) and `ui/` (shadcn-svel
 | `modelsStore`        | Model list, selection, loading/unloading (ROUTER)         |
 | `serverStore`        | Server properties, role detection, modalities             |
 | `settingsStore`      | User preferences, parameter sync with server defaults     |
+| `compactionStore`    | Threshold policy, compaction generation, and activation   |
 
 #### Services (`src/lib/services/`)
 
-| Service                | Responsibility                                      |
-| ---------------------- | --------------------------------------------------- |
-| `ChatContextService`   | Prompt projections and one-request context assembly |
-| `ChatService`          | Chat requests, prompt measurement, and SSE parsing  |
-| `ModelsService`        | `/models`, `/models/load`, `/models/unload`         |
-| `PropsService`         | `/props`, `/props?model=`                           |
-| `DatabaseService`      | IndexedDB operations via Dexie                      |
-| `ParameterSyncService` | Syncs settings with server defaults                 |
+| Service                | Responsibility                                          |
+| ---------------------- | ------------------------------------------------------- |
+| `ChatContextService`   | Prompt projections and one-request context assembly     |
+| `ChatService`          | Chat requests, prompt measurement, and SSE parsing      |
+| `CompactionService`    | Safe turn ranges, structured summaries, and projections |
+| `ModelsService`        | `/models`, `/models/load`, `/models/unload`             |
+| `PropsService`         | `/props`, `/props?model=`                               |
+| `DatabaseService`      | IndexedDB operations via Dexie                          |
+| `ParameterSyncService` | Syncs settings with server defaults                     |
 
 ---
 
@@ -556,6 +559,19 @@ validated projections to the active message path and can add temporary retrieved
 changing the IndexedDB transcript. It returns a stable prompt for pre-encoding and a request prompt
 for the current inference. `ChatService` remains responsible for attachment conversion, request
 formatting, streaming, `/apply-template`, and `/tokenize`.
+
+Conversation compaction is one such projection. Its Memory settings support off, ask, and automatic
+modes, with configurable trigger, target, and protected-turn values. Before inference, the WebUI
+measures the rendered prompt against usable input capacity after reserving answer and safety space.
+It offers only complete old-turn boundaries and also protects a token-based recent tail. Automatic
+mode selects the smallest range expected to reach the target, validates the exact projected prompt,
+and makes one stricter retry if needed. Ask mode offers the same safe candidate before sending.
+
+The conversation menu remains available for manual compaction. A summary is generated with the
+active model using a fixed structured schema. Activation atomically verifies that the source is
+still unchanged, marks its IndexedDB record ready, and appends a path-local projection event. The
+stored message tree is not rewritten. A later restore event exposes the original path again, and
+JSON/JSONL export, import, deletion, and forking carry the related metadata and diagnostics.
 
 ### 6. Server Role Abstraction
 
