@@ -2,6 +2,8 @@ import type { ApiChatMessageData } from './api';
 
 export type CompactionStatus = 'pending' | 'ready';
 export type CompactionProjectionAction = 'apply' | 'restore';
+export type CompactionMode = 'off' | 'ask' | 'automatic';
+export type CompactionActivationMode = 'manual' | 'confirmed' | 'automatic';
 
 export interface DatabaseCompaction {
 	id: string;
@@ -20,6 +22,14 @@ export interface DatabaseCompaction {
 	projectedTokenCount: number;
 	previousCompactionId?: string;
 	generation: number;
+	activationMode?: CompactionActivationMode;
+	contextSize?: number;
+	usableInputTokenCount?: number;
+	triggerPercent?: number;
+	targetPercent?: number;
+	attemptCount?: number;
+	durationMs?: number;
+	strictRetryUsed?: boolean;
 }
 
 export interface DatabaseCompactionProjectionEvent {
@@ -43,6 +53,27 @@ export interface CompactionRangeCandidate {
 	endMessageId: string;
 	turnCount: number;
 	sourceTokenCount: number;
+}
+
+export interface CompactionPolicy {
+	mode: CompactionMode;
+	contextSize: number;
+	outputReserveTokens: number;
+	safetyMarginTokens: number;
+	usableInputTokens: number;
+	triggerPercent: number;
+	targetPercent: number;
+	triggerTokens: number;
+	targetTokens: number;
+	protectedTurns: number;
+	protectedTailTokens: number;
+}
+
+export interface CompactionPreflightMeasurement {
+	promptTokens: number;
+	utilizationPercent: number;
+	triggered: boolean;
+	hardLimitExceeded: boolean;
 }
 
 export interface ResolvedCompaction {

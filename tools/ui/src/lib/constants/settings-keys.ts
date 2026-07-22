@@ -62,6 +62,11 @@ export const SETTINGS_KEYS = {
 	ALWAYS_SHOW_TOOL_CALL_CONTENT: 'alwaysShowToolCallContent',
 	// Performance
 	PRE_ENCODE_CONVERSATION: 'preEncodeConversation',
+	// Memory
+	COMPACTION_MODE: 'compactionMode',
+	COMPACTION_TRIGGER_PERCENT: 'compactionTriggerPercent',
+	COMPACTION_TARGET_PERCENT: 'compactionTargetPercent',
+	COMPACTION_PROTECTED_TURNS: 'compactionProtectedTurns',
 	// Developer
 	DISABLE_REASONING_PARSING: 'disableReasoningParsing',
 	EXCLUDE_REASONING_FROM_CONTEXT: 'excludeReasoningFromContext',

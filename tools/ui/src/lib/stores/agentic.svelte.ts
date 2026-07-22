@@ -479,12 +479,13 @@ class AgenticStore {
 			createToolResultMessage,
 			updateToolResultMessage,
 			createAssistantMessage,
+			prepareMessages,
 			onFlowComplete,
 			onTimings,
 			onTurnComplete
 		} = callbacks;
 
-		const sessionMessages: AgenticMessage[] = toAgenticMessages(messages);
+		let sessionMessages: AgenticMessage[] = toAgenticMessages(messages);
 		let capturedTimings: ChatMessageTimings | undefined;
 		let totalToolCallCount = 0;
 
@@ -529,6 +530,14 @@ class AgenticStore {
 			// For turns > 0, create a new assistant message via callback
 			if (turn > 0 && createAssistantMessage) {
 				await createAssistantMessage();
+			}
+			if (turn > 0 && prepareMessages) {
+				const refreshed = await prepareMessages(turn);
+				if (!refreshed) {
+					onFlowComplete?.(this.buildFinalTimings(capturedTimings, agenticTimings));
+					return;
+				}
+				sessionMessages = toAgenticMessages(refreshed);
 			}
 
 			let turnContent = '';
