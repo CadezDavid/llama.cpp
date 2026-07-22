@@ -217,8 +217,17 @@ export class RetrievalService {
 		return { candidates, semantic: !!queryEmbedding };
 	}
 
-	private static spominCandidates(results: MemoryRetrievalHit[]): Candidate[] {
-		return results.map((result) => ({
+	private static spominCandidates(
+		results: MemoryRetrievalHit[],
+		settings: RetrievalSettings
+	): Candidate[] {
+		return results
+		.filter(
+			(result) =>
+				(result.lexical_coverage ?? 0) >= settings.lexicalThreshold ||
+				(result.semantic_score ?? 0) >= settings.semanticThreshold
+		)
+		.map((result) => ({
 			id: `spomin:${result.memory_ids?.[0] ?? result.id}`,
 			text: result.text,
 			source: 'long-term-memory',
@@ -286,11 +295,7 @@ export class RetrievalService {
 		if (!input.settings.spominEnabled) {
 			providers.spomin = { status: 'disabled' };
 		} else if (spominResult.status === 'fulfilled' && spominResult.value) {
-			remote = RetrievalService.spominCandidates(spominResult.value.results).filter(
-				(candidate) =>
-					candidate.score >=
-					Math.min(input.settings.semanticThreshold, input.settings.lexicalThreshold)
-			);
+			remote = RetrievalService.spominCandidates(spominResult.value.results, input.settings);
 			providers.spomin = {
 				status: 'ok',
 				detail: spominResult.value.semantic_available ? 'hybrid' : 'keyword-only'
