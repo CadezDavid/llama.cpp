@@ -4,6 +4,7 @@
 	import {
 		DialogChatError,
 		DialogConfirmation,
+		DialogConversationCompaction,
 		DialogEmptyFileAlert,
 		DialogFileUploadError
 	} from '$lib/components/app';
@@ -23,6 +24,8 @@
 	bind:open={fileUpload.showFileErrorDialog}
 	fileErrorData={fileUpload.fileErrorData}
 />
+
+<DialogConversationCompaction />
 
 <DialogConfirmation
 	bind:open={showDeleteDialog}

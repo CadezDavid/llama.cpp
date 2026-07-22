@@ -15,6 +15,7 @@ import { SvelteMap, SvelteSet } from 'svelte/reactivity';
 import { DatabaseService } from '$lib/services/database.service';
 import { ChatService } from '$lib/services/chat.service';
 import { ChatContextService } from '$lib/services/chat-context.service';
+import { CompactionService } from '$lib/services/compaction.service';
 import { streamIdentity } from '$lib/utils/stream-identity';
 import { getAuthHeaders } from '$lib/utils/api-headers';
 import { conversationsStore } from '$lib/stores/conversations.svelte';
@@ -54,7 +55,8 @@ import type {
 	ApiProcessingState,
 	ApiStreamSession,
 	DatabaseMessage,
-	DatabaseMessageExtra
+	DatabaseMessageExtra,
+	PreparedChatContext
 } from '$lib/types';
 import {
 	ContinueIntentKind,
@@ -115,6 +117,24 @@ class ChatStore {
 		string,
 		{ content: string; extras?: DatabaseMessageExtra[] }
 	>();
+
+	private async prepareConversationContext(
+		conversationId: string,
+		messages: DatabaseMessage[],
+		model?: string | null,
+		excludeReasoning?: boolean
+	): Promise<PreparedChatContext> {
+		const activeCompaction = await CompactionService.resolveActiveCompaction(
+			conversationId,
+			messages
+		);
+		return await ChatContextService.prepare({
+			transcriptMessages: messages,
+			model,
+			excludeReasoning,
+			projections: activeCompaction ? [CompactionService.toProjection(activeCompaction)] : []
+		});
+	}
 
 	private setChatLoading(convId: string, loading: boolean): void {
 		this.touchConversationState(convId);
@@ -1088,11 +1108,12 @@ class ChatStore {
 			...this.getApiOptions(),
 			...(effectiveModel ? { model: effectiveModel } : {})
 		} as SettingsChatServiceOptions;
-		const preparedContext = await ChatContextService.prepare({
-			transcriptMessages: allMessages,
-			model: effectiveModel,
-			excludeReasoning: !!apiOptions.excludeReasoningFromContext
-		});
+		const preparedContext = await this.prepareConversationContext(
+			assistantMessage.convId,
+			allMessages,
+			effectiveModel,
+			!!apiOptions.excludeReasoningFromContext
+		);
 		const preparedMessages = preparedContext.requestMessages;
 
 		// Mutable state for the current message being streamed
@@ -1912,11 +1933,12 @@ class ChatStore {
 				...this.getApiOptions(),
 				continueFinalMessage: true
 			} as SettingsChatServiceOptions;
-			const preparedContext = await ChatContextService.prepare({
-				transcriptMessages: contextWithContinue,
-				model: continueOptions.model,
-				excludeReasoning: !!continueOptions.excludeReasoningFromContext
-			});
+			const preparedContext = await this.prepareConversationContext(
+				msg.convId,
+				contextWithContinue,
+				continueOptions.model,
+				!!continueOptions.excludeReasoningFromContext
+			);
 
 			await ChatService.sendMessage(
 				preparedContext.requestMessages,
@@ -2370,11 +2392,7 @@ class ChatStore {
 	}
 
 	getConversationModel(messages: DatabaseMessage[]): string | null {
-		for (let i = messages.length - 1; i >= 0; i--) {
-			const message = messages[i];
-			if (message.role === MessageRole.ASSISTANT && message.model) return message.model;
-		}
-		return null;
+		return ChatService.findLatestAssistantModel(messages);
 	}
 
 	private getApiOptions(): Record<string, unknown> {
@@ -2488,11 +2506,12 @@ class ChatStore {
 				conversation.currNode,
 				false
 			) as DatabaseMessage[];
-			const preparedContext = await ChatContextService.prepare({
-				transcriptMessages: activePath,
+			const preparedContext = await this.prepareConversationContext(
+				conversationId,
+				activePath,
 				model,
 				excludeReasoning
-			});
+			);
 
 			await ChatService.preEncode(preparedContext.stableMessages, model, signal);
 		} catch (err) {
