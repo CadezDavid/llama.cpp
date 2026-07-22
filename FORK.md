@@ -33,18 +33,21 @@ The detailed design is in
 
 ## Current status
 
-The shared foundation and manual reversible compaction are implemented in the
-SvelteKit WebUI under `tools/ui`. Normal chat, continuation, and agentic
-requests use one context-preparation path. From a conversation's menu, users
-can measure old complete turns, generate a structured compaction with the
-current model, preview the token savings, apply it without changing the stored
-messages, inspect its sources, recompact it, or restore the original history.
-Compaction metadata is retained by conversation export, import, and compatible
-branch forks.
+The shared foundation and reversible compaction are implemented in the SvelteKit
+WebUI under `tools/ui`. Normal chat, continuation, and agentic requests use one
+context-preparation path. Compaction can be disabled, requested before sending,
+or run automatically when the rendered prompt crosses a configurable percentage
+of usable model input. The policy reserves output and safety capacity, targets a
+smaller post-compaction prompt, and keeps a configurable recent tail literal.
+
+From a conversation's menu, users can also measure old complete turns, generate
+a structured compaction with the current model, preview the token savings, apply
+it without changing the stored messages, inspect its sources and diagnostics,
+recompact it, or restore the original history. Compaction metadata is retained
+by conversation export, import, and compatible branch forks.
 
 The feature-specific stages are still under development:
 
-- automatic threshold compaction and compaction diagnostics;
 - Spomin configuration and explicit retrieval;
 - indexing and retrieval of literal conversation excerpts;
 - automatic retrieval orchestration, ranking, and diagnostics.
