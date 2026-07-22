@@ -62,6 +62,92 @@ function record(source: DatabaseMessage[], id = 'compact-1'): DatabaseCompaction
 describe('CompactionService', () => {
 	afterEach(() => vi.restoreAllMocks());
 
+	it('derives a usable input budget from context, output reserve, and safety margin', () => {
+		const policy = CompactionService.createPolicy({
+			mode: 'automatic',
+			contextSize: 32768,
+			maxOutputTokens: 4096,
+			triggerPercent: 80,
+			targetPercent: 50,
+			protectedTurns: 10
+		});
+
+		expect(policy).toMatchObject({
+			mode: 'automatic',
+			contextSize: 32768,
+			outputReserveTokens: 4096,
+			safetyMarginTokens: 655,
+			usableInputTokens: 28017,
+			triggerPercent: 80,
+			targetPercent: 50,
+			protectedTurns: 10
+		});
+		expect(policy.triggerTokens).toBe(Math.floor(policy.usableInputTokens * 0.8));
+		expect(policy.targetTokens).toBe(Math.floor(policy.usableInputTokens * 0.5));
+		expect(policy.protectedTailTokens).toBe(Math.floor(policy.usableInputTokens * 0.25));
+	});
+
+	it('normalizes unsafe policy values and supplies conservative defaults', () => {
+		const policy = CompactionService.createPolicy({
+			mode: 'unknown',
+			contextSize: 16384,
+			triggerPercent: 40,
+			targetPercent: 90,
+			protectedTurns: 100
+		});
+
+		expect(policy.mode).toBe('ask');
+		expect(policy.outputReserveTokens).toBe(2048);
+		expect(policy.triggerPercent).toBe(55);
+		expect(policy.targetPercent).toBe(45);
+		expect(policy.protectedTurns).toBe(32);
+	});
+
+	it('triggers at the configured threshold and distinguishes the hard limit', () => {
+		const policy = CompactionService.createPolicy({ contextSize: 32768 });
+
+		expect(CompactionService.evaluatePreflight(policy.triggerTokens - 1, policy)).toMatchObject({
+			triggered: false,
+			hardLimitExceeded: false
+		});
+		expect(CompactionService.evaluatePreflight(policy.triggerTokens, policy).triggered).toBe(true);
+		expect(
+			CompactionService.evaluatePreflight(policy.usableInputTokens, policy).hardLimitExceeded
+		).toBe(false);
+		expect(
+			CompactionService.evaluatePreflight(policy.usableInputTokens + 1, policy).hardLimitExceeded
+		).toBe(true);
+	});
+
+	it('selects the smallest source range expected to reach the target', () => {
+		const candidates = [1000, 3500, 5000].map((sourceTokenCount, index) => ({
+			sourceMessageIds: [`u${index}`],
+			endMessageId: `a${index}`,
+			turnCount: index + 1,
+			sourceTokenCount
+		}));
+
+		expect(CompactionService.selectAutomaticCandidate(candidates, 9000, 6000, 500)).toBe(1);
+		expect(CompactionService.selectAutomaticCandidate(candidates, 12000, 6000, 500)).toBe(-1);
+	});
+
+	it('accepts only projections that save enough and finish near the target', () => {
+		const policy = CompactionService.createPolicy({
+			contextSize: 10000,
+			maxOutputTokens: 1000,
+			targetPercent: 50
+		});
+		const maximumAfter = Math.floor(policy.usableInputTokens * 0.55);
+
+		expect(CompactionService.acceptsAutomaticProjection(8000, maximumAfter, policy, 1000)).toBe(
+			true
+		);
+		expect(CompactionService.acceptsAutomaticProjection(8000, maximumAfter + 1, policy, 1000)).toBe(
+			false
+		);
+		expect(CompactionService.acceptsAutomaticProjection(8000, 7500, policy, 1000)).toBe(false);
+	});
+
 	it('groups complete turns while keeping a tool exchange indivisible', () => {
 		const messages = [
 			message('root', MessageRole.SYSTEM, '', { type: MessageType.ROOT }),
@@ -159,6 +245,22 @@ describe('CompactionService', () => {
 			temperature: 0.2,
 			max_tokens: 768
 		});
+	});
+
+	it('uses deterministic generation for a strict retry', async () => {
+		const send = vi.spyOn(ChatService, 'sendMessage').mockResolvedValue(validSummary());
+
+		await CompactionService.generateSummary({
+			messages: completeTurn(1),
+			sourceMessageIds: ['u1', 'a1'],
+			deltaSourceMessageIds: ['u1', 'a1'],
+			model: 'current-model',
+			maxTokens: 512,
+			strict: true
+		});
+
+		expect(send.mock.calls[0][1]).toMatchObject({ temperature: 0, max_tokens: 512 });
+		expect(send.mock.calls[0][0][0].content).toContain('extremely concise');
 	});
 
 	it('resolves the deepest projection event on the active path', async () => {

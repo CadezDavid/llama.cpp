@@ -5,6 +5,7 @@ import { MessageRole } from '$lib/enums';
 import type { McpServerOverride } from '$lib/types/database';
 import type { ExportedConversation } from '$lib/types/database';
 import type { DatabaseCompaction, DatabaseCompactionProjectionEvent } from '$lib/types';
+import { ChatContextService } from './chat-context.service';
 
 class LlamaUiDatabase extends Dexie {
 	[IDXDB_TABLES.conversations]!: EntityTable<DatabaseConversation, string>;
@@ -511,12 +512,26 @@ export class DatabaseService {
 
 	static async activateCompaction(
 		id: string,
-		updates: Pick<DatabaseCompaction, 'summary' | 'projectedTokenCount'>,
+		updates: Pick<DatabaseCompaction, 'summary' | 'projectedTokenCount'> &
+			Partial<
+				Pick<
+					DatabaseCompaction,
+					| 'activationMode'
+					| 'contextSize'
+					| 'usableInputTokenCount'
+					| 'triggerPercent'
+					| 'targetPercent'
+					| 'attemptCount'
+					| 'durationMs'
+					| 'strictRetryUsed'
+				>
+			>,
 		anchorMessageId: string
 	): Promise<DatabaseCompactionProjectionEvent> {
 		return await db.transaction(
 			'rw',
 			[
+				db[IDXDB_TABLES.conversations],
 				db[IDXDB_TABLES.messages],
 				db[IDXDB_TABLES.compactions],
 				db[IDXDB_TABLES.compactionProjectionEvents]
@@ -529,6 +544,36 @@ export class DatabaseService {
 				const anchor = await db[IDXDB_TABLES.messages].get(anchorMessageId);
 				if (!anchor || anchor.convId !== record.conversationId) {
 					throw new Error(`Compaction anchor ${anchorMessageId} is not in the conversation`);
+				}
+				const conversation = await db[IDXDB_TABLES.conversations].get(record.conversationId);
+				if (!conversation?.currNode) throw new Error('The conversation has no active branch');
+				const conversationMessages = await db[IDXDB_TABLES.messages]
+					.where('convId')
+					.equals(record.conversationId)
+					.toArray();
+				const activePath = filterByLeafNodeId(
+					conversationMessages,
+					conversation.currNode,
+					true
+				) as DatabaseMessage[];
+				const pathIndexes = new Map(activePath.map((message, index) => [message.id, index]));
+				if (!pathIndexes.has(anchorMessageId)) {
+					throw new Error(`Compaction anchor ${anchorMessageId} is no longer active`);
+				}
+				const sourceIndexes = record.sourceMessageIds.map((sourceId) => pathIndexes.get(sourceId));
+				const sourceStart = sourceIndexes[0];
+				if (
+					sourceStart === undefined ||
+					sourceIndexes.some((sourceIndex, offset) => sourceIndex !== sourceStart + offset)
+				) {
+					throw new Error(`Compaction ${id} source range is no longer active`);
+				}
+				const sourceMessages = activePath.slice(sourceStart, sourceStart + sourceIndexes.length);
+				if (
+					(await ChatContextService.fingerprintMessages(sourceMessages)) !==
+					record.sourceFingerprint
+				) {
+					throw new Error(`Compaction ${id} source messages changed before activation`);
 				}
 				await db[IDXDB_TABLES.compactions].put({ ...record, ...updates, status: 'ready' });
 				const event: DatabaseCompactionProjectionEvent = {

@@ -83,6 +83,28 @@ class SettingsStore {
 		return ParameterSyncService.extractServerDefaults(serverParams, uiSettings);
 	}
 
+	private normalizeCompactionSettings(): void {
+		const mode = String(this.config[SETTINGS_KEYS.COMPACTION_MODE] ?? 'ask');
+		this.config[SETTINGS_KEYS.COMPACTION_MODE] = ['off', 'ask', 'automatic'].includes(mode)
+			? mode
+			: 'ask';
+		const trigger = Math.min(
+			95,
+			Math.max(55, Math.round(Number(this.config[SETTINGS_KEYS.COMPACTION_TRIGGER_PERCENT]) || 78))
+		);
+		const target = Math.min(
+			Math.min(75, trigger - 10),
+			Math.max(30, Math.round(Number(this.config[SETTINGS_KEYS.COMPACTION_TARGET_PERCENT]) || 50))
+		);
+		const protectedTurns = Math.min(
+			32,
+			Math.max(2, Math.round(Number(this.config[SETTINGS_KEYS.COMPACTION_PROTECTED_TURNS]) || 8))
+		);
+		this.config[SETTINGS_KEYS.COMPACTION_TRIGGER_PERCENT] = trigger;
+		this.config[SETTINGS_KEYS.COMPACTION_TARGET_PERCENT] = target;
+		this.config[SETTINGS_KEYS.COMPACTION_PROTECTED_TURNS] = protectedTurns;
+	}
+
 	constructor() {
 		if (browser) {
 			this.initialize();
@@ -128,6 +150,7 @@ class SettingsStore {
 				...SETTING_CONFIG_DEFAULT,
 				...savedVal
 			};
+			this.normalizeCompactionSettings();
 
 			// Default sendOnEnter to false on mobile when the user has no saved preference
 			if (!(SETTINGS_KEYS.SEND_ON_ENTER in savedVal)) {
@@ -180,6 +203,7 @@ class SettingsStore {
 	 */
 	updateConfig<K extends keyof SettingsConfigType>(key: K, value: SettingsConfigType[K]): void {
 		this.config[key] = value;
+		this.normalizeCompactionSettings();
 
 		if (ParameterSyncService.canSyncParameter(key as string)) {
 			const propsDefaults = this.getServerDefaults();
@@ -206,6 +230,7 @@ class SettingsStore {
 	 */
 	updateMultipleConfig(updates: Partial<SettingsConfigType>) {
 		Object.assign(this.config, updates);
+		this.normalizeCompactionSettings();
 
 		const propsDefaults = this.getServerDefaults();
 

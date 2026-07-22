@@ -33,6 +33,9 @@
 				{#if compactionStore.mode === 'view'}
 					<ArchiveRestore class="h-5 w-5" />
 					Compacted conversation state
+				{:else if compactionStore.mode === 'ask'}
+					<AlertTriangle class="h-5 w-5" />
+					Conversation context is getting full
 				{:else}
 					<Minimize2 class="h-5 w-5" />
 					Compact conversation
@@ -70,6 +73,24 @@
 						<div class="text-muted-foreground">Projected</div>
 						{formatTokens(compactionStore.projectedTokenCount)} tokens
 					</div>
+					<div>
+						<div class="text-muted-foreground">Activation</div>
+						{compactionStore.activeCompaction.record.activationMode ?? 'manual'}
+					</div>
+					<div>
+						<div class="text-muted-foreground">Saved</div>
+						{formatTokens(compactionStore.beforeTokenCount - compactionStore.projectedTokenCount)} tokens
+					</div>
+					<div>
+						<div class="text-muted-foreground">Attempts</div>
+						{compactionStore.activeCompaction.record.attemptCount ?? 1}
+					</div>
+					<div>
+						<div class="text-muted-foreground">Duration</div>
+						{compactionStore.activeCompaction.record.durationMs !== undefined
+							? `${(compactionStore.activeCompaction.record.durationMs / 1000).toFixed(1)} s`
+							: 'Not recorded'}
+					</div>
 				</div>
 				<pre
 					class="max-h-80 overflow-auto whitespace-pre-wrap rounded-md border bg-muted/30 p-4 text-xs">{compactionStore.summary}</pre>
@@ -98,6 +119,58 @@
 					</div>
 				</details>
 			</div>
+		{:else if compactionStore.mode === 'ask'}
+			<div class="grid gap-4">
+				{#if compactionStore.step === 'generate'}
+					<div class="py-10 text-center text-sm text-muted-foreground">
+						{compactionStore.operationStatus ?? 'Compacting conversation...'}
+					</div>
+				{:else}
+					<div class="grid grid-cols-2 gap-3 text-sm sm:grid-cols-4">
+						<div>
+							<div class="text-muted-foreground">Current prompt</div>
+							{formatTokens(compactionStore.beforeTokenCount)}
+						</div>
+						<div>
+							<div class="text-muted-foreground">Usable input</div>
+							{formatTokens(compactionStore.policy?.usableInputTokens ?? 0)}
+						</div>
+						<div>
+							<div class="text-muted-foreground">Used</div>
+							{Math.round(compactionStore.preflightMeasurement?.utilizationPercent ?? 0)}%
+						</div>
+						<div>
+							<div class="text-muted-foreground">Target</div>
+							{compactionStore.policy?.targetPercent ?? 0}%
+						</div>
+					</div>
+					<label class="grid gap-2 text-sm">
+						<span class="font-medium">Compact through turn</span>
+						<select
+							class="h-10 rounded-md border bg-background px-3"
+							value={compactionStore.selectedCandidateIndex}
+							onchange={(event) =>
+								void compactionStore.selectCandidate(Number(event.currentTarget.value))}
+						>
+							{#each compactionStore.candidates as candidate, index (candidate.endMessageId)}
+								<option value={index}
+									>Turn {candidate.turnCount} ({formatTokens(candidate.sourceTokenCount)} source tokens)</option
+								>
+							{/each}
+						</select>
+					</label>
+					<p class="text-sm text-muted-foreground">
+						Compaction keeps the original messages and replaces only the context sent to the model.
+						The recent conversation remains literal.
+					</p>
+					{#if !compactionStore.canSkipAsk}
+						<div class="rounded-md border border-destructive/40 bg-destructive/10 p-3 text-sm">
+							This request no longer fits with the configured answer reserve. It must be compacted
+							or cancelled.
+						</div>
+					{/if}
+				{/if}
+			</div>
 		{:else if compactionStore.mode === 'create'}
 			<div class="grid gap-4">
 				<div class="grid grid-cols-2 gap-3 text-sm sm:grid-cols-4">
@@ -115,7 +188,7 @@
 					</div>
 					<div>
 						<div class="text-muted-foreground">Protected tail</div>
-						8 turns
+						{compactionStore.policy?.protectedTurns ?? 8} turns minimum
 					</div>
 				</div>
 
@@ -176,7 +249,9 @@
 		{/if}
 
 		<Dialog.Footer>
-			<Button variant="outline" onclick={() => void compactionStore.close()}>Cancel</Button>
+			{#if compactionStore.mode !== 'ask'}
+				<Button variant="outline" onclick={() => void compactionStore.close()}>Cancel</Button>
+			{/if}
 			{#if compactionStore.mode === 'view' && compactionStore.activeCompaction}
 				<Button variant="outline" onclick={() => void compactionStore.openCreate()}
 					>Recompact</Button
@@ -184,6 +259,24 @@
 				<Button variant="destructive" onclick={() => void compactionStore.restore()}
 					>Restore original history</Button
 				>
+			{:else if compactionStore.mode === 'ask'}
+				{#if compactionStore.error}
+					<Button variant="outline" onclick={() => compactionStore.cancelAskCompaction()}
+						>Cancel send</Button
+					>
+				{:else if compactionStore.step !== 'generate'}
+					<Button variant="outline" onclick={() => compactionStore.cancelAskCompaction()}
+						>Cancel send</Button
+					>
+					<Button
+						variant="outline"
+						disabled={!compactionStore.canSkipAsk}
+						onclick={() => compactionStore.skipAskCompaction()}>Send without compacting</Button
+					>
+					<Button onclick={() => void compactionStore.confirmAskCompaction()}
+						>Compact and send</Button
+					>
+				{/if}
 			{:else if compactionStore.mode === 'create' && !compactionStore.error}
 				{#if compactionStore.step === 'measure'}
 					<Button onclick={() => void compactionStore.generate()}>Generate preview</Button>

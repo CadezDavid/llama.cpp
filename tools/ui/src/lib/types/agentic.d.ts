@@ -122,6 +122,8 @@ export interface AgenticFlowCallbacks {
 	) => Promise<void>;
 	/** Create a new assistant message for the next agentic turn */
 	createAssistantMessage?: () => Promise<DatabaseMessage>;
+	/** Rebuild the effective prompt before a later agentic model turn. */
+	prepareMessages?: (turn: number) => Promise<ApiChatMessageData[] | null>;
 	/** Entire agentic flow is complete */
 	onFlowComplete?: (timings?: ChatMessageTimings) => void;
 	/** Error during flow */
