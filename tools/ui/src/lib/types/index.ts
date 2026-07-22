@@ -24,6 +24,9 @@ export type {
 	ApiChatCompletionToolCall,
 	ApiChatCompletionStreamChunk,
 	ApiChatCompletionResponse,
+	ApiApplyTemplateResponse,
+	ApiTokenizeResponse,
+	ApiPromptTokenMeasurement,
 	ApiSlotData,
 	ApiProcessingState,
 	ApiRouterModelMeta,
@@ -55,6 +58,14 @@ export type {
 	AttachmentDisplayItemsOptions,
 	FileProcessingResult
 } from './chat.d';
+
+export type {
+	ChatContextSource,
+	ChatPromptProjection,
+	ChatContextBlock,
+	PrepareChatContextInput,
+	PreparedChatContext
+} from './chat-context';
 
 // Database types
 export type {

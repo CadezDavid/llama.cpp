@@ -14,6 +14,7 @@
 import { SvelteMap, SvelteSet } from 'svelte/reactivity';
 import { DatabaseService } from '$lib/services/database.service';
 import { ChatService } from '$lib/services/chat.service';
+import { ChatContextService } from '$lib/services/chat-context.service';
 import { streamIdentity } from '$lib/utils/stream-identity';
 import { getAuthHeaders } from '$lib/utils/api-headers';
 import { conversationsStore } from '$lib/stores/conversations.svelte';
@@ -1083,6 +1084,17 @@ class ChatStore {
 				await modelsStore.fetchModelProps(effectiveModel);
 		}
 
+		const apiOptions = {
+			...this.getApiOptions(),
+			...(effectiveModel ? { model: effectiveModel } : {})
+		} as SettingsChatServiceOptions;
+		const preparedContext = await ChatContextService.prepare({
+			transcriptMessages: allMessages,
+			model: effectiveModel,
+			excludeReasoning: !!apiOptions.excludeReasoningFromContext
+		});
+		const preparedMessages = preparedContext.requestMessages;
+
 		// Mutable state for the current message being streamed
 		let currentMessageId = assistantMessage.id;
 		let streamedContent = '';
@@ -1324,13 +1336,7 @@ class ChatStore {
 				if (isRouterMode()) modelsStore.fetchRouterModels().catch(console.error);
 				// Pre-encode conversation in KV cache for faster next turn
 				if (config().preEncodeConversation) {
-					this.triggerPreEncode(
-						allMessages,
-						assistantMessage,
-						streamedContent,
-						effectiveModel,
-						!!config().excludeReasoningFromContext
-					);
+					this.triggerPreEncode(convId, effectiveModel, !!config().excludeReasoningFromContext);
 				}
 			},
 			onError: async (error: Error) => {
@@ -1367,11 +1373,8 @@ class ChatStore {
 		{
 			const agenticResult = await agenticStore.runAgenticFlow({
 				conversationId: convId,
-				messages: allMessages,
-				options: {
-					...this.getApiOptions(),
-					...(effectiveModel ? { model: effectiveModel } : {})
-				},
+				messages: preparedMessages,
+				options: apiOptions,
 				callbacks: streamCallbacks,
 				signal: abortController.signal,
 				perChatOverrides
@@ -1391,10 +1394,9 @@ class ChatStore {
 		}
 
 		await ChatService.sendMessage(
-			allMessages,
+			preparedMessages,
 			{
-				...this.getApiOptions(),
-				...(effectiveModel ? { model: effectiveModel } : {}),
+				...apiOptions,
 				stream: true,
 				onChunk: streamCallbacks.onChunk,
 				onReasoningChunk: streamCallbacks.onReasoningChunk,
@@ -1440,6 +1442,10 @@ class ChatStore {
 					// issue when user switches conversations while streaming)
 					if (firstUserMessageContent) {
 						await this.generateTitleWithLLM(firstUserMessageContent, streamedContent, convId);
+					}
+
+					if (config().preEncodeConversation) {
+						this.triggerPreEncode(convId, effectiveModel, !!config().excludeReasoningFromContext);
 					}
 
 					// Check if there's a pending message queued during streaming
@@ -1902,12 +1908,20 @@ class ChatStore {
 			};
 
 			const abortController = this.getOrCreateAbortController(msg.convId);
+			const continueOptions = {
+				...this.getApiOptions(),
+				continueFinalMessage: true
+			} as SettingsChatServiceOptions;
+			const preparedContext = await ChatContextService.prepare({
+				transcriptMessages: contextWithContinue,
+				model: continueOptions.model,
+				excludeReasoning: !!continueOptions.excludeReasoningFromContext
+			});
 
 			await ChatService.sendMessage(
-				contextWithContinue,
+				preparedContext.requestMessages,
 				{
-					...this.getApiOptions(),
-					continueFinalMessage: true,
+					...continueOptions,
 					onConnectionState: (state: StreamConnectionState) => {
 						if (msg.convId === conversationsStore.activeConversation?.id) {
 							this.streamConnectionState = state;
@@ -1985,6 +1999,13 @@ class ChatStore {
 						this.setChatLoading(msg.convId, false);
 						this.clearChatStreaming(msg.convId);
 						this.setProcessingState(msg.convId, null);
+						if (config().preEncodeConversation) {
+							this.triggerPreEncode(
+								msg.convId,
+								continueOptions.model,
+								!!continueOptions.excludeReasoningFromContext
+							);
+						}
 					},
 					onError: async (error: Error) => {
 						if (isAbortError(error)) {
@@ -2444,9 +2465,7 @@ class ChatStore {
 	}
 
 	private async triggerPreEncode(
-		allMessages: DatabaseMessage[],
-		assistantMessage: DatabaseMessage,
-		assistantContent: string,
+		conversationId: string,
 		model?: string | null,
 		excludeReasoning?: boolean
 	): Promise<void> {
@@ -2459,12 +2478,23 @@ class ChatStore {
 			const allIdle = await ChatService.areAllSlotsIdle(model, signal);
 			if (!allIdle || signal.aborted) return;
 
-			const messagesWithAssistant: DatabaseMessage[] = [
-				...allMessages,
-				{ ...assistantMessage, content: assistantContent }
-			];
+			const [conversation, allMessages] = await Promise.all([
+				DatabaseService.getConversation(conversationId),
+				DatabaseService.getConversationMessages(conversationId)
+			]);
+			if (!conversation?.currNode || signal.aborted) return;
+			const activePath = filterByLeafNodeId(
+				allMessages,
+				conversation.currNode,
+				false
+			) as DatabaseMessage[];
+			const preparedContext = await ChatContextService.prepare({
+				transcriptMessages: activePath,
+				model,
+				excludeReasoning
+			});
 
-			await ChatService.preEncode(messagesWithAssistant, model, excludeReasoning, signal);
+			await ChatService.preEncode(preparedContext.stableMessages, model, signal);
 		} catch (err) {
 			if (!isAbortError(err)) {
 				console.warn('[ChatStore] Pre-encode failed:', err);

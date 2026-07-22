@@ -269,6 +269,9 @@ export interface ApiChatCompletionRequest {
 	tools?: ApiChatCompletionTool[];
 	// Reasoning parameters
 	reasoning_format?: string;
+	reasoning_control?: boolean;
+	thinking_budget_tokens?: number;
+	chat_template_kwargs?: Record<string, unknown>;
 	// Generation parameters
 	temperature?: number;
 	max_tokens?: number;
@@ -355,6 +358,20 @@ export interface ApiChatCompletionResponse {
 		};
 		finish_reason?: string | null;
 	}>;
+}
+
+export interface ApiApplyTemplateResponse {
+	prompt: string;
+}
+
+export interface ApiTokenizeResponse {
+	tokens: Array<number | { id: number; piece: string | number[] }>;
+}
+
+export interface ApiPromptTokenMeasurement {
+	tokenCount: number;
+	hasNonTextContent: boolean;
+	exactForTextOnly: boolean;
 }
 
 export interface ApiSlotData {

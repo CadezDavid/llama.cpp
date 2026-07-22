@@ -420,24 +420,6 @@ class AgenticStore {
 
 		console.log(`[AgenticStore] Starting agentic flow with ${tools.length} tools`);
 
-		const normalizedMessages: ApiChatMessageData[] = (
-			await Promise.all(
-				messages.map((msg) => {
-					if ('id' in msg && 'convId' in msg && 'timestamp' in msg)
-						return ChatService.convertDbMessageToApiChatMessageData(
-							msg as DatabaseMessage & { extra?: DatabaseMessageExtra[] }
-						);
-					return msg as ApiChatMessageData;
-				})
-			)
-		).filter((msg: { role: ChatRole; content: string | ApiChatMessageContentPart[] }) => {
-			if (msg.role === MessageRole.SYSTEM) {
-				const content = typeof msg.content === 'string' ? msg.content : '';
-				return content.trim().length > 0;
-			}
-			return true;
-		});
-
 		this.updateSession(conversationId, {
 			isRunning: true,
 			currentTurn: 0,
@@ -450,7 +432,7 @@ class AgenticStore {
 		try {
 			await this.executeAgenticLoop({
 				conversationId,
-				messages: normalizedMessages,
+				messages,
 				options,
 				tools,
 				agenticConfig,

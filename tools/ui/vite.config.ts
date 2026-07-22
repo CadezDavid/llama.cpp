@@ -91,6 +91,8 @@ export default defineConfig({
 	server: {
 		proxy: {
 			'/v1': SERVER_ORIGIN,
+			'/apply-template': SERVER_ORIGIN,
+			'/tokenize': SERVER_ORIGIN,
 			'/props': SERVER_ORIGIN,
 			'/models': SERVER_ORIGIN,
 			'/tools': SERVER_ORIGIN,
