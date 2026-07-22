@@ -65,6 +65,7 @@ export { default as SettingsMcpServers } from './SettingsMcpServers.svelte';
  * Handles validation, help text display, and parameter source indicators.
  */
 export { default as SettingsChatFields } from './SettingsChat/SettingsChatFields.svelte';
+export { default as SettingsMemoryManager } from './SettingsMemoryManager.svelte';
 
 /**
  * **SettingsChatToolsTab** - Tools configuration tab for chat settings
