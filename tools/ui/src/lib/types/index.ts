@@ -5,6 +5,16 @@
 
 // API types
 export type {
+	CompactionStatus,
+	CompactionProjectionAction,
+	DatabaseCompaction,
+	DatabaseCompactionProjectionEvent,
+	CompactionTurnUnit,
+	CompactionRangeCandidate,
+	ResolvedCompaction
+} from './compaction';
+
+export type {
 	ApiChatMessageContentPart,
 	ApiContextSizeError,
 	ApiErrorResponse,
