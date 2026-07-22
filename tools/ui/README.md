@@ -363,13 +363,14 @@ Components are organized in `app/` (application-specific) and `ui/` (shadcn-svel
 
 #### Services (`src/lib/services/`)
 
-| Service                | Responsibility                                  |
-| ---------------------- | ----------------------------------------------- |
-| `ChatService`          | API calls to`/v1/chat/completions`, SSE parsing |
-| `ModelsService`        | `/models`, `/models/load`, `/models/unload`     |
-| `PropsService`         | `/props`, `/props?model=`                       |
-| `DatabaseService`      | IndexedDB operations via Dexie                  |
-| `ParameterSyncService` | Syncs settings with server defaults             |
+| Service                | Responsibility                                      |
+| ---------------------- | --------------------------------------------------- |
+| `ChatContextService`   | Prompt projections and one-request context assembly |
+| `ChatService`          | Chat requests, prompt measurement, and SSE parsing  |
+| `ModelsService`        | `/models`, `/models/load`, `/models/unload`         |
+| `PropsService`         | `/props`, `/props?model=`                           |
+| `DatabaseService`      | IndexedDB operations via Dexie                      |
+| `ParameterSyncService` | Syncs settings with server defaults                 |
 
 ---
 
@@ -398,6 +399,7 @@ sequenceDiagram
     Note over User,API: Chat Flow
     User->>UI: send message
     Stores->>DB: save user message
+    Stores->>Stores: assemble stable and request prompt
     Stores->>API: POST /v1/chat/completions (stream)
     loop streaming
         API-->>Stores: SSE chunks
@@ -548,6 +550,12 @@ Stores handle state; services handle I/O:
 │   Storage/API   │  IndexedDB, LocalStorage, HTTP
 └─────────────────┘
 ```
+
+Chat requests pass through `ChatContextService` before `ChatService`. The context service applies
+validated projections to the active message path and can add temporary retrieved context without
+changing the IndexedDB transcript. It returns a stable prompt for pre-encoding and a request prompt
+for the current inference. `ChatService` remains responsible for attachment conversion, request
+formatting, streaming, `/apply-template`, and `/tokenize`.
 
 ### 6. Server Role Abstraction
 

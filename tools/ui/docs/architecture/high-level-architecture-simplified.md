@@ -38,6 +38,7 @@ flowchart TB
     end
 
     subgraph Services["⚙️ Services"]
+        SVC["ChatContextService<br/><i>prompt projection & ephemeral context</i>"]
         SV1["ChatService"]
         SV2["ModelsService"]
         SV3["PropsService"]
@@ -52,7 +53,7 @@ flowchart TB
     end
 
     subgraph APIs["🌐 llama-server API"]
-        API1["/v1/chat/completions"]
+        API1["/v1/chat/completions<br/>/apply-template<br/>/tokenize"]
         API2["/props"]
         API3["/models/*"]
         API4["/v1/models"]
@@ -101,7 +102,8 @@ flowchart TB
     SA --> S6
 
     %% Stores → Services
-    S1 --> SV1 & SV4
+    S1 --> SVC & SV4
+    SVC --> SV1
     S2 --> SV4
     S3 --> SV2 & SV3
     S4 --> SV3
@@ -138,7 +140,7 @@ flowchart TB
     class C_McpSettings,C_McpResourceBrowser,C_McpServersSelector componentStyle
     class H1,H2 hookStyle
     class S1,S2,S3,S4,S5,SA,S6,S7 storeStyle
-    class SV1,SV2,SV3,SV4,SV5,SV6 serviceStyle
+    class SVC,SV1,SV2,SV3,SV4,SV5,SV6 serviceStyle
     class ST1,ST2 storageStyle
     class API1,API2,API3,API4 apiStyle
     class EXT1,EXT2 externalStyle
