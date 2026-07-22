@@ -86,7 +86,13 @@ export type {
 	MemoryRecord,
 	MemoryRetrievalHit,
 	MemoryRetrievalResponse,
-	SpominClientOptions
+	SpominClientOptions,
+	ArchiveEmbeddingStatus,
+	DatabaseArchiveChunk,
+	DatabaseArchiveTerm,
+	RetrievalTraceHit,
+	DatabaseRetrievalTrace,
+	DatabaseRetrievalHitUsage
 } from './memory';
 
 // Database types

@@ -528,6 +528,49 @@ const SETTINGS_REGISTRY: Record<string, SettingsSectionEntry> = {
 				type: SettingsFieldType.INPUT,
 				section: SETTINGS_SECTION_SLUGS.MEMORY,
 				isPositiveInteger: true
+			},
+			{
+				key: SETTINGS_KEYS.LOCAL_RECALL_RESULT_LIMIT,
+				label: 'Conversation recall result limit',
+				help: 'Maximum compacted conversation fragments considered per request.',
+				defaultValue: 5,
+				type: SettingsFieldType.INPUT,
+				section: SETTINGS_SECTION_SLUGS.MEMORY,
+				isPositiveInteger: true
+			},
+			{
+				key: SETTINGS_KEYS.LOCAL_RECALL_TOKEN_BUDGET,
+				label: 'Conversation recall token budget',
+				help: 'Maximum approximate tokens injected from compacted conversation history.',
+				defaultValue: 1500,
+				type: SettingsFieldType.INPUT,
+				section: SETTINGS_SECTION_SLUGS.MEMORY,
+				isPositiveInteger: true
+			},
+			{
+				key: SETTINGS_KEYS.TOTAL_RECALL_TOKEN_BUDGET,
+				label: 'Total recall token budget',
+				help: 'Shared cap across conversation recall and Spomin.',
+				defaultValue: 2500,
+				type: SettingsFieldType.INPUT,
+				section: SETTINGS_SECTION_SLUGS.MEMORY,
+				isPositiveInteger: true
+			},
+			{
+				key: SETTINGS_KEYS.SEMANTIC_RECALL_THRESHOLD,
+				label: 'Semantic recall threshold',
+				help: 'Minimum cosine similarity for a local semantic match.',
+				defaultValue: 0.62,
+				type: SettingsFieldType.INPUT,
+				section: SETTINGS_SECTION_SLUGS.MEMORY
+			},
+			{
+				key: SETTINGS_KEYS.LEXICAL_RECALL_THRESHOLD,
+				label: 'Lexical recall threshold',
+				help: 'Minimum query-term coverage for a local keyword match.',
+				defaultValue: 0.34,
+				type: SettingsFieldType.INPUT,
+				section: SETTINGS_SECTION_SLUGS.MEMORY
 			}
 		]
 	},

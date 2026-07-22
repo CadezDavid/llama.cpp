@@ -36,3 +36,65 @@ export interface SpominClientOptions {
 	apiToken?: string;
 	timeoutMs?: number;
 }
+
+export type ArchiveEmbeddingStatus = 'pending' | 'ready' | 'failed';
+
+export interface DatabaseArchiveChunk {
+	id: string;
+	conversationId: string;
+	compactionId: string;
+	generation: number;
+	sourceMessageIds: string[];
+	text: string;
+	terms: string[];
+	createdAt: number;
+	embedding?: number[];
+	embeddingModel?: string;
+	embeddingStatus: ArchiveEmbeddingStatus;
+	embeddingError?: string;
+}
+
+export interface DatabaseArchiveTerm {
+	id: string;
+	conversationId: string;
+	chunkId: string;
+	term: string;
+}
+
+export interface RetrievalTraceHit {
+	id: string;
+	source: 'conversation-recall' | 'long-term-memory';
+	score: number;
+	selected: boolean;
+	reason?: string;
+	tokenCount?: number;
+}
+
+export interface DatabaseRetrievalTrace {
+	id: string;
+	conversationId: string;
+	anchorMessageId: string;
+	createdAt: number;
+	query: string;
+	queryFingerprint: string;
+	queryTerms: string[];
+	compactionGeneration: number;
+	providers: Record<string, { status: 'ok' | 'timeout' | 'error' | 'disabled'; detail?: string }>;
+	hits: RetrievalTraceHit[];
+	injectedHitIds: string[];
+	injectedTokenCount: number;
+	finalPromptTokenCount?: number;
+}
+
+export interface DatabaseRetrievalHitUsage {
+	id: string;
+	conversationId: string;
+	hitId: string;
+	source: 'conversation-recall' | 'long-term-memory';
+	lastInjectedUserTurn: number;
+	queryFingerprint: string;
+	queryTerms: string[];
+	score: number;
+	compactionGeneration: number;
+	updatedAt: number;
+}

@@ -1,23 +1,67 @@
 import Dexie, { type EntityTable } from 'dexie';
 import { findDescendantMessages, uuid, filterByLeafNodeId } from '$lib/utils';
-import { IDXDB_TABLES, IDXDB_STORES, IDXDB_STORES_V1, STORAGE_APP_NAME } from '$lib/constants';
+import {
+	IDXDB_TABLES,
+	IDXDB_STORES,
+	IDXDB_STORES_V1,
+	IDXDB_STORES_V3,
+	STORAGE_APP_NAME
+} from '$lib/constants';
 import { MessageRole } from '$lib/enums';
 import type { McpServerOverride } from '$lib/types/database';
 import type { ExportedConversation } from '$lib/types/database';
 import type { DatabaseCompaction, DatabaseCompactionProjectionEvent } from '$lib/types';
+import type {
+	DatabaseArchiveChunk,
+	DatabaseArchiveTerm,
+	DatabaseRetrievalTrace,
+	DatabaseRetrievalHitUsage
+} from '$lib/types';
 import { ChatContextService } from './chat-context.service';
+
+function createArchiveChunks(
+	record: DatabaseCompaction,
+	messages: DatabaseMessage[]
+): DatabaseArchiveChunk[] {
+	const archivedIds = new Set(record.deltaSourceMessageIds);
+	return messages
+		.filter((message) => archivedIds.has(message.id) && message.content.trim())
+		.flatMap((message) => {
+			const words = message.content.trim().split(/\s+/);
+			const pieces: string[] = [];
+			for (let offset = 0; offset < words.length; offset += 500) {
+				pieces.push(words.slice(offset, offset + 500).join(' '));
+			}
+			return pieces.map((piece) => ({
+				id: uuid(),
+				conversationId: record.conversationId,
+				compactionId: record.id,
+				generation: record.generation,
+				sourceMessageIds: [message.id],
+				text: `${message.role}: ${piece}`,
+				terms: Array.from(new Set(piece.toLowerCase().match(/[\p{L}\p{N}_-]+/gu) ?? [])),
+				createdAt: Date.now(),
+				embeddingStatus: 'pending' as const
+			}));
+		});
+}
 
 class LlamaUiDatabase extends Dexie {
 	[IDXDB_TABLES.conversations]!: EntityTable<DatabaseConversation, string>;
 	[IDXDB_TABLES.messages]!: EntityTable<DatabaseMessage, string>;
 	[IDXDB_TABLES.compactions]!: EntityTable<DatabaseCompaction, 'id'>;
 	[IDXDB_TABLES.compactionProjectionEvents]!: EntityTable<DatabaseCompactionProjectionEvent, 'id'>;
+	[IDXDB_TABLES.archiveChunks]!: EntityTable<DatabaseArchiveChunk, 'id'>;
+	[IDXDB_TABLES.archiveTerms]!: EntityTable<DatabaseArchiveTerm, 'id'>;
+	[IDXDB_TABLES.retrievalTraces]!: EntityTable<DatabaseRetrievalTrace, 'id'>;
+	[IDXDB_TABLES.retrievalHitUsage]!: EntityTable<DatabaseRetrievalHitUsage, 'id'>;
 
 	constructor() {
 		super(STORAGE_APP_NAME);
 
 		this.version(1).stores(IDXDB_STORES_V1);
 		this.version(2).stores(IDXDB_STORES);
+		this.version(3).stores(IDXDB_STORES_V3);
 	}
 }
 
@@ -192,7 +236,11 @@ export class DatabaseService {
 				db[IDXDB_TABLES.conversations],
 				db[IDXDB_TABLES.messages],
 				db[IDXDB_TABLES.compactions],
-				db[IDXDB_TABLES.compactionProjectionEvents]
+				db[IDXDB_TABLES.compactionProjectionEvents],
+				db[IDXDB_TABLES.archiveChunks],
+				db[IDXDB_TABLES.archiveTerms],
+				db[IDXDB_TABLES.retrievalTraces],
+				db[IDXDB_TABLES.retrievalHitUsage]
 			],
 			async () => {
 				if (options?.deleteWithForks) {
@@ -220,6 +268,22 @@ export class DatabaseService {
 							.where('conversationId')
 							.equals(forkId)
 							.delete();
+						await db[IDXDB_TABLES.archiveChunks]
+							.where('conversationId')
+							.equals(forkId)
+							.delete();
+						await db[IDXDB_TABLES.archiveTerms]
+							.where('conversationId')
+							.equals(forkId)
+							.delete();
+						await db[IDXDB_TABLES.retrievalTraces]
+							.where('conversationId')
+							.equals(forkId)
+							.delete();
+						await db[IDXDB_TABLES.retrievalHitUsage]
+							.where('conversationId')
+							.equals(forkId)
+							.delete();
 					}
 				} else {
 					await this.reparentDirectChildren(id);
@@ -232,6 +296,10 @@ export class DatabaseService {
 					.where('conversationId')
 					.equals(id)
 					.delete();
+				await db[IDXDB_TABLES.archiveChunks].where('conversationId').equals(id).delete();
+				await db[IDXDB_TABLES.archiveTerms].where('conversationId').equals(id).delete();
+				await db[IDXDB_TABLES.retrievalTraces].where('conversationId').equals(id).delete();
+				await db[IDXDB_TABLES.retrievalHitUsage].where('conversationId').equals(id).delete();
 			}
 		);
 	}
@@ -303,7 +371,11 @@ export class DatabaseService {
 				db[IDXDB_TABLES.conversations],
 				db[IDXDB_TABLES.messages],
 				db[IDXDB_TABLES.compactions],
-				db[IDXDB_TABLES.compactionProjectionEvents]
+				db[IDXDB_TABLES.compactionProjectionEvents],
+				db[IDXDB_TABLES.archiveChunks],
+				db[IDXDB_TABLES.archiveTerms],
+				db[IDXDB_TABLES.retrievalTraces],
+				db[IDXDB_TABLES.retrievalHitUsage]
 			],
 			async () => {
 				// Pre-load each to-delete conversation so the per-id reparent
@@ -337,6 +409,22 @@ export class DatabaseService {
 					.where('conversationId')
 					.anyOf(cleanIds)
 					.delete();
+				await db[IDXDB_TABLES.archiveChunks]
+					.where('conversationId')
+					.anyOf(cleanIds)
+					.delete();
+				await db[IDXDB_TABLES.archiveTerms]
+					.where('conversationId')
+					.anyOf(cleanIds)
+					.delete();
+				await db[IDXDB_TABLES.retrievalTraces]
+					.where('conversationId')
+					.anyOf(cleanIds)
+					.delete();
+				await db[IDXDB_TABLES.retrievalHitUsage]
+					.where('conversationId')
+					.anyOf(cleanIds)
+					.delete();
 			}
 		);
 	}
@@ -352,7 +440,9 @@ export class DatabaseService {
 			[
 				db[IDXDB_TABLES.messages],
 				db[IDXDB_TABLES.compactions],
-				db[IDXDB_TABLES.compactionProjectionEvents]
+				db[IDXDB_TABLES.compactionProjectionEvents],
+				db[IDXDB_TABLES.archiveChunks],
+				db[IDXDB_TABLES.archiveTerms]
 			],
 			async () => {
 				const message = await db[IDXDB_TABLES.messages].get(messageId);
@@ -379,6 +469,14 @@ export class DatabaseService {
 					.equals(messageId)
 					.delete();
 				if (invalidIds.length > 0) {
+					const invalidChunks = await db[IDXDB_TABLES.archiveChunks]
+						.where('compactionId')
+						.anyOf(invalidIds)
+						.primaryKeys();
+					if (invalidChunks.length) {
+						await db[IDXDB_TABLES.archiveTerms].where('chunkId').anyOf(invalidChunks).delete();
+						await db[IDXDB_TABLES.archiveChunks].bulkDelete(invalidChunks);
+					}
 					await db[IDXDB_TABLES.compactionProjectionEvents]
 						.where('conversationId')
 						.equals(message.convId)
@@ -407,7 +505,9 @@ export class DatabaseService {
 			[
 				db[IDXDB_TABLES.messages],
 				db[IDXDB_TABLES.compactions],
-				db[IDXDB_TABLES.compactionProjectionEvents]
+				db[IDXDB_TABLES.compactionProjectionEvents],
+				db[IDXDB_TABLES.archiveChunks],
+				db[IDXDB_TABLES.archiveTerms]
 			],
 			async () => {
 				// Get all messages in the conversation to find descendants
@@ -446,6 +546,14 @@ export class DatabaseService {
 					.anyOf(allToDelete)
 					.delete();
 				if (invalidIds.length > 0) {
+					const invalidChunks = await db[IDXDB_TABLES.archiveChunks]
+						.where('compactionId')
+						.anyOf(invalidIds)
+						.primaryKeys();
+					if (invalidChunks.length) {
+						await db[IDXDB_TABLES.archiveTerms].where('chunkId').anyOf(invalidChunks).delete();
+						await db[IDXDB_TABLES.archiveChunks].bulkDelete(invalidChunks);
+					}
 					await db[IDXDB_TABLES.compactionProjectionEvents]
 						.where('conversationId')
 						.equals(conversationId)
@@ -534,7 +642,9 @@ export class DatabaseService {
 				db[IDXDB_TABLES.conversations],
 				db[IDXDB_TABLES.messages],
 				db[IDXDB_TABLES.compactions],
-				db[IDXDB_TABLES.compactionProjectionEvents]
+				db[IDXDB_TABLES.compactionProjectionEvents],
+				db[IDXDB_TABLES.archiveChunks],
+				db[IDXDB_TABLES.archiveTerms]
 			],
 			async () => {
 				const record = await db[IDXDB_TABLES.compactions].get(id);
@@ -585,6 +695,17 @@ export class DatabaseService {
 					createdAt: Date.now()
 				};
 				await db[IDXDB_TABLES.compactionProjectionEvents].add(event);
+				const archiveChunks = createArchiveChunks(record, sourceMessages);
+				const archiveTerms: DatabaseArchiveTerm[] = archiveChunks.flatMap((chunk) =>
+					chunk.terms.map((term) => ({
+						id: `${chunk.id}:${term}`,
+						conversationId: chunk.conversationId,
+						chunkId: chunk.id,
+						term
+					}))
+				);
+				if (archiveChunks.length) await db[IDXDB_TABLES.archiveChunks].bulkAdd(archiveChunks);
+				if (archiveTerms.length) await db[IDXDB_TABLES.archiveTerms].bulkAdd(archiveTerms);
 				return event;
 			}
 		);
@@ -641,6 +762,62 @@ export class DatabaseService {
 		if (abandoned.length > 0) await db[IDXDB_TABLES.compactions].bulkDelete(abandoned);
 	}
 
+	static async getConversationArchiveChunks(
+		conversationId: string
+	): Promise<DatabaseArchiveChunk[]> {
+		return await db[IDXDB_TABLES.archiveChunks]
+			.where('conversationId')
+			.equals(conversationId)
+			.toArray();
+	}
+
+	static async getPendingArchiveChunks(
+		conversationId: string,
+		limit = 16
+	): Promise<DatabaseArchiveChunk[]> {
+		return await db[IDXDB_TABLES.archiveChunks]
+			.where('conversationId')
+			.equals(conversationId)
+			.filter((chunk) => chunk.embeddingStatus === 'pending')
+			.limit(limit)
+			.toArray();
+	}
+
+	static async updateArchiveChunk(
+		id: string,
+		changes: Partial<DatabaseArchiveChunk>
+	): Promise<void> {
+		await db[IDXDB_TABLES.archiveChunks].update(id, changes);
+	}
+
+	static async addRetrievalTrace(trace: DatabaseRetrievalTrace): Promise<void> {
+		await db[IDXDB_TABLES.retrievalTraces].add(trace);
+	}
+
+	static async getRetrievalTraces(
+		conversationId: string,
+		limit = 20
+	): Promise<DatabaseRetrievalTrace[]> {
+		return (await db[IDXDB_TABLES.retrievalTraces]
+			.where('conversationId')
+			.equals(conversationId)
+			.reverse()
+			.sortBy('createdAt')).slice(0, limit);
+	}
+
+	static async getRetrievalHitUsage(
+		conversationId: string
+	): Promise<DatabaseRetrievalHitUsage[]> {
+		return await db[IDXDB_TABLES.retrievalHitUsage]
+			.where('conversationId')
+			.equals(conversationId)
+			.toArray();
+	}
+
+	static async putRetrievalHitUsage(records: DatabaseRetrievalHitUsage[]): Promise<void> {
+		if (records.length) await db[IDXDB_TABLES.retrievalHitUsage].bulkPut(records);
+	}
+
 	/**
 	 * Loads multiple conversations with all of their messages in two bulk
 	 * reads. Missing conversations are silently omitted from the result.
@@ -655,11 +832,22 @@ export class DatabaseService {
 		const cleanIds = convIds.filter((id): id is string => typeof id === 'string' && id.length > 0);
 		if (cleanIds.length === 0) return result;
 
-		const [convs, allMessages, allCompactions, allProjectionEvents] = await Promise.all([
+		const [
+			convs,
+			allMessages,
+			allCompactions,
+			allProjectionEvents,
+			allArchiveChunks,
+			allRetrievalTraces,
+			allRetrievalUsage
+		] = await Promise.all([
 			db[IDXDB_TABLES.conversations].bulkGet(cleanIds),
 			db[IDXDB_TABLES.messages].where('convId').anyOf(cleanIds).toArray(),
 			db[IDXDB_TABLES.compactions].where('conversationId').anyOf(cleanIds).toArray(),
-			db[IDXDB_TABLES.compactionProjectionEvents].where('conversationId').anyOf(cleanIds).toArray()
+			db[IDXDB_TABLES.compactionProjectionEvents].where('conversationId').anyOf(cleanIds).toArray(),
+			db[IDXDB_TABLES.archiveChunks].where('conversationId').anyOf(cleanIds).toArray(),
+			db[IDXDB_TABLES.retrievalTraces].where('conversationId').anyOf(cleanIds).toArray(),
+			db[IDXDB_TABLES.retrievalHitUsage].where('conversationId').anyOf(cleanIds).toArray()
 		]);
 
 		const messagesByConv = new Map<string, DatabaseMessage[]>();
@@ -680,6 +868,24 @@ export class DatabaseService {
 			if (bucket) bucket.push(event);
 			else eventsByConv.set(event.conversationId, [event]);
 		}
+		const archivesByConv = new Map<string, DatabaseArchiveChunk[]>();
+		for (const item of allArchiveChunks) {
+			const bucket = archivesByConv.get(item.conversationId);
+			if (bucket) bucket.push(item);
+			else archivesByConv.set(item.conversationId, [item]);
+		}
+		const tracesByConv = new Map<string, DatabaseRetrievalTrace[]>();
+		for (const item of allRetrievalTraces) {
+			const bucket = tracesByConv.get(item.conversationId);
+			if (bucket) bucket.push(item);
+			else tracesByConv.set(item.conversationId, [item]);
+		}
+		const usageByConv = new Map<string, DatabaseRetrievalHitUsage[]>();
+		for (const item of allRetrievalUsage) {
+			const bucket = usageByConv.get(item.conversationId);
+			if (bucket) bucket.push(item);
+			else usageByConv.set(item.conversationId, [item]);
+		}
 
 		for (let i = 0; i < cleanIds.length; i++) {
 			const conv = convs[i];
@@ -691,7 +897,10 @@ export class DatabaseService {
 				conv,
 				messages,
 				compactions: compactionsByConv.get(conv.id) ?? [],
-				compactionProjectionEvents: eventsByConv.get(conv.id) ?? []
+				compactionProjectionEvents: eventsByConv.get(conv.id) ?? [],
+				archiveChunks: archivesByConv.get(conv.id) ?? [],
+				retrievalTraces: tracesByConv.get(conv.id) ?? [],
+				retrievalHitUsage: usageByConv.get(conv.id) ?? []
 			});
 		}
 		return result;
@@ -823,11 +1032,23 @@ export class DatabaseService {
 				db[IDXDB_TABLES.conversations],
 				db[IDXDB_TABLES.messages],
 				db[IDXDB_TABLES.compactions],
-				db[IDXDB_TABLES.compactionProjectionEvents]
+				db[IDXDB_TABLES.compactionProjectionEvents],
+				db[IDXDB_TABLES.archiveChunks],
+				db[IDXDB_TABLES.archiveTerms],
+				db[IDXDB_TABLES.retrievalTraces],
+				db[IDXDB_TABLES.retrievalHitUsage]
 			],
 			async () => {
 				for (const item of data) {
-					const { conv, messages, compactions, compactionProjectionEvents } = item;
+					const {
+						conv,
+						messages,
+						compactions,
+						compactionProjectionEvents,
+						archiveChunks,
+						retrievalTraces,
+						retrievalHitUsage
+					} = item;
 
 					const existing = await db[IDXDB_TABLES.conversations].get(conv.id);
 					if (existing) {
@@ -843,6 +1064,25 @@ export class DatabaseService {
 					if (compactions?.length) await db[IDXDB_TABLES.compactions].bulkPut(compactions);
 					if (compactionProjectionEvents?.length) {
 						await db[IDXDB_TABLES.compactionProjectionEvents].bulkPut(compactionProjectionEvents);
+					}
+					if (archiveChunks?.length) {
+						await db[IDXDB_TABLES.archiveChunks].bulkPut(archiveChunks);
+						await db[IDXDB_TABLES.archiveTerms].bulkPut(
+							archiveChunks.flatMap((chunk) =>
+								chunk.terms.map((term) => ({
+									id: `${chunk.id}:${term}`,
+									conversationId: chunk.conversationId,
+									chunkId: chunk.id,
+									term
+								}))
+							)
+						);
+					}
+					if (retrievalTraces?.length) {
+						await db[IDXDB_TABLES.retrievalTraces].bulkPut(retrievalTraces);
+					}
+					if (retrievalHitUsage?.length) {
+						await db[IDXDB_TABLES.retrievalHitUsage].bulkPut(retrievalHitUsage);
 					}
 
 					importedCount++;
@@ -881,7 +1121,9 @@ export class DatabaseService {
 				db[IDXDB_TABLES.conversations],
 				db[IDXDB_TABLES.messages],
 				db[IDXDB_TABLES.compactions],
-				db[IDXDB_TABLES.compactionProjectionEvents]
+				db[IDXDB_TABLES.compactionProjectionEvents],
+				db[IDXDB_TABLES.archiveChunks],
+				db[IDXDB_TABLES.archiveTerms]
 			],
 			async () => {
 				const sourceConv = await db[IDXDB_TABLES.conversations].get(sourceConvId);
@@ -939,7 +1181,8 @@ export class DatabaseService {
 								serverId: o.serverId,
 								enabled: o.enabled
 							}))
-						: undefined
+						: undefined,
+					memoryProject: sourceConv.memoryProject
 				};
 
 				await db[IDXDB_TABLES.conversations].add(newConv);
@@ -1013,6 +1256,32 @@ export class DatabaseService {
 						anchorMessageId,
 						compactionId
 					});
+				}
+
+				const sourceArchive = await db[IDXDB_TABLES.archiveChunks]
+					.where('conversationId')
+					.equals(sourceConvId)
+					.toArray();
+				for (const chunk of sourceArchive) {
+					const compactionId = compactionIdMap.get(chunk.compactionId);
+					if (!compactionId || !chunk.sourceMessageIds.every((id) => idMap.has(id))) continue;
+					const newId = uuid();
+					const cloned = {
+						...chunk,
+						id: newId,
+						conversationId: newConvId,
+						compactionId,
+						sourceMessageIds: chunk.sourceMessageIds.map((id) => idMap.get(id)!)
+					};
+					await db[IDXDB_TABLES.archiveChunks].add(cloned);
+					await db[IDXDB_TABLES.archiveTerms].bulkAdd(
+						cloned.terms.map((term) => ({
+							id: `${newId}:${term}`,
+							conversationId: newConvId,
+							chunkId: newId,
+							term
+						}))
+					);
 				}
 
 				return newConv;

@@ -2,9 +2,10 @@
 	import { Button } from '$lib/components/ui/button';
 	import { Input } from '$lib/components/ui/input';
 	import { SpominService } from '$lib/services';
+	import { DatabaseService } from '$lib/services/database.service';
 	import { config } from '$lib/stores/settings.svelte';
 	import { conversationsStore } from '$lib/stores/conversations.svelte';
-	import type { MemoryRecord } from '$lib/types';
+	import type { DatabaseRetrievalTrace, MemoryRecord } from '$lib/types';
 
 	let records = $state<MemoryRecord[]>([]);
 	let loading = $state(false);
@@ -14,6 +15,7 @@
 	let project = $state('');
 	let tier = $state<'archive' | 'core'>('archive');
 	let conversationProject = $state(conversationsStore.activeConversation?.memoryProject ?? '');
+	let traces = $state<DatabaseRetrievalTrace[]>([]);
 
 	function client(): SpominService {
 		const current = config();
@@ -29,6 +31,12 @@
 		error = null;
 		const service = client();
 		try {
+			if (conversationsStore.activeConversation) {
+				traces = await DatabaseService.getRetrievalTraces(
+					conversationsStore.activeConversation.id,
+					10
+				);
+			}
 			reachable = await service.health();
 			if (!reachable) throw new Error('Spomin is not reachable');
 			records = await service.list({ limit: 50, project: String(config().spominProject || '') });
@@ -161,4 +169,28 @@
 			<p class="truncate text-xs text-muted-foreground" title={record.id}>{record.id}</p>
 		</div>
 	{/each}
+
+	{#if traces.length}
+		<div class="space-y-2 border-t border-border/30 pt-4">
+			<h4 class="font-medium">Recent recall decisions</h4>
+			{#each traces as trace (trace.id)}
+				<details class="rounded-md border p-3 text-xs">
+					<summary class="cursor-pointer">
+						{new Date(trace.createdAt).toLocaleString()} - {trace.injectedHitIds.length} injected,
+						{trace.injectedTokenCount} tokens
+					</summary>
+					<p class="mt-2 whitespace-pre-wrap text-muted-foreground">{trace.query}</p>
+					<p class="mt-2">Providers: {JSON.stringify(trace.providers)}</p>
+					<ul class="mt-2 space-y-1">
+						{#each trace.hits as hit (`${hit.source}:${hit.id}`)}
+							<li>
+								{hit.selected ? 'injected' : `skipped (${hit.reason ?? 'ranking'})`} -
+								{hit.source}:{hit.id} - score {hit.score.toFixed(3)}
+							</li>
+						{/each}
+					</ul>
+				</details>
+			{/each}
+		</div>
+	{/if}
 </section>

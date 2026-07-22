@@ -77,6 +77,11 @@ export const SETTINGS_KEYS = {
 	EMBEDDING_BASE_URL: 'embeddingBaseUrl',
 	EMBEDDING_MODEL: 'embeddingModel',
 	EMBEDDING_TIMEOUT_MS: 'embeddingTimeoutMs',
+	LOCAL_RECALL_RESULT_LIMIT: 'localRecallResultLimit',
+	LOCAL_RECALL_TOKEN_BUDGET: 'localRecallTokenBudget',
+	TOTAL_RECALL_TOKEN_BUDGET: 'totalRecallTokenBudget',
+	SEMANTIC_RECALL_THRESHOLD: 'semanticRecallThreshold',
+	LEXICAL_RECALL_THRESHOLD: 'lexicalRecallThreshold',
 	// Developer
 	DISABLE_REASONING_PARSING: 'disableReasoningParsing',
 	EXCLUDE_REASONING_FROM_CONTEXT: 'excludeReasoningFromContext',
