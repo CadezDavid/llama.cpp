@@ -59,6 +59,7 @@ export interface CompactionPolicy {
 	mode: CompactionMode;
 	contextSize: number;
 	outputReserveTokens: number;
+	retrievalReserveTokens: number;
 	safetyMarginTokens: number;
 	usableInputTokens: number;
 	triggerPercent: number;

@@ -16,6 +16,7 @@ import { DatabaseService } from '$lib/services/database.service';
 import { ChatService } from '$lib/services/chat.service';
 import { ChatContextService } from '$lib/services/chat-context.service';
 import { CompactionService } from '$lib/services/compaction.service';
+import { RetrievalService } from '$lib/services/retrieval.service';
 import { compactionStore } from '$lib/stores/compaction.svelte';
 import { streamIdentity } from '$lib/utils/stream-identity';
 import { getAuthHeaders } from '$lib/utils/api-headers';
@@ -124,18 +125,87 @@ class ChatStore {
 		conversationId: string,
 		messages: DatabaseMessage[],
 		model?: string | null,
-		excludeReasoning?: boolean
+		excludeReasoning?: boolean,
+		measurementOptions?: SettingsChatServiceOptions,
+		includeRecall = true
 	): Promise<PreparedChatContext> {
 		const activeCompaction = await CompactionService.resolveActiveCompaction(
 			conversationId,
 			messages
 		);
-		return await ChatContextService.prepare({
+		const baseInput = {
 			transcriptMessages: messages,
 			model,
 			excludeReasoning,
 			projections: activeCompaction ? [CompactionService.toProjection(activeCompaction)] : []
-		});
+		};
+		if (!includeRecall || !messages.at(-1)?.id) {
+			return await ChatContextService.prepare(baseInput);
+		}
+		try {
+			const currentConfig = config();
+			const conversation = await DatabaseService.getConversation(conversationId);
+			const preparation = await RetrievalService.prepare({
+				conversationId,
+				anchorMessageId: messages.at(-1)!.id,
+				messages,
+				compactionGeneration: activeCompaction?.record.generation ?? 0,
+				settings: {
+					spominEnabled: Boolean(currentConfig.spominEnabled),
+					spominBaseUrl: String(currentConfig.spominBaseUrl || 'http://127.0.0.1:8084'),
+					spominApiToken: String(currentConfig.spominApiToken || ''),
+					spominProject:
+						conversation?.memoryProject || String(currentConfig.spominProject || '') || undefined,
+					spominResultLimit: Number(currentConfig.spominResultLimit) || 3,
+					spominTokenBudget: Number(currentConfig.spominTokenBudget) || 1000,
+					spominTimeoutMs: Number(currentConfig.spominTimeoutMs) || 750,
+					embeddingBaseUrl: String(
+						currentConfig.embeddingBaseUrl || 'http://127.0.0.1:8081/v1'
+					),
+					embeddingModel: String(
+						currentConfig.embeddingModel || 'embeddinggemma-300M-Q8_0.gguf'
+					),
+					embeddingTimeoutMs: Number(currentConfig.embeddingTimeoutMs) || 1200,
+					localResultLimit: Number(currentConfig.localRecallResultLimit) || 5,
+					localTokenBudget: Number(currentConfig.localRecallTokenBudget) || 1500,
+					totalTokenBudget: Number(currentConfig.totalRecallTokenBudget) || 2500,
+					semanticThreshold: Number(currentConfig.semanticRecallThreshold) || 0.62,
+					lexicalThreshold: Number(currentConfig.lexicalRecallThreshold) || 0.34
+				}
+			});
+			let blocks = preparation.blocks;
+			let prepared = await ChatContextService.prepare({ ...baseInput, contextBlocks: blocks });
+			let finalTokens: number | undefined;
+			const modelContextSize = isRouterMode()
+				? ((model ? modelsStore.getModelContextSize(model) : null) ??
+					selectedModelContextSize() ??
+					0)
+				: (contextSize() ?? 0);
+			if (modelContextSize && blocks.length) {
+				const outputReserve = Number(currentConfig.max_tokens) || Math.min(8192, modelContextSize * 0.1);
+				const maximumInput = modelContextSize - outputReserve - Math.max(256, modelContextSize * 0.02);
+				while (true) {
+					finalTokens = (
+						await ChatService.measurePrompt(prepared.requestMessages, {
+							...measurementOptions,
+							model: model || undefined
+						})
+					).tokenCount;
+					if (finalTokens <= maximumInput || blocks.length === 0) break;
+					blocks = blocks.slice(0, -1);
+					prepared = await ChatContextService.prepare({ ...baseInput, contextBlocks: blocks });
+				}
+			}
+			await RetrievalService.finalize(
+				preparation,
+				blocks.map((block) => block.id),
+				finalTokens
+			);
+			return prepared;
+		} catch (error) {
+			console.warn('[ChatStore] Recall unavailable; continuing without recalled context:', error);
+			return await ChatContextService.prepare(baseInput);
+		}
 	}
 
 	private async runCompactionPreflight(
@@ -159,6 +229,7 @@ class ChatStore {
 			model: model ?? undefined,
 			contextSize: modelContextSize,
 			maxOutputTokens: Number(currentConfig.max_tokens) || undefined,
+			retrievalReserveTokens: Number(currentConfig.totalRecallTokenBudget) || 2500,
 			mode: modeOverride ?? (String(currentConfig.compactionMode ?? 'ask') as CompactionMode),
 			triggerPercent: Number(currentConfig.compactionTriggerPercent) || 78,
 			targetPercent: Number(currentConfig.compactionTargetPercent) || 50,
@@ -1175,7 +1246,8 @@ class ChatStore {
 			assistantMessage.convId,
 			allMessages,
 			effectiveModel,
-			!!apiOptions.excludeReasoningFromContext
+			!!apiOptions.excludeReasoningFromContext,
+			apiOptions
 		);
 		const preparedMessages = preparedContext.requestMessages;
 
@@ -1441,7 +1513,8 @@ class ChatStore {
 					convId,
 					transcript,
 					effectiveModel,
-					!!apiOptions.excludeReasoningFromContext
+					!!apiOptions.excludeReasoningFromContext,
+					apiOptions
 				);
 				return refreshed.requestMessages;
 			},
@@ -2051,7 +2124,8 @@ class ChatStore {
 				msg.convId,
 				contextWithContinue,
 				continueOptions.model,
-				!!continueOptions.excludeReasoningFromContext
+				!!continueOptions.excludeReasoningFromContext,
+				continueOptions
 			);
 
 			await ChatService.sendMessage(
@@ -2636,7 +2710,9 @@ class ChatStore {
 				conversationId,
 				activePath,
 				model,
-				excludeReasoning
+				excludeReasoning,
+				undefined,
+				false
 			);
 
 			await ChatService.preEncode(preparedContext.stableMessages, model, signal);

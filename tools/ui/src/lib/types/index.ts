@@ -81,6 +81,20 @@ export type {
 	PreparedChatContext
 } from './chat-context';
 
+export type {
+	MemoryProviderCapabilities,
+	MemoryRecord,
+	MemoryRetrievalHit,
+	MemoryRetrievalResponse,
+	SpominClientOptions,
+	ArchiveEmbeddingStatus,
+	DatabaseArchiveChunk,
+	DatabaseArchiveTerm,
+	RetrievalTraceHit,
+	DatabaseRetrievalTrace,
+	DatabaseRetrievalHitUsage
+} from './memory';
+
 // Database types
 export type {
 	McpServerOverride,

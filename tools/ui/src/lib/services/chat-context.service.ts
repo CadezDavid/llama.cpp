@@ -200,10 +200,9 @@ export class ChatContextService {
 			blockIds.add(block.id);
 		}
 
-		const userIndex = messages.length - 1;
-		if (messages[userIndex]?.role !== MessageRole.USER) {
-			throw new Error('Context blocks require the current message to be a user message');
-		}
+		let userIndex = messages.length - 1;
+		while (userIndex >= 0 && messages[userIndex]?.role !== MessageRole.USER) userIndex--;
+		if (userIndex < 0) throw new Error('Context blocks require a user message');
 
 		const envelope = blocks.map(ChatContextService.renderContextBlock).join('\n\n');
 		return messages.map((message, index) => {

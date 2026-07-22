@@ -33,8 +33,8 @@ The detailed design is in
 
 ## Current status
 
-The shared foundation and reversible compaction are implemented in the SvelteKit
-WebUI under `tools/ui`. Normal chat, continuation, and agentic requests use one
+The complete memory stack is implemented in the SvelteKit WebUI under
+`tools/ui`. Normal chat, continuation, and agentic requests use one
 context-preparation path. Compaction can be disabled, requested before sending,
 or run automatically when the rendered prompt crosses a configurable percentage
 of usable model input. The policy reserves output and safety capacity, targets a
@@ -46,11 +46,19 @@ it without changing the stored messages, inspect its sources and diagnostics,
 recompact it, or restore the original history. Compaction metadata is retained
 by conversation export, import, and compatible branch forks.
 
-The feature-specific stages are still under development:
+Compaction also writes its literal source messages into a local IndexedDB
+archive in the same transaction that activates the summary. Before each model
+request, the WebUI searches that archive with keywords and optional embeddings
+while querying Spomin in parallel. It injects only the highest-scoring results
+that pass configured thresholds and token budgets. Repetition cooldowns avoid
+putting the same memory into consecutive requests unless the topic, score, or
+compaction generation changes or the user explicitly asks to recall it.
 
-- Spomin configuration and explicit retrieval;
-- indexing and retrieval of literal conversation excerpts;
-- automatic retrieval orchestration, ranking, and diagnostics.
+The Memory settings page configures both providers, supports per-conversation
+Spomin project overrides, offers explicit create/edit/delete controls, and
+shows recent retrieval decisions. Provider failures are fail-open and never
+block a chat request. Spomin mutations remain explicit; automatic recall does
+not create or modify long-term memories.
 
 ## Branch guide
 
@@ -85,9 +93,8 @@ through the integration branches.
 - Use `integration/turboquant-memory` for the full combined fork.
 - Use a `memory/*` branch only when developing or testing that specific stage.
 
-Until the feature stages are complete, integration branches may contain
-foundational or partially integrated functionality rather than a finished
-end-user memory system.
+The integration branches contain the completed memory stack. The feature
+branches remain useful for isolated testing and maintenance.
 
 ## Updating the fork
 
