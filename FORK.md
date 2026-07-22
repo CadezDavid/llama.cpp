@@ -33,15 +33,18 @@ The detailed design is in
 
 ## Current status
 
-The shared foundation is implemented in the SvelteKit WebUI under `tools/ui`.
-It provides one context-preparation path for normal chat, continuation, and
-agentic requests. It can create validated prompt projections, attach ephemeral
-context without changing stored history, and measure the rendered prompt with
-the existing llama-server template and tokenization endpoints.
+The shared foundation and manual reversible compaction are implemented in the
+SvelteKit WebUI under `tools/ui`. Normal chat, continuation, and agentic
+requests use one context-preparation path. From a conversation's menu, users
+can measure old complete turns, generate a structured compaction with the
+current model, preview the token savings, apply it without changing the stored
+messages, inspect its sources, recompact it, or restore the original history.
+Compaction metadata is retained by conversation export, import, and compatible
+branch forks.
 
 The feature-specific stages are still under development:
 
-- compaction policy, records, preview, restore, and automatic triggering;
+- automatic threshold compaction and compaction diagnostics;
 - Spomin configuration and explicit retrieval;
 - indexing and retrieval of literal conversation excerpts;
 - automatic retrieval orchestration, ranking, and diagnostics.
