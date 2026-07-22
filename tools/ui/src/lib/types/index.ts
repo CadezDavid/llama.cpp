@@ -5,6 +5,20 @@
 
 // API types
 export type {
+	CompactionStatus,
+	CompactionProjectionAction,
+	CompactionMode,
+	CompactionActivationMode,
+	DatabaseCompaction,
+	DatabaseCompactionProjectionEvent,
+	CompactionTurnUnit,
+	CompactionRangeCandidate,
+	CompactionPolicy,
+	CompactionPreflightMeasurement,
+	ResolvedCompaction
+} from './compaction';
+
+export type {
 	ApiChatMessageContentPart,
 	ApiContextSizeError,
 	ApiErrorResponse,
@@ -66,6 +80,14 @@ export type {
 	PrepareChatContextInput,
 	PreparedChatContext
 } from './chat-context';
+
+export type {
+	MemoryProviderCapabilities,
+	MemoryRecord,
+	MemoryRetrievalHit,
+	MemoryRetrievalResponse,
+	SpominClientOptions
+} from './memory';
 
 // Database types
 export type {

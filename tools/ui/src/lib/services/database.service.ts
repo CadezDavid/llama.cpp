@@ -1,18 +1,23 @@
 import Dexie, { type EntityTable } from 'dexie';
 import { findDescendantMessages, uuid, filterByLeafNodeId } from '$lib/utils';
-import { IDXDB_TABLES, IDXDB_STORES, STORAGE_APP_NAME } from '$lib/constants';
+import { IDXDB_TABLES, IDXDB_STORES, IDXDB_STORES_V1, STORAGE_APP_NAME } from '$lib/constants';
 import { MessageRole } from '$lib/enums';
 import type { McpServerOverride } from '$lib/types/database';
 import type { ExportedConversation } from '$lib/types/database';
+import type { DatabaseCompaction, DatabaseCompactionProjectionEvent } from '$lib/types';
+import { ChatContextService } from './chat-context.service';
 
 class LlamaUiDatabase extends Dexie {
 	[IDXDB_TABLES.conversations]!: EntityTable<DatabaseConversation, string>;
 	[IDXDB_TABLES.messages]!: EntityTable<DatabaseMessage, string>;
+	[IDXDB_TABLES.compactions]!: EntityTable<DatabaseCompaction, 'id'>;
+	[IDXDB_TABLES.compactionProjectionEvents]!: EntityTable<DatabaseCompactionProjectionEvent, 'id'>;
 
 	constructor() {
 		super(STORAGE_APP_NAME);
 
-		this.version(1).stores(IDXDB_STORES);
+		this.version(1).stores(IDXDB_STORES_V1);
+		this.version(2).stores(IDXDB_STORES);
 	}
 }
 
@@ -183,7 +188,12 @@ export class DatabaseService {
 	): Promise<void> {
 		await db.transaction(
 			'rw',
-			[db[IDXDB_TABLES.conversations], db[IDXDB_TABLES.messages]],
+			[
+				db[IDXDB_TABLES.conversations],
+				db[IDXDB_TABLES.messages],
+				db[IDXDB_TABLES.compactions],
+				db[IDXDB_TABLES.compactionProjectionEvents]
+			],
 			async () => {
 				if (options?.deleteWithForks) {
 					// Recursively collect all descendant IDs
@@ -205,6 +215,11 @@ export class DatabaseService {
 					for (const forkId of idsToDelete) {
 						await db[IDXDB_TABLES.conversations].delete(forkId);
 						await db[IDXDB_TABLES.messages].where('convId').equals(forkId).delete();
+						await db[IDXDB_TABLES.compactions].where('conversationId').equals(forkId).delete();
+						await db[IDXDB_TABLES.compactionProjectionEvents]
+							.where('conversationId')
+							.equals(forkId)
+							.delete();
 					}
 				} else {
 					await this.reparentDirectChildren(id);
@@ -212,6 +227,11 @@ export class DatabaseService {
 
 				await db[IDXDB_TABLES.conversations].delete(id);
 				await db[IDXDB_TABLES.messages].where('convId').equals(id).delete();
+				await db[IDXDB_TABLES.compactions].where('conversationId').equals(id).delete();
+				await db[IDXDB_TABLES.compactionProjectionEvents]
+					.where('conversationId')
+					.equals(id)
+					.delete();
 			}
 		);
 	}
@@ -279,7 +299,12 @@ export class DatabaseService {
 
 		await db.transaction(
 			'rw',
-			[db[IDXDB_TABLES.conversations], db[IDXDB_TABLES.messages]],
+			[
+				db[IDXDB_TABLES.conversations],
+				db[IDXDB_TABLES.messages],
+				db[IDXDB_TABLES.compactions],
+				db[IDXDB_TABLES.compactionProjectionEvents]
+			],
 			async () => {
 				// Pre-load each to-delete conversation so the per-id reparent
 				// walk-up doesn't ping-pong the same ancestry chain.
@@ -307,6 +332,11 @@ export class DatabaseService {
 
 				await db[IDXDB_TABLES.conversations].bulkDelete(cleanIds);
 				await db[IDXDB_TABLES.messages].where('convId').anyOf(cleanIds).delete();
+				await db[IDXDB_TABLES.compactions].where('conversationId').anyOf(cleanIds).delete();
+				await db[IDXDB_TABLES.compactionProjectionEvents]
+					.where('conversationId')
+					.anyOf(cleanIds)
+					.delete();
 			}
 		);
 	}
@@ -317,22 +347,47 @@ export class DatabaseService {
 	 * @param messageId - ID of the message to delete
 	 */
 	static async deleteMessage(messageId: string): Promise<void> {
-		await db.transaction('rw', db[IDXDB_TABLES.messages], async () => {
-			const message = await db[IDXDB_TABLES.messages].get(messageId);
-			if (!message) return;
+		await db.transaction(
+			'rw',
+			[
+				db[IDXDB_TABLES.messages],
+				db[IDXDB_TABLES.compactions],
+				db[IDXDB_TABLES.compactionProjectionEvents]
+			],
+			async () => {
+				const message = await db[IDXDB_TABLES.messages].get(messageId);
+				if (!message) return;
 
-			// Remove this message from its parent's children array
-			if (message.parent) {
-				const parent = await db[IDXDB_TABLES.messages].get(message.parent);
-				if (parent) {
-					parent.children = parent.children.filter((childId: string) => childId !== messageId);
-					await db[IDXDB_TABLES.messages].put(parent);
+				// Remove this message from its parent's children array
+				if (message.parent) {
+					const parent = await db[IDXDB_TABLES.messages].get(message.parent);
+					if (parent) {
+						parent.children = parent.children.filter((childId: string) => childId !== messageId);
+						await db[IDXDB_TABLES.messages].put(parent);
+					}
+				}
+
+				const invalidCompactions = await db[IDXDB_TABLES.compactions]
+					.where('conversationId')
+					.equals(message.convId)
+					.filter((record) => record.sourceMessageIds.includes(messageId))
+					.toArray();
+				const invalidIds = invalidCompactions.map((record) => record.id);
+				await db[IDXDB_TABLES.messages].delete(messageId);
+				await db[IDXDB_TABLES.compactionProjectionEvents]
+					.where('anchorMessageId')
+					.equals(messageId)
+					.delete();
+				if (invalidIds.length > 0) {
+					await db[IDXDB_TABLES.compactionProjectionEvents]
+						.where('conversationId')
+						.equals(message.convId)
+						.filter((event) => !!event.compactionId && invalidIds.includes(event.compactionId))
+						.delete();
+					await db[IDXDB_TABLES.compactions].bulkDelete(invalidIds);
 				}
 			}
-
-			// Delete the message
-			await db[IDXDB_TABLES.messages].delete(messageId);
-		});
+		);
 	}
 
 	/**
@@ -347,32 +402,61 @@ export class DatabaseService {
 		conversationId: string,
 		messageId: string
 	): Promise<string[]> {
-		return await db.transaction('rw', db[IDXDB_TABLES.messages], async () => {
-			// Get all messages in the conversation to find descendants
-			const allMessages = await db[IDXDB_TABLES.messages]
-				.where('convId')
-				.equals(conversationId)
-				.toArray();
+		return await db.transaction(
+			'rw',
+			[
+				db[IDXDB_TABLES.messages],
+				db[IDXDB_TABLES.compactions],
+				db[IDXDB_TABLES.compactionProjectionEvents]
+			],
+			async () => {
+				// Get all messages in the conversation to find descendants
+				const allMessages = await db[IDXDB_TABLES.messages]
+					.where('convId')
+					.equals(conversationId)
+					.toArray();
 
-			// Find all descendant messages
-			const descendants = findDescendantMessages(allMessages, messageId);
-			const allToDelete = [messageId, ...descendants];
+				// Find all descendant messages
+				const descendants = findDescendantMessages(allMessages, messageId);
+				const allToDelete = [messageId, ...descendants];
 
-			// Get the message to delete for parent cleanup
-			const message = await db[IDXDB_TABLES.messages].get(messageId);
-			if (message && message.parent) {
-				const parent = await db[IDXDB_TABLES.messages].get(message.parent);
-				if (parent) {
-					parent.children = parent.children.filter((childId: string) => childId !== messageId);
-					await db[IDXDB_TABLES.messages].put(parent);
+				// Get the message to delete for parent cleanup
+				const message = await db[IDXDB_TABLES.messages].get(messageId);
+				if (message && message.parent) {
+					const parent = await db[IDXDB_TABLES.messages].get(message.parent);
+					if (parent) {
+						parent.children = parent.children.filter((childId: string) => childId !== messageId);
+						await db[IDXDB_TABLES.messages].put(parent);
+					}
 				}
+
+				// Delete all messages in the branch
+				const invalidCompactions = (
+					await db[IDXDB_TABLES.compactions]
+						.where('conversationId')
+						.equals(conversationId)
+						.toArray()
+				).filter((record) =>
+					record.sourceMessageIds.some((sourceId) => allToDelete.includes(sourceId))
+				);
+				const invalidIds = invalidCompactions.map((record) => record.id);
+				await db[IDXDB_TABLES.messages].bulkDelete(allToDelete);
+				await db[IDXDB_TABLES.compactionProjectionEvents]
+					.where('anchorMessageId')
+					.anyOf(allToDelete)
+					.delete();
+				if (invalidIds.length > 0) {
+					await db[IDXDB_TABLES.compactionProjectionEvents]
+						.where('conversationId')
+						.equals(conversationId)
+						.filter((event) => !!event.compactionId && invalidIds.includes(event.compactionId))
+						.delete();
+					await db[IDXDB_TABLES.compactions].bulkDelete(invalidIds);
+				}
+
+				return allToDelete;
 			}
-
-			// Delete all messages in the branch
-			await db[IDXDB_TABLES.messages].bulkDelete(allToDelete);
-
-			return allToDelete;
-		});
+		);
 	}
 
 	/**
@@ -405,6 +489,159 @@ export class DatabaseService {
 	}
 
 	/**
+	 * Compaction records are immutable once ready. A pending record is harmless
+	 * until an apply projection event is committed with it.
+	 */
+	static async createPendingCompaction(
+		record: Omit<DatabaseCompaction, 'id' | 'status' | 'createdAt'>
+	): Promise<DatabaseCompaction> {
+		const pending: DatabaseCompaction = {
+			...record,
+			id: uuid(),
+			status: 'pending',
+			createdAt: Date.now()
+		};
+		await db[IDXDB_TABLES.compactions].add(pending);
+		return pending;
+	}
+
+	static async deletePendingCompaction(id: string): Promise<void> {
+		const record = await db[IDXDB_TABLES.compactions].get(id);
+		if (record?.status === 'pending') await db[IDXDB_TABLES.compactions].delete(id);
+	}
+
+	static async activateCompaction(
+		id: string,
+		updates: Pick<DatabaseCompaction, 'summary' | 'projectedTokenCount'> &
+			Partial<
+				Pick<
+					DatabaseCompaction,
+					| 'activationMode'
+					| 'contextSize'
+					| 'usableInputTokenCount'
+					| 'triggerPercent'
+					| 'targetPercent'
+					| 'attemptCount'
+					| 'durationMs'
+					| 'strictRetryUsed'
+				>
+			>,
+		anchorMessageId: string
+	): Promise<DatabaseCompactionProjectionEvent> {
+		return await db.transaction(
+			'rw',
+			[
+				db[IDXDB_TABLES.conversations],
+				db[IDXDB_TABLES.messages],
+				db[IDXDB_TABLES.compactions],
+				db[IDXDB_TABLES.compactionProjectionEvents]
+			],
+			async () => {
+				const record = await db[IDXDB_TABLES.compactions].get(id);
+				if (!record || record.status !== 'pending') {
+					throw new Error(`Pending compaction ${id} not found`);
+				}
+				const anchor = await db[IDXDB_TABLES.messages].get(anchorMessageId);
+				if (!anchor || anchor.convId !== record.conversationId) {
+					throw new Error(`Compaction anchor ${anchorMessageId} is not in the conversation`);
+				}
+				const conversation = await db[IDXDB_TABLES.conversations].get(record.conversationId);
+				if (!conversation?.currNode) throw new Error('The conversation has no active branch');
+				const conversationMessages = await db[IDXDB_TABLES.messages]
+					.where('convId')
+					.equals(record.conversationId)
+					.toArray();
+				const activePath = filterByLeafNodeId(
+					conversationMessages,
+					conversation.currNode,
+					true
+				) as DatabaseMessage[];
+				const pathIndexes = new Map(activePath.map((message, index) => [message.id, index]));
+				if (!pathIndexes.has(anchorMessageId)) {
+					throw new Error(`Compaction anchor ${anchorMessageId} is no longer active`);
+				}
+				const sourceIndexes = record.sourceMessageIds.map((sourceId) => pathIndexes.get(sourceId));
+				const sourceStart = sourceIndexes[0];
+				if (
+					sourceStart === undefined ||
+					sourceIndexes.some((sourceIndex, offset) => sourceIndex !== sourceStart + offset)
+				) {
+					throw new Error(`Compaction ${id} source range is no longer active`);
+				}
+				const sourceMessages = activePath.slice(sourceStart, sourceStart + sourceIndexes.length);
+				if (
+					(await ChatContextService.fingerprintMessages(sourceMessages)) !==
+					record.sourceFingerprint
+				) {
+					throw new Error(`Compaction ${id} source messages changed before activation`);
+				}
+				await db[IDXDB_TABLES.compactions].put({ ...record, ...updates, status: 'ready' });
+				const event: DatabaseCompactionProjectionEvent = {
+					id: uuid(),
+					conversationId: record.conversationId,
+					anchorMessageId,
+					action: 'apply',
+					compactionId: id,
+					createdAt: Date.now()
+				};
+				await db[IDXDB_TABLES.compactionProjectionEvents].add(event);
+				return event;
+			}
+		);
+	}
+
+	static async createCompactionRestoreEvent(
+		conversationId: string,
+		anchorMessageId: string
+	): Promise<DatabaseCompactionProjectionEvent> {
+		return await db.transaction(
+			'rw',
+			[db[IDXDB_TABLES.messages], db[IDXDB_TABLES.compactionProjectionEvents]],
+			async () => {
+				const anchor = await db[IDXDB_TABLES.messages].get(anchorMessageId);
+				if (!anchor || anchor.convId !== conversationId) {
+					throw new Error(`Compaction anchor ${anchorMessageId} is not in the conversation`);
+				}
+				const event: DatabaseCompactionProjectionEvent = {
+					id: uuid(),
+					conversationId,
+					anchorMessageId,
+					action: 'restore',
+					createdAt: Date.now()
+				};
+				await db[IDXDB_TABLES.compactionProjectionEvents].add(event);
+				return event;
+			}
+		);
+	}
+
+	static async getConversationCompactions(conversationId: string): Promise<DatabaseCompaction[]> {
+		return await db[IDXDB_TABLES.compactions]
+			.where('conversationId')
+			.equals(conversationId)
+			.sortBy('createdAt');
+	}
+
+	static async getConversationCompactionProjectionEvents(
+		conversationId: string
+	): Promise<DatabaseCompactionProjectionEvent[]> {
+		return await db[IDXDB_TABLES.compactionProjectionEvents]
+			.where('conversationId')
+			.equals(conversationId)
+			.sortBy('createdAt');
+	}
+
+	static async cleanupAbandonedCompactions(maxAgeMs = 24 * 60 * 60 * 1000): Promise<void> {
+		const cutoff = Date.now() - maxAgeMs;
+		const abandoned = await db[IDXDB_TABLES.compactions]
+			.where('status')
+			.equals('pending')
+			.filter((record) => record.createdAt < cutoff)
+			.primaryKeys();
+		if (abandoned.length > 0) await db[IDXDB_TABLES.compactions].bulkDelete(abandoned);
+	}
+
+	/**
 	 * Loads multiple conversations with all of their messages in two bulk
 	 * reads. Missing conversations are silently omitted from the result.
 	 *
@@ -418,9 +655,11 @@ export class DatabaseService {
 		const cleanIds = convIds.filter((id): id is string => typeof id === 'string' && id.length > 0);
 		if (cleanIds.length === 0) return result;
 
-		const [convs, allMessages] = await Promise.all([
+		const [convs, allMessages, allCompactions, allProjectionEvents] = await Promise.all([
 			db[IDXDB_TABLES.conversations].bulkGet(cleanIds),
-			db[IDXDB_TABLES.messages].where('convId').anyOf(cleanIds).toArray()
+			db[IDXDB_TABLES.messages].where('convId').anyOf(cleanIds).toArray(),
+			db[IDXDB_TABLES.compactions].where('conversationId').anyOf(cleanIds).toArray(),
+			db[IDXDB_TABLES.compactionProjectionEvents].where('conversationId').anyOf(cleanIds).toArray()
 		]);
 
 		const messagesByConv = new Map<string, DatabaseMessage[]>();
@@ -429,6 +668,18 @@ export class DatabaseService {
 			if (bucket) bucket.push(msg);
 			else messagesByConv.set(msg.convId, [msg]);
 		}
+		const compactionsByConv = new Map<string, DatabaseCompaction[]>();
+		for (const record of allCompactions) {
+			const bucket = compactionsByConv.get(record.conversationId);
+			if (bucket) bucket.push(record);
+			else compactionsByConv.set(record.conversationId, [record]);
+		}
+		const eventsByConv = new Map<string, DatabaseCompactionProjectionEvent[]>();
+		for (const event of allProjectionEvents) {
+			const bucket = eventsByConv.get(event.conversationId);
+			if (bucket) bucket.push(event);
+			else eventsByConv.set(event.conversationId, [event]);
+		}
 
 		for (let i = 0; i < cleanIds.length; i++) {
 			const conv = convs[i];
@@ -436,7 +687,12 @@ export class DatabaseService {
 			const messages = (messagesByConv.get(conv.id) ?? []).sort(
 				(a, b) => a.timestamp - b.timestamp
 			);
-			result.set(conv.id, { conv, messages });
+			result.set(conv.id, {
+				conv,
+				messages,
+				compactions: compactionsByConv.get(conv.id) ?? [],
+				compactionProjectionEvents: eventsByConv.get(conv.id) ?? []
+			});
 		}
 		return result;
 	}
@@ -556,17 +812,22 @@ export class DatabaseService {
 	 * @param data - Array of { conv, messages } objects
 	 */
 	static async importConversations(
-		data: { conv: DatabaseConversation; messages: DatabaseMessage[] }[]
+		data: ExportedConversation[]
 	): Promise<{ imported: number; skipped: number }> {
 		let importedCount = 0;
 		let skippedCount = 0;
 
 		return await db.transaction(
 			'rw',
-			[db[IDXDB_TABLES.conversations], db[IDXDB_TABLES.messages]],
+			[
+				db[IDXDB_TABLES.conversations],
+				db[IDXDB_TABLES.messages],
+				db[IDXDB_TABLES.compactions],
+				db[IDXDB_TABLES.compactionProjectionEvents]
+			],
 			async () => {
 				for (const item of data) {
-					const { conv, messages } = item;
+					const { conv, messages, compactions, compactionProjectionEvents } = item;
 
 					const existing = await db[IDXDB_TABLES.conversations].get(conv.id);
 					if (existing) {
@@ -578,6 +839,10 @@ export class DatabaseService {
 					await db[IDXDB_TABLES.conversations].add(conv);
 					for (const msg of messages) {
 						await db[IDXDB_TABLES.messages].put(msg);
+					}
+					if (compactions?.length) await db[IDXDB_TABLES.compactions].bulkPut(compactions);
+					if (compactionProjectionEvents?.length) {
+						await db[IDXDB_TABLES.compactionProjectionEvents].bulkPut(compactionProjectionEvents);
 					}
 
 					importedCount++;
@@ -612,7 +877,12 @@ export class DatabaseService {
 	): Promise<DatabaseConversation> {
 		return await db.transaction(
 			'rw',
-			[db[IDXDB_TABLES.conversations], db[IDXDB_TABLES.messages]],
+			[
+				db[IDXDB_TABLES.conversations],
+				db[IDXDB_TABLES.messages],
+				db[IDXDB_TABLES.compactions],
+				db[IDXDB_TABLES.compactionProjectionEvents]
+			],
 			async () => {
 				const sourceConv = await db[IDXDB_TABLES.conversations].get(sourceConvId);
 				if (!sourceConv) {
@@ -676,6 +946,73 @@ export class DatabaseService {
 
 				for (const msg of clonedMessages) {
 					await db[IDXDB_TABLES.messages].add(msg);
+				}
+
+				const sourceCompactions = await db[IDXDB_TABLES.compactions]
+					.where('conversationId')
+					.equals(sourceConvId)
+					.toArray();
+				const compactionIdMap = new Map<string, string>();
+				for (const record of sourceCompactions) {
+					if (record.status === 'ready' && record.sourceMessageIds.every((id) => idMap.has(id))) {
+						compactionIdMap.set(record.id, uuid());
+					}
+				}
+				for (const record of sourceCompactions) {
+					const newId = compactionIdMap.get(record.id);
+					if (!newId) continue;
+					const sourceMessageIds = record.sourceMessageIds.map((id) => idMap.get(id)!);
+					const sourceMessages = sourceMessageIds.map(
+						(id) => clonedMessages.find((message) => message.id === id)!
+					);
+					const fingerprintData = JSON.stringify(
+						sourceMessages.map((message) => ({
+							id: message.id,
+							role: message.role,
+							content: message.content,
+							reasoningContent: message.reasoningContent,
+							toolCalls: message.toolCalls,
+							toolCallId: message.toolCallId,
+							extra: message.extra
+						}))
+					);
+					const digest = await crypto.subtle.digest(
+						'SHA-256',
+						new TextEncoder().encode(fingerprintData)
+					);
+					const sourceFingerprint = Array.from(new Uint8Array(digest), (byte) =>
+						byte.toString(16).padStart(2, '0')
+					).join('');
+					await db[IDXDB_TABLES.compactions].add({
+						...record,
+						id: newId,
+						conversationId: newConvId,
+						sourceMessageIds,
+						deltaSourceMessageIds: record.deltaSourceMessageIds.map((id) => idMap.get(id)!),
+						sourceFingerprint,
+						previousCompactionId: record.previousCompactionId
+							? compactionIdMap.get(record.previousCompactionId)
+							: undefined
+					});
+				}
+
+				const sourceEvents = await db[IDXDB_TABLES.compactionProjectionEvents]
+					.where('conversationId')
+					.equals(sourceConvId)
+					.toArray();
+				for (const event of sourceEvents) {
+					const anchorMessageId = idMap.get(event.anchorMessageId);
+					const compactionId = event.compactionId
+						? compactionIdMap.get(event.compactionId)
+						: undefined;
+					if (!anchorMessageId || (event.action === 'apply' && !compactionId)) continue;
+					await db[IDXDB_TABLES.compactionProjectionEvents].add({
+						...event,
+						id: uuid(),
+						conversationId: newConvId,
+						anchorMessageId,
+						compactionId
+					});
 				}
 
 				return newConv;

@@ -2,11 +2,32 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ContentPartType, MessageRole } from '$lib/enums';
 import { ChatService } from '$lib/services/chat.service';
 import type { ApiChatMessageData } from '$lib/types';
+import type { DatabaseMessage } from '$lib/types';
 
 describe('ChatService prompt requests', () => {
 	afterEach(() => {
+		ChatService.clearPromptMeasurementCache();
 		vi.restoreAllMocks();
 		vi.unstubAllGlobals();
+	});
+
+	it('reuses exact prompt measurements and reports cache metrics', async () => {
+		const fetchMock = vi
+			.fn()
+			.mockResolvedValueOnce(new Response(JSON.stringify({ prompt: '<bos>Hello' })))
+			.mockResolvedValueOnce(new Response(JSON.stringify({ tokens: [1, 2, 3] })));
+		vi.stubGlobal('fetch', fetchMock);
+		const messages = [{ role: MessageRole.USER, content: 'Cache me' }];
+
+		await ChatService.measurePrompt(messages);
+		await ChatService.measurePrompt(messages);
+
+		expect(fetchMock).toHaveBeenCalledTimes(2);
+		expect(ChatService.getPromptMeasurementCacheMetrics()).toEqual({
+			hits: 1,
+			misses: 1,
+			size: 1
+		});
 	});
 
 	it('uses one request builder for template and completion settings', () => {
@@ -97,5 +118,15 @@ describe('ChatService prompt requests', () => {
 			hasNonTextContent: true,
 			exactForTextOnly: false
 		});
+	});
+
+	it('uses the model from the latest assistant response', () => {
+		const messages = [
+			{ role: MessageRole.ASSISTANT, model: 'older-model' },
+			{ role: MessageRole.USER },
+			{ role: MessageRole.ASSISTANT, model: 'current-model' }
+		] as DatabaseMessage[];
+
+		expect(ChatService.findLatestAssistantModel(messages)).toBe('current-model');
 	});
 });

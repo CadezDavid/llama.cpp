@@ -53,6 +53,7 @@ import {
 import { ROUTES } from '$lib/constants/routes';
 import { RouterService } from '$lib/services/router.service';
 import { SvelteMap, SvelteSet } from 'svelte/reactivity';
+import type { DatabaseCompaction, DatabaseCompactionProjectionEvent } from '$lib/types';
 
 export interface ConversationTreeItem {
 	conversation: DatabaseConversation;
@@ -776,6 +777,20 @@ class ConversationsStore {
 		}
 	}
 
+	async setMemoryProject(project: string | undefined): Promise<void> {
+		if (!this.activeConversation) return;
+		const memoryProject = project?.trim() || undefined;
+		await DatabaseService.updateConversation(this.activeConversation.id, { memoryProject });
+		this.activeConversation = { ...this.activeConversation, memoryProject };
+		const index = this.conversations.findIndex(
+			(conversation) => conversation.id === this.activeConversation?.id
+		);
+		if (index >= 0) {
+			this.conversations[index] = { ...this.conversations[index], memoryProject };
+			this.conversations = [...this.conversations];
+		}
+	}
+
 	/**
 	 * Toggles MCP server enabled state for the active conversation.
 	 * @param serverId - The server ID to toggle
@@ -964,7 +979,7 @@ class ConversationsStore {
 	 * @returns The JSONL string (one record per line)
 	 */
 	serializeSessionToJsonl(data: ExportedConversation): string {
-		const { conv, messages } = data;
+		const { conv, messages, compactions = [], compactionProjectionEvents = [] } = data;
 
 		const sessionLine = JSON.stringify({ type: 'session', harness: 'llama.app', ...conv });
 		const messageLines = messages.map((message: DatabaseMessage) => {
@@ -975,7 +990,15 @@ class ConversationsStore {
 			return JSON.stringify({ type: 'message', message: normalized });
 		});
 
-		return [sessionLine, ...messageLines].join('\n');
+		const compactionLines = compactions.map((compaction: DatabaseCompaction) =>
+			JSON.stringify({ type: 'compaction', compaction })
+		);
+		const projectionLines = compactionProjectionEvents.map(
+			(event: DatabaseCompactionProjectionEvent) =>
+				JSON.stringify({ type: 'compaction_projection', event })
+		);
+
+		return [sessionLine, ...messageLines, ...compactionLines, ...projectionLines].join('\n');
 	}
 
 	/**
@@ -1013,6 +1036,14 @@ class ConversationsStore {
 					message.toolCalls = JSON.stringify(message.toolCalls);
 				}
 				current.messages.push(message);
+			} else if (record.type === 'compaction') {
+				if (!current) throw new Error('Invalid JSONL: compaction before any session record');
+				current.compactions ??= [];
+				current.compactions.push(record.compaction);
+			} else if (record.type === 'compaction_projection') {
+				if (!current) throw new Error('Invalid JSONL: projection before any session record');
+				current.compactionProjectionEvents ??= [];
+				current.compactionProjectionEvents.push(record.event);
 			}
 			// Ignore unknown record types for forward compatibility.
 		}
@@ -1142,9 +1173,18 @@ class ConversationsStore {
 
 		if (!conversation) return;
 
-		const messages = await DatabaseService.getConversationMessages(convId);
+		const [messages, compactions, compactionProjectionEvents] = await Promise.all([
+			DatabaseService.getConversationMessages(convId),
+			DatabaseService.getConversationCompactions(convId),
+			DatabaseService.getConversationCompactionProjectionEvents(convId)
+		]);
 
-		this.downloadConversationFile({ conv: conversation, messages });
+		this.downloadConversationFile({
+			conv: conversation,
+			messages,
+			compactions,
+			compactionProjectionEvents
+		});
 	}
 
 	/**

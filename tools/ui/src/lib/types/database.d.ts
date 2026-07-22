@@ -1,5 +1,6 @@
 import type { ChatMessageTimings, ChatRole, ChatMessageType } from '$lib/types/chat';
 import { AttachmentType, ReasoningEffort } from '$lib/enums';
+import type { DatabaseCompaction, DatabaseCompactionProjectionEvent } from './compaction';
 
 export interface McpServerOverride {
 	serverId: string;
@@ -16,6 +17,7 @@ export interface DatabaseConversation {
 	reasoningEffort?: ReasoningEffort;
 	forkedFromConversationId?: string;
 	pinned?: boolean;
+	memoryProject?: string;
 }
 
 export interface DatabaseMessageExtraAudioFile {
@@ -128,6 +130,8 @@ export interface DatabaseMessage {
 export type ExportedConversation = {
 	conv: DatabaseConversation;
 	messages: DatabaseMessage[];
+	compactions?: DatabaseCompaction[];
+	compactionProjectionEvents?: DatabaseCompactionProjectionEvent[];
 };
 
 export type ExportedConversations = ExportedConversation | ExportedConversation[];

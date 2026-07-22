@@ -10,7 +10,9 @@
 		GitBranch,
 		Pin,
 		PinOff,
-		ListChecks
+		ListChecks,
+		Minimize2,
+		ArchiveRestore
 	} from '@lucide/svelte';
 	import { DropdownMenuActions } from '$lib/components/app';
 	import * as Tooltip from '$lib/components/ui/tooltip';
@@ -21,6 +23,7 @@
 	import { conversationsStore } from '$lib/stores/conversations.svelte';
 	import { TruncatedText } from '$lib/components/app';
 	import { onMount } from 'svelte';
+	import { compactionStore } from '$lib/stores/compaction.svelte';
 
 	interface Props {
 		isActive?: boolean;
@@ -246,6 +249,31 @@
 				triggerTooltip="More actions"
 				bind:open={dropdownOpen}
 				actions={[
+					...(isActive
+						? [
+								{
+									icon: Minimize2,
+									label: compactionStore.activeCompaction ? 'Recompact' : 'Compact conversation',
+									disabled: isLoading,
+									onclick: (e: Event) => {
+										e.stopPropagation();
+										void compactionStore.openCreate();
+									}
+								},
+								...(compactionStore.activeCompaction
+									? [
+											{
+												icon: ArchiveRestore,
+												label: 'View compacted state',
+												onclick: (e: Event) => {
+													e.stopPropagation();
+													void compactionStore.openView();
+												}
+											}
+										]
+									: [])
+							]
+						: []),
 					{
 						icon: conversation.pinned ? PinOff : Pin,
 						label: conversation.pinned ? 'Unpin' : 'Pin',

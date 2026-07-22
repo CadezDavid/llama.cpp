@@ -62,6 +62,21 @@ export const SETTINGS_KEYS = {
 	ALWAYS_SHOW_TOOL_CALL_CONTENT: 'alwaysShowToolCallContent',
 	// Performance
 	PRE_ENCODE_CONVERSATION: 'preEncodeConversation',
+	// Memory
+	COMPACTION_MODE: 'compactionMode',
+	COMPACTION_TRIGGER_PERCENT: 'compactionTriggerPercent',
+	COMPACTION_TARGET_PERCENT: 'compactionTargetPercent',
+	COMPACTION_PROTECTED_TURNS: 'compactionProtectedTurns',
+	SPOMIN_ENABLED: 'spominEnabled',
+	SPOMIN_BASE_URL: 'spominBaseUrl',
+	SPOMIN_API_TOKEN: 'spominApiToken',
+	SPOMIN_PROJECT: 'spominProject',
+	SPOMIN_RESULT_LIMIT: 'spominResultLimit',
+	SPOMIN_TOKEN_BUDGET: 'spominTokenBudget',
+	SPOMIN_TIMEOUT_MS: 'spominTimeoutMs',
+	EMBEDDING_BASE_URL: 'embeddingBaseUrl',
+	EMBEDDING_MODEL: 'embeddingModel',
+	EMBEDDING_TIMEOUT_MS: 'embeddingTimeoutMs',
 	// Developer
 	DISABLE_REASONING_PARSING: 'disableReasoningParsing',
 	EXCLUDE_REASONING_FROM_CONTEXT: 'excludeReasoningFromContext',

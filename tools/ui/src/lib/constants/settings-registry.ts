@@ -12,7 +12,8 @@ import {
 	Database,
 	Monitor as MonitorIcon,
 	Sun,
-	Moon
+	Moon,
+	Brain
 } from '@lucide/svelte';
 import type { Component } from 'svelte';
 import type {
@@ -36,6 +37,7 @@ export const SETTINGS_SECTION_TITLES = {
 	AGENTIC: 'Agentic',
 	TOOLS: 'Tools',
 	IMPORT_EXPORT: 'Import/Export',
+	MEMORY: 'Memory',
 	DEVELOPER: 'Developer'
 } as const;
 
@@ -52,6 +54,12 @@ const COLOR_MODE_OPTIONS: Array<{ value: string; label: string; icon: Component 
 	{ value: ColorMode.SYSTEM, label: 'System', icon: MonitorIcon },
 	{ value: ColorMode.LIGHT, label: 'Light', icon: Sun },
 	{ value: ColorMode.DARK, label: 'Dark', icon: Moon }
+];
+
+const COMPACTION_MODE_OPTIONS: Array<{ value: string; label: string; icon: Component }> = [
+	{ value: 'off', label: 'Off', icon: MonitorIcon },
+	{ value: 'ask', label: 'Ask before compacting', icon: AlertTriangle },
+	{ value: 'automatic', label: 'Compact automatically', icon: Brain }
 ];
 
 // Shared options for the title-generation radio group. Both paired registry entries
@@ -387,6 +395,139 @@ const SETTINGS_REGISTRY: Record<string, SettingsSectionEntry> = {
 					serverKey: SETTINGS_KEYS.SHOW_BUILD_VERSION,
 					paramType: SyncableParameterType.BOOLEAN
 				}
+			}
+		]
+	},
+	[SETTINGS_SECTION_SLUGS.MEMORY]: {
+		title: SETTINGS_SECTION_TITLES.MEMORY,
+		slug: SETTINGS_SECTION_SLUGS.MEMORY,
+		icon: Brain,
+		settings: [
+			{
+				key: SETTINGS_KEYS.COMPACTION_MODE,
+				label: 'Automatic conversation compaction',
+				help: 'Choose whether long conversations are left alone, paused for confirmation, or compacted automatically before a request.',
+				defaultValue: 'ask',
+				type: SettingsFieldType.SELECT,
+				section: SETTINGS_SECTION_SLUGS.MEMORY,
+				options: COMPACTION_MODE_OPTIONS
+			},
+			{
+				key: SETTINGS_KEYS.COMPACTION_TRIGGER_PERCENT,
+				label: 'Compaction trigger (%)',
+				help: 'Start compaction when the rendered prompt reaches this percentage of usable input capacity. Valid range: 55-95.',
+				defaultValue: 78,
+				type: SettingsFieldType.INPUT,
+				section: SETTINGS_SECTION_SLUGS.MEMORY,
+				isPositiveInteger: true
+			},
+			{
+				key: SETTINGS_KEYS.COMPACTION_TARGET_PERCENT,
+				label: 'Compaction target (%)',
+				help: 'Target prompt size after compaction. It must remain at least 10 percentage points below the trigger. Valid range: 30-75.',
+				defaultValue: 50,
+				type: SettingsFieldType.INPUT,
+				section: SETTINGS_SECTION_SLUGS.MEMORY,
+				isPositiveInteger: true
+			},
+			{
+				key: SETTINGS_KEYS.COMPACTION_PROTECTED_TURNS,
+				label: 'Protected recent turns',
+				help: 'Minimum number of complete recent turns that always remain literal. Valid range: 2-32.',
+				defaultValue: 8,
+				type: SettingsFieldType.INPUT,
+				section: SETTINGS_SECTION_SLUGS.MEMORY,
+				isPositiveInteger: true
+			},
+			{
+				key: SETTINGS_KEYS.SPOMIN_ENABLED,
+				label: 'Use Spomin long-term memory',
+				help: 'Retrieve from a Spomin server when it is reachable. Failures never block chat requests.',
+				defaultValue: true,
+				type: SettingsFieldType.CHECKBOX,
+				section: SETTINGS_SECTION_SLUGS.MEMORY
+			},
+			{
+				key: SETTINGS_KEYS.SPOMIN_BASE_URL,
+				label: 'Spomin URL',
+				help: 'REST endpoint for the Spomin server.',
+				defaultValue: 'http://127.0.0.1:8084',
+				type: SettingsFieldType.INPUT,
+				section: SETTINGS_SECTION_SLUGS.MEMORY,
+				dependsOn: SETTINGS_KEYS.SPOMIN_ENABLED
+			},
+			{
+				key: SETTINGS_KEYS.SPOMIN_API_TOKEN,
+				label: 'Spomin API token',
+				help: 'Optional bearer token. It remains in this browser profile.',
+				defaultValue: '',
+				type: SettingsFieldType.INPUT,
+				section: SETTINGS_SECTION_SLUGS.MEMORY,
+				dependsOn: SETTINGS_KEYS.SPOMIN_ENABLED
+			},
+			{
+				key: SETTINGS_KEYS.SPOMIN_PROJECT,
+				label: 'Default Spomin project',
+				help: 'Optional project scope. A conversation-specific override can replace it.',
+				defaultValue: '',
+				type: SettingsFieldType.INPUT,
+				section: SETTINGS_SECTION_SLUGS.MEMORY,
+				dependsOn: SETTINGS_KEYS.SPOMIN_ENABLED
+			},
+			{
+				key: SETTINGS_KEYS.SPOMIN_RESULT_LIMIT,
+				label: 'Spomin result limit',
+				help: 'Maximum long-term memories considered for one request.',
+				defaultValue: 3,
+				type: SettingsFieldType.INPUT,
+				section: SETTINGS_SECTION_SLUGS.MEMORY,
+				isPositiveInteger: true,
+				dependsOn: SETTINGS_KEYS.SPOMIN_ENABLED
+			},
+			{
+				key: SETTINGS_KEYS.SPOMIN_TOKEN_BUDGET,
+				label: 'Spomin token budget',
+				help: 'Maximum approximate tokens injected from Spomin per request.',
+				defaultValue: 1000,
+				type: SettingsFieldType.INPUT,
+				section: SETTINGS_SECTION_SLUGS.MEMORY,
+				isPositiveInteger: true,
+				dependsOn: SETTINGS_KEYS.SPOMIN_ENABLED
+			},
+			{
+				key: SETTINGS_KEYS.SPOMIN_TIMEOUT_MS,
+				label: 'Spomin timeout (ms)',
+				help: 'Short deadline for fail-open retrieval and memory management requests.',
+				defaultValue: 750,
+				type: SettingsFieldType.INPUT,
+				section: SETTINGS_SECTION_SLUGS.MEMORY,
+				isPositiveInteger: true,
+				dependsOn: SETTINGS_KEYS.SPOMIN_ENABLED
+			},
+			{
+				key: SETTINGS_KEYS.EMBEDDING_BASE_URL,
+				label: 'Embedding API URL',
+				help: 'OpenAI-compatible embedding endpoint used for local semantic recall.',
+				defaultValue: 'http://127.0.0.1:8081/v1',
+				type: SettingsFieldType.INPUT,
+				section: SETTINGS_SECTION_SLUGS.MEMORY
+			},
+			{
+				key: SETTINGS_KEYS.EMBEDDING_MODEL,
+				label: 'Embedding model',
+				help: 'Model name sent to the embedding endpoint.',
+				defaultValue: 'embeddinggemma-300M-Q8_0.gguf',
+				type: SettingsFieldType.INPUT,
+				section: SETTINGS_SECTION_SLUGS.MEMORY
+			},
+			{
+				key: SETTINGS_KEYS.EMBEDDING_TIMEOUT_MS,
+				label: 'Embedding timeout (ms)',
+				help: 'Deadline for semantic recall. Lexical recall remains available on timeout.',
+				defaultValue: 1200,
+				type: SettingsFieldType.INPUT,
+				section: SETTINGS_SECTION_SLUGS.MEMORY,
+				isPositiveInteger: true
 			}
 		]
 	},
