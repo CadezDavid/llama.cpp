@@ -518,7 +518,7 @@ export class ChatService {
 	static async areAllSlotsIdle(model?: string | null, signal?: AbortSignal): Promise<boolean> {
 		try {
 			const url = model ? `${API_SLOTS.LIST}?model=${encodeURIComponent(model)}` : API_SLOTS.LIST;
-			const res = await fetch(url, { signal });
+			const res = await fetch(url, { headers: getAuthHeaders(), signal });
 			if (!res.ok) return true;
 
 			const slots: { is_processing: boolean }[] = await res.json();

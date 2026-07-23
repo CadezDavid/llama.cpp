@@ -53,7 +53,11 @@ import {
 import { ROUTES } from '$lib/constants/routes';
 import { RouterService } from '$lib/services/router.service';
 import { SvelteMap, SvelteSet } from 'svelte/reactivity';
-import type { DatabaseCompaction, DatabaseCompactionProjectionEvent } from '$lib/types';
+import type {
+	DatabaseCompaction,
+	DatabaseCompactionProjectionEvent,
+	DatabaseRetrievalTrace
+} from '$lib/types';
 
 export interface ConversationTreeItem {
 	conversation: DatabaseConversation;
@@ -979,7 +983,13 @@ class ConversationsStore {
 	 * @returns The JSONL string (one record per line)
 	 */
 	serializeSessionToJsonl(data: ExportedConversation): string {
-		const { conv, messages, compactions = [], compactionProjectionEvents = [] } = data;
+		const {
+			conv,
+			messages,
+			compactions = [],
+			compactionProjectionEvents = [],
+			retrievalTraces = []
+		} = data;
 
 		const sessionLine = JSON.stringify({ type: 'session', harness: 'llama.app', ...conv });
 		const messageLines = messages.map((message: DatabaseMessage) => {
@@ -997,8 +1007,17 @@ class ConversationsStore {
 			(event: DatabaseCompactionProjectionEvent) =>
 				JSON.stringify({ type: 'compaction_projection', event })
 		);
+		const retrievalTraceLines = retrievalTraces.map((trace: DatabaseRetrievalTrace) =>
+			JSON.stringify({ type: 'retrieval_trace', trace })
+		);
 
-		return [sessionLine, ...messageLines, ...compactionLines, ...projectionLines].join('\n');
+		return [
+			sessionLine,
+			...messageLines,
+			...compactionLines,
+			...projectionLines,
+			...retrievalTraceLines
+		].join('\n');
 	}
 
 	/**
@@ -1044,6 +1063,10 @@ class ConversationsStore {
 				if (!current) throw new Error('Invalid JSONL: projection before any session record');
 				current.compactionProjectionEvents ??= [];
 				current.compactionProjectionEvents.push(record.event);
+			} else if (record.type === 'retrieval_trace') {
+				if (!current) throw new Error('Invalid JSONL: retrieval trace before any session record');
+				current.retrievalTraces ??= [];
+				current.retrievalTraces.push(record.trace);
 			}
 			// Ignore unknown record types for forward compatibility.
 		}

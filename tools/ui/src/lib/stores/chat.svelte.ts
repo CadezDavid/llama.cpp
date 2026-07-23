@@ -20,6 +20,7 @@ import { RetrievalService } from '$lib/services/retrieval.service';
 import { compactionStore } from '$lib/stores/compaction.svelte';
 import { streamIdentity } from '$lib/utils/stream-identity';
 import { getAuthHeaders } from '$lib/utils/api-headers';
+import { memoryDebug } from '$lib/utils/memory-debug';
 import { conversationsStore } from '$lib/stores/conversations.svelte';
 import { config } from '$lib/stores/settings.svelte';
 import { agenticStore } from '$lib/stores/agentic.svelte';
@@ -124,11 +125,19 @@ class ChatStore {
 	private async prepareConversationContext(
 		conversationId: string,
 		messages: DatabaseMessage[],
+		responseMessageId: string | undefined,
 		model?: string | null,
 		excludeReasoning?: boolean,
 		measurementOptions?: SettingsChatServiceOptions,
 		includeRecall = true
 	): Promise<PreparedChatContext> {
+		memoryDebug('chat.context.prepare', {
+			conversationId,
+			messageCount: messages.length,
+			model,
+			includeRecall,
+			excludeReasoning: Boolean(excludeReasoning)
+		});
 		const activeCompaction = await CompactionService.resolveActiveCompaction(
 			conversationId,
 			messages
@@ -148,6 +157,7 @@ class ChatStore {
 			const preparation = await RetrievalService.prepare({
 				conversationId,
 				anchorMessageId: messages.at(-1)!.id,
+				responseMessageId,
 				messages,
 				compactionGeneration: activeCompaction?.record.generation ?? 0,
 				settings: {
@@ -158,13 +168,9 @@ class ChatStore {
 						conversation?.memoryProject || String(currentConfig.spominProject || '') || undefined,
 					spominResultLimit: Number(currentConfig.spominResultLimit) || 3,
 					spominTokenBudget: Number(currentConfig.spominTokenBudget) || 1000,
-					spominTimeoutMs: Number(currentConfig.spominTimeoutMs) || 750,
-					embeddingBaseUrl: String(
-						currentConfig.embeddingBaseUrl || 'http://127.0.0.1:8081/v1'
-					),
-					embeddingModel: String(
-						currentConfig.embeddingModel || 'embeddinggemma-300M-Q8_0.gguf'
-					),
+					spominTimeoutMs: Number(currentConfig.spominTimeoutMs) || 2000,
+					embeddingBaseUrl: String(currentConfig.embeddingBaseUrl || 'http://127.0.0.1:8081/v1'),
+					embeddingModel: String(currentConfig.embeddingModel || 'embeddinggemma-300M-Q8_0.gguf'),
 					embeddingTimeoutMs: Number(currentConfig.embeddingTimeoutMs) || 1200,
 					localResultLimit: Number(currentConfig.localRecallResultLimit) || 5,
 					localTokenBudget: Number(currentConfig.localRecallTokenBudget) || 1500,
@@ -182,8 +188,10 @@ class ChatStore {
 					0)
 				: (contextSize() ?? 0);
 			if (modelContextSize && blocks.length) {
-				const outputReserve = Number(currentConfig.max_tokens) || Math.min(8192, modelContextSize * 0.1);
-				const maximumInput = modelContextSize - outputReserve - Math.max(256, modelContextSize * 0.02);
+				const outputReserve =
+					Number(currentConfig.max_tokens) || Math.min(8192, modelContextSize * 0.1);
+				const maximumInput =
+					modelContextSize - outputReserve - Math.max(256, modelContextSize * 0.02);
 				while (true) {
 					finalTokens = (
 						await ChatService.measurePrompt(prepared.requestMessages, {
@@ -192,6 +200,13 @@ class ChatStore {
 						})
 					).tokenCount;
 					if (finalTokens <= maximumInput || blocks.length === 0) break;
+					memoryDebug('chat.context.drop-recall-block', {
+						conversationId,
+						droppedBlockId: blocks.at(-1)?.id,
+						promptTokens: finalTokens,
+						maximumInput,
+						remainingBlockCount: blocks.length - 1
+					});
 					blocks = blocks.slice(0, -1);
 					prepared = await ChatContextService.prepare({ ...baseInput, contextBlocks: blocks });
 				}
@@ -201,8 +216,16 @@ class ChatStore {
 				blocks.map((block) => block.id),
 				finalTokens
 			);
+			memoryDebug('chat.context.ready', {
+				conversationId,
+				activeCompactionId: activeCompaction?.record.id,
+				contextBlockIds: blocks.map((block) => block.id),
+				finalPromptTokenCount: finalTokens,
+				requestMessageCount: prepared.requestMessages.length
+			});
 			return prepared;
 		} catch (error) {
+			memoryDebug('chat.context.recall-fallback', { conversationId, error });
 			console.warn('[ChatStore] Recall unavailable; continuing without recalled context:', error);
 			return await ChatContextService.prepare(baseInput);
 		}
@@ -1245,6 +1268,7 @@ class ChatStore {
 		const preparedContext = await this.prepareConversationContext(
 			assistantMessage.convId,
 			allMessages,
+			assistantMessage.id,
 			effectiveModel,
 			!!apiOptions.excludeReasoningFromContext,
 			apiOptions
@@ -1512,6 +1536,7 @@ class ChatStore {
 				const refreshed = await this.prepareConversationContext(
 					convId,
 					transcript,
+					currentMessageId,
 					effectiveModel,
 					!!apiOptions.excludeReasoningFromContext,
 					apiOptions
@@ -2123,6 +2148,7 @@ class ChatStore {
 			const preparedContext = await this.prepareConversationContext(
 				msg.convId,
 				contextWithContinue,
+				msg.id,
 				continueOptions.model,
 				!!continueOptions.excludeReasoningFromContext,
 				continueOptions
@@ -2709,6 +2735,7 @@ class ChatStore {
 			const preparedContext = await this.prepareConversationContext(
 				conversationId,
 				activePath,
+				undefined,
 				model,
 				excludeReasoning,
 				undefined,

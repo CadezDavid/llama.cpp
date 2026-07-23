@@ -553,6 +553,22 @@ const mcpDefaultEnabledMigration: Migration = {
 
 const CONFIG_TYPES_MIGRATION_ID = 'config-type-normalization-v1';
 
+const SPOMIN_TIMEOUT_MIGRATION_ID = 'spomin-timeout-default-v1';
+
+const spominTimeoutMigration: Migration = {
+	id: SPOMIN_TIMEOUT_MIGRATION_ID,
+	description: 'Raise the previous default Spomin timeout from 750 ms to 2000 ms',
+
+	async run(): Promise<void> {
+		const configRaw = localStorage.getItem(CONFIG_LOCALSTORAGE_KEY);
+		if (configRaw === null) return;
+		const config = JSON.parse(configRaw);
+		if (Number(config[SETTINGS_KEYS.SPOMIN_TIMEOUT_MS]) !== 750) return;
+		config[SETTINGS_KEYS.SPOMIN_TIMEOUT_MS] = 2000;
+		localStorage.setItem(CONFIG_LOCALSTORAGE_KEY, JSON.stringify(config));
+	}
+};
+
 const configTypesMigration: Migration = {
 	id: CONFIG_TYPES_MIGRATION_ID,
 	description: 'Coerce legacy string-encoded booleans in persisted config to real booleans',
@@ -671,6 +687,7 @@ const migrations: Migration[] = [
 	customJsonKeyMigration,
 	mcpDefaultEnabledMigration,
 	mcpDefaultOverridesMergeMigration,
+	spominTimeoutMigration,
 	configTypesMigration
 ];
 

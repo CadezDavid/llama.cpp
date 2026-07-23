@@ -4,6 +4,7 @@
 	import { AlertTriangle, ArchiveRestore, Minimize2 } from '@lucide/svelte';
 	import { compactionStore } from '$lib/stores/compaction.svelte';
 	import { conversationsStore } from '$lib/stores/conversations.svelte';
+	import CompactionRangeTimeline from './CompactionRangeTimeline.svelte';
 
 	let observedConversationId = $state<string | null>(null);
 	let observedMessageCount = $state(-1);
@@ -144,21 +145,17 @@
 							{compactionStore.policy?.targetPercent ?? 0}%
 						</div>
 					</div>
-					<label class="grid gap-2 text-sm">
-						<span class="font-medium">Compact through turn</span>
-						<select
-							class="h-10 rounded-md border bg-background px-3"
-							value={compactionStore.selectedCandidateIndex}
-							onchange={(event) =>
-								void compactionStore.selectCandidate(Number(event.currentTarget.value))}
-						>
-							{#each compactionStore.candidates as candidate, index (candidate.endMessageId)}
-								<option value={index}
-									>Turn {candidate.turnCount} ({formatTokens(candidate.sourceTokenCount)} source tokens)</option
-								>
-							{/each}
-						</select>
-					</label>
+					<div class="grid gap-2">
+						<div class="text-sm font-medium">Compact through turn</div>
+						<CompactionRangeTimeline
+							candidates={compactionStore.candidates}
+							messages={compactionStore.messages}
+							selectedIndex={compactionStore.selectedCandidateIndex}
+							totalTokenCount={compactionStore.beforeTokenCount}
+							protectedTurns={compactionStore.policy?.protectedTurns ?? 8}
+							onSelect={(index) => void compactionStore.selectCandidate(index)}
+						/>
+					</div>
 					<p class="text-sm text-muted-foreground">
 						Compaction keeps the original messages and replaces only the context sent to the model.
 						The recent conversation remains literal.
@@ -193,25 +190,17 @@
 				</div>
 
 				{#if compactionStore.step === 'measure'}
-					<label class="grid gap-2 text-sm">
-						<span class="font-medium">Compact through turn</span>
-						<select
-							class="h-10 rounded-md border bg-background px-3"
-							value={compactionStore.selectedCandidateIndex}
-							onchange={(event) =>
-								void compactionStore.selectCandidate(Number(event.currentTarget.value))}
-						>
-							{#each compactionStore.candidates as candidate, index (candidate.endMessageId)}
-								<option value={index}
-									>Turn {candidate.turnCount} ({candidate.sourceMessageIds.length} messages)</option
-								>
-							{/each}
-						</select>
-					</label>
-					<p class="text-xs text-muted-foreground">
-						The ending boundary can move only between complete turns. Tool calls and results stay
-						together.
-					</p>
+					<div class="grid gap-2">
+						<div class="text-sm font-medium">Compact through turn</div>
+						<CompactionRangeTimeline
+							candidates={compactionStore.candidates}
+							messages={compactionStore.messages}
+							selectedIndex={compactionStore.selectedCandidateIndex}
+							totalTokenCount={compactionStore.beforeTokenCount}
+							protectedTurns={compactionStore.policy?.protectedTurns ?? 8}
+							onSelect={(index) => void compactionStore.selectCandidate(index)}
+						/>
+					</div>
 				{:else if compactionStore.step === 'generate'}
 					<div class="py-10 text-center text-sm text-muted-foreground">
 						Generating structured conversation state...

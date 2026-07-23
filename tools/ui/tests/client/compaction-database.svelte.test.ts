@@ -320,6 +320,36 @@ describe('compaction database persistence', () => {
 			{ summary: 'ready', projectedTokenCount: 800 },
 			assistant.id
 		);
+		const sourceChunk = (await DatabaseService.getConversationArchiveChunks(conversation.id))[0];
+		await DatabaseService.addRetrievalTrace({
+			id: 'source-trace',
+			conversationId: conversation.id,
+			anchorMessageId: user.id,
+			responseMessageId: assistant.id,
+			createdAt: Date.now(),
+			query: 'old question',
+			queryFingerprint: 'fingerprint',
+			queryTerms: ['old', 'question'],
+			compactionGeneration: 1,
+			providers: { local: { status: 'ok' } },
+			hits: [
+				{
+					id: `local:${sourceChunk.id}`,
+					source: 'conversation-recall',
+					score: 0.9,
+					selected: true,
+					tokenCount: 4,
+					contentSnapshot: sourceChunk.text,
+					provenance: {
+						chunkId: sourceChunk.id,
+						compactionId: pending.id,
+						sourceMessageIds: sourceChunk.sourceMessageIds
+					}
+				}
+			],
+			injectedHitIds: [`local:${sourceChunk.id}`],
+			injectedTokenCount: 4
+		});
 
 		const fork = await DatabaseService.forkConversation(conversation.id, assistant.id, {
 			name: 'Fork target',
@@ -328,6 +358,7 @@ describe('compaction database persistence', () => {
 		const forkMessages = await DatabaseService.getConversationMessages(fork.id);
 		const forkCompactions = await DatabaseService.getConversationCompactions(fork.id);
 		const forkEvents = await DatabaseService.getConversationCompactionProjectionEvents(fork.id);
+		const forkTraces = await DatabaseService.getRetrievalTraces(fork.id);
 
 		expect(forkCompactions).toHaveLength(1);
 		expect(forkCompactions[0]).toMatchObject({
@@ -344,5 +375,69 @@ describe('compaction database persistence', () => {
 			action: 'apply',
 			compactionId: forkCompactions[0].id
 		});
+		expect(forkTraces).toHaveLength(1);
+		expect(forkTraces[0]).toMatchObject({
+			conversationId: fork.id,
+			hits: [
+				expect.objectContaining({
+					contentSnapshot: sourceChunk.text,
+					provenance: expect.objectContaining({ compactionId: forkCompactions[0].id })
+				})
+			]
+		});
+		expect(forkMessages.some((message) => message.id === forkTraces[0].anchorMessageId)).toBe(true);
+		expect(forkMessages.some((message) => message.id === forkTraces[0].responseMessageId)).toBe(
+			true
+		);
+		expect(forkTraces[0].hits[0].id).not.toBe(`local:${sourceChunk.id}`);
+	});
+
+	it('deletes request traces with their response branch', async () => {
+		const conversation = await DatabaseService.createConversation('Trace deletion');
+		conversationId = conversation.id;
+		const rootId = await DatabaseService.createRootMessage(conversation.id);
+		const user = await DatabaseService.createMessageBranch(
+			{
+				convId: conversation.id,
+				type: MessageType.TEXT,
+				timestamp: Date.now(),
+				role: MessageRole.USER,
+				content: 'Question',
+				parent: rootId,
+				children: []
+			},
+			rootId
+		);
+		const assistant = await DatabaseService.createMessageBranch(
+			{
+				convId: conversation.id,
+				type: MessageType.TEXT,
+				timestamp: Date.now() + 1,
+				role: MessageRole.ASSISTANT,
+				content: 'Answer',
+				parent: user.id,
+				children: []
+			},
+			user.id
+		);
+		await DatabaseService.addRetrievalTrace({
+			id: 'trace-delete',
+			conversationId: conversation.id,
+			anchorMessageId: user.id,
+			responseMessageId: assistant.id,
+			createdAt: Date.now(),
+			query: 'question',
+			queryFingerprint: 'fingerprint',
+			queryTerms: ['question'],
+			compactionGeneration: 0,
+			providers: { local: { status: 'ok' } },
+			hits: [],
+			injectedHitIds: [],
+			injectedTokenCount: 0
+		});
+
+		await DatabaseService.deleteMessageCascading(conversation.id, assistant.id);
+
+		expect(await DatabaseService.getRetrievalTraces(conversation.id)).toEqual([]);
 	});
 });

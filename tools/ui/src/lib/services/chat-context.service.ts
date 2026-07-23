@@ -11,6 +11,7 @@ import type {
 	PreparedChatContext
 } from '$lib/types/chat-context';
 import type { DatabaseMessage } from '$lib/types/database';
+import { memoryDebug } from '$lib/utils/memory-debug';
 import { ChatService, type ChatMessageInput } from './chat.service';
 
 interface ValidatedProjection {
@@ -21,6 +22,13 @@ interface ValidatedProjection {
 
 export class ChatContextService {
 	static async prepare(input: PrepareChatContextInput): Promise<PreparedChatContext> {
+		memoryDebug('context.prepare.start', {
+			transcriptMessageCount: input.transcriptMessages.length,
+			projectionCount: input.projections?.length ?? 0,
+			contextBlockCount: input.contextBlocks?.length ?? 0,
+			model: input.model,
+			excludeReasoning: Boolean(input.excludeReasoning)
+		});
 		const projections = await ChatContextService.validateProjections(
 			input.transcriptMessages,
 			input.projections ?? []
@@ -35,6 +43,17 @@ export class ChatContextService {
 		});
 		const contextBlocks = input.contextBlocks ?? [];
 		const requestMessages = ChatContextService.insertContextBlocks(stableMessages, contextBlocks);
+		memoryDebug('context.prepare.complete', {
+			stableMessageCount: stableMessages.length,
+			requestMessageCount: requestMessages.length,
+			appliedProjectionIds: projections.map(({ projection }) => projection.id),
+			contextBlockIds: contextBlocks.map((block) => block.id),
+			hasNonTextContent: requestMessages.some(
+				(message) =>
+					Array.isArray(message.content) &&
+					message.content.some((part) => part.type !== ContentPartType.TEXT)
+			)
+		});
 
 		return {
 			stableMessages,
@@ -205,6 +224,15 @@ export class ChatContextService {
 		if (userIndex < 0) throw new Error('Context blocks require a user message');
 
 		const envelope = blocks.map(ChatContextService.renderContextBlock).join('\n\n');
+		memoryDebug('context.blocks.insert', {
+			targetUserMessageIndex: userIndex,
+			blockCount: blocks.length,
+			blocks: blocks.map((block) => ({
+				id: block.id,
+				source: block.source,
+				characterCount: block.content.length
+			}))
+		});
 		return messages.map((message, index) => {
 			if (index !== userIndex) return { ...message };
 			const content: string | ApiChatMessageContentPart[] =

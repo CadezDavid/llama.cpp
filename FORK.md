@@ -56,9 +56,22 @@ compaction generation changes or the user explicitly asks to recall it.
 
 The Memory settings page configures both providers, supports per-conversation
 Spomin project overrides, offers explicit create/edit/delete controls, and
-shows recent retrieval decisions. Provider failures are fail-open and never
-block a chat request. Spomin mutations remain explicit; automatic recall does
-not create or modify long-term memories.
+shows recent retrieval decisions. Automatic Spomin retrieval uses a two-second
+fail-open deadline and never blocks a chat request when the provider is
+unavailable. Spomin mutations remain explicit; automatic recall does not create
+or modify long-term memories.
+
+Each completed request displays a collapsed memory-context indicator below the
+corresponding user turn. Its expanded view distinguishes Spomin memories from
+compacted conversation excerpts, shows the exact text sent to the model, and
+explains why other candidates were skipped. These are immutable request
+snapshots, so later edits or deletions in the source memory do not rewrite chat
+history.
+
+Manual and confirmed compaction use a token-weighted timeline. Its points are
+safe complete-turn boundaries, the selected left portion is compacted, and the
+protected recent tail remains literal. Pointer, touch, and keyboard controls
+all select from the same validated candidates used by automatic compaction.
 
 ## Branch guide
 
@@ -125,6 +138,24 @@ Memory-related WebUI changes should at minimum pass the UI type checks, lint,
 unit tests, and production build. Changes merged into a TurboQuant integration
 branch should also build the CUDA-enabled `llama-server` configuration used by
 that branch.
+
+## Debugging
+
+llama-server uses `-lv 4` for trace logging, `-lv 5` for debug logging, and
+`-v` for all available logs. Options passed through the local launcher belong
+after `--`, for example:
+
+```bash
+~/scripts/start-llm.sh qwen -- --log-verbosity 5
+```
+
+Memory decisions happen in the browser as well as the server. Enable
+`Memory diagnostics` under the WebUI Memory settings, save the settings, and
+open the browser developer console. Structured `[Memory]` events cover
+compaction policy and activation, recalled-context selection and cooldowns,
+embedding fallback, Spomin requests, prompt-budget trimming, and final context
+insertion. These logs redact prompt text, memory text, retrieval queries,
+embeddings, summaries, and credentials.
 
 ## Scope and support
 

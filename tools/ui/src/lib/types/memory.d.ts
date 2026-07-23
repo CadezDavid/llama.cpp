@@ -65,15 +65,24 @@ export interface RetrievalTraceHit {
 	id: string;
 	source: 'conversation-recall' | 'long-term-memory';
 	score: number;
+	lexicalScore?: number;
+	semanticScore?: number;
+	providerScore?: number;
 	selected: boolean;
 	reason?: string;
 	tokenCount?: number;
+	/** Immutable copy of text that was actually sent to the model. */
+	contentSnapshot?: string;
+	/** Non-secret source identifiers captured when retrieval ran. */
+	provenance?: Record<string, unknown>;
 }
 
 export interface DatabaseRetrievalTrace {
 	id: string;
 	conversationId: string;
 	anchorMessageId: string;
+	/** Assistant message prepared by this request. Missing on legacy traces. */
+	responseMessageId?: string;
 	createdAt: number;
 	query: string;
 	queryFingerprint: string;

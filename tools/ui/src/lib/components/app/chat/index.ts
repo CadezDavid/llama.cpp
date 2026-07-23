@@ -591,6 +591,7 @@ export { default as ChatMessageEditForm } from './ChatMessages/ChatMessageEditFo
  */
 export { default as ChatMessageUser } from './ChatMessages/ChatMessage/ChatMessageUser/ChatMessageUser.svelte';
 export { default as ChatMessageUserBubble } from './ChatMessages/ChatMessage/ChatMessageUser/ChatMessageUserBubble.svelte';
+export { default as ChatMessageMemoryContext } from './ChatMessages/ChatMessage/ChatMessageUser/ChatMessageMemoryContext.svelte';
 export { default as ChatMessageUserPending } from './ChatMessages/ChatMessage/ChatMessageUser/ChatMessageUserPending.svelte';
 
 /**

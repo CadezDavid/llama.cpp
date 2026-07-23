@@ -151,6 +151,9 @@ class SettingsStore {
 				...savedVal
 			};
 			this.normalizeCompactionSettings();
+			if (Number(this.config[SETTINGS_KEYS.SPOMIN_TIMEOUT_MS]) === 750) {
+				this.config[SETTINGS_KEYS.SPOMIN_TIMEOUT_MS] = 2000;
+			}
 
 			// Default sendOnEnter to false on mobile when the user has no saved preference
 			if (!(SETTINGS_KEYS.SEND_ON_ENTER in savedVal)) {

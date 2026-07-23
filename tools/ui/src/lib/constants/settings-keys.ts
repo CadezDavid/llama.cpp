@@ -67,6 +67,7 @@ export const SETTINGS_KEYS = {
 	COMPACTION_TRIGGER_PERCENT: 'compactionTriggerPercent',
 	COMPACTION_TARGET_PERCENT: 'compactionTargetPercent',
 	COMPACTION_PROTECTED_TURNS: 'compactionProtectedTurns',
+	MEMORY_DEBUG_LOGGING: 'memoryDebugLogging',
 	SPOMIN_ENABLED: 'spominEnabled',
 	SPOMIN_BASE_URL: 'spominBaseUrl',
 	SPOMIN_API_TOKEN: 'spominApiToken',
