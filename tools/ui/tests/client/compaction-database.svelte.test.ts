@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MessageRole, MessageType } from '$lib/enums';
 import { ChatContextService } from '$lib/services/chat-context.service';
 import { DatabaseService } from '$lib/services/database.service';
@@ -11,6 +11,7 @@ describe('compaction database persistence', () => {
 			await DatabaseService.deleteConversation(conversationId, { deleteWithForks: true });
 		}
 		conversationId = null;
+		vi.restoreAllMocks();
 	});
 
 	it('stores plain copies of reactive source message arrays', async () => {
@@ -112,6 +113,65 @@ describe('compaction database persistence', () => {
 			new Set([user.id, assistant.id])
 		);
 		expect(archive.every((chunk) => chunk.embeddingStatus === 'pending')).toBe(true);
+	});
+
+	it('keeps activation alive while Web Crypto fingerprints the source', async () => {
+		const conversation = await DatabaseService.createConversation('Delayed fingerprint test');
+		conversationId = conversation.id;
+		const rootId = await DatabaseService.createRootMessage(conversation.id);
+		const user = await DatabaseService.createMessageBranch(
+			{
+				convId: conversation.id,
+				type: MessageType.TEXT,
+				timestamp: Date.now(),
+				role: MessageRole.USER,
+				content: 'Old question',
+				parent: rootId,
+				children: []
+			},
+			rootId
+		);
+		const assistant = await DatabaseService.createMessageBranch(
+			{
+				convId: conversation.id,
+				type: MessageType.TEXT,
+				timestamp: Date.now() + 1,
+				role: MessageRole.ASSISTANT,
+				content: 'Old answer',
+				parent: user.id,
+				children: []
+			},
+			user.id
+		);
+		const sourceFingerprint = await ChatContextService.fingerprintMessages([user, assistant]);
+		const pending = await DatabaseService.createPendingCompaction({
+			conversationId: conversation.id,
+			sourceMessageIds: [user.id, assistant.id],
+			deltaSourceMessageIds: [user.id, assistant.id],
+			sourceFingerprint,
+			summary: '',
+			summarySchemaVersion: 1,
+			promptVersion: 1,
+			sourceTokenCount: 1000,
+			beforeTokenCount: 2000,
+			projectedTokenCount: 0,
+			generation: 1
+		});
+		const fingerprintMessages = ChatContextService.fingerprintMessages.bind(ChatContextService);
+		vi.spyOn(ChatContextService, 'fingerprintMessages').mockImplementation(async (messages) => {
+			await new Promise((resolve) => setTimeout(resolve, 25));
+			return await fingerprintMessages(messages);
+		});
+
+		await expect(
+			DatabaseService.activateCompaction(
+				pending.id,
+				{ summary: 'ready', projectedTokenCount: 800 },
+				assistant.id
+			)
+		).resolves.toMatchObject({ action: 'apply', compactionId: pending.id });
+		const records = await DatabaseService.getConversationCompactions(conversation.id);
+		expect(records[0]).toMatchObject({ status: 'ready', summary: 'ready' });
 	});
 
 	it('records restore as a later path projection event', async () => {
