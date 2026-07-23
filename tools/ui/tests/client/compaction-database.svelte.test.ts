@@ -13,6 +13,31 @@ describe('compaction database persistence', () => {
 		conversationId = null;
 	});
 
+	it('stores plain copies of reactive source message arrays', async () => {
+		const conversation = await DatabaseService.createConversation('Reactive source test');
+		conversationId = conversation.id;
+		const sourceMessageIds = new Proxy(['message-1'], {});
+		const deltaSourceMessageIds = new Proxy(['message-1'], {});
+
+		const pending = await DatabaseService.createPendingCompaction({
+			conversationId: conversation.id,
+			sourceMessageIds,
+			deltaSourceMessageIds,
+			sourceFingerprint: 'fingerprint',
+			summary: '',
+			summarySchemaVersion: 1,
+			promptVersion: 1,
+			sourceTokenCount: 1000,
+			beforeTokenCount: 2000,
+			projectedTokenCount: 0,
+			generation: 1
+		});
+
+		expect(pending.sourceMessageIds).toEqual(['message-1']);
+		expect(pending.deltaSourceMessageIds).toEqual(['message-1']);
+		expect(await DatabaseService.getConversationCompactions(conversation.id)).toHaveLength(1);
+	});
+
 	it('keeps pending records inactive and commits ready state with its projection event', async () => {
 		const conversation = await DatabaseService.createConversation('Compaction test');
 		conversationId = conversation.id;
