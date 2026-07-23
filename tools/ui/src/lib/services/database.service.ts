@@ -681,10 +681,10 @@ export class DatabaseService {
 					throw new Error(`Compaction ${id} source range is no longer active`);
 				}
 				const sourceMessages = activePath.slice(sourceStart, sourceStart + sourceIndexes.length);
-				if (
-					(await ChatContextService.fingerprintMessages(sourceMessages)) !==
-					record.sourceFingerprint
-				) {
+				const sourceFingerprint = await Dexie.waitFor(
+					ChatContextService.fingerprintMessages(sourceMessages)
+				);
+				if (sourceFingerprint !== record.sourceFingerprint) {
 					throw new Error(`Compaction ${id} source messages changed before activation`);
 				}
 				await db[IDXDB_TABLES.compactions].put({ ...record, ...updates, status: 'ready' });
