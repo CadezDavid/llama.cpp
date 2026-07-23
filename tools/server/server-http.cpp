@@ -248,6 +248,8 @@ bool server_http_context::init(const common_params & params) {
         );
 
         SRV_WRN("%s", "unauthorized: Invalid API Key\n");
+        SRV_DBG("unauthorized request: method = %s, path = %s, remote = %s\n",
+                req.method.c_str(), req.path.c_str(), req.remote_addr.c_str());
 
         return false;
     };

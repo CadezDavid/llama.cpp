@@ -440,6 +440,14 @@ const SETTINGS_REGISTRY: Record<string, SettingsSectionEntry> = {
 				isPositiveInteger: true
 			},
 			{
+				key: SETTINGS_KEYS.MEMORY_DEBUG_LOGGING,
+				label: 'Memory diagnostics',
+				help: 'Write detailed compaction, recall, and Spomin decisions to the browser console. Prompt text, memory text, embeddings, and credentials are redacted.',
+				defaultValue: false,
+				type: SettingsFieldType.CHECKBOX,
+				section: SETTINGS_SECTION_SLUGS.MEMORY
+			},
+			{
 				key: SETTINGS_KEYS.SPOMIN_ENABLED,
 				label: 'Use Spomin long-term memory',
 				help: 'Retrieve from a Spomin server when it is reachable. Failures never block chat requests.',
@@ -497,8 +505,8 @@ const SETTINGS_REGISTRY: Record<string, SettingsSectionEntry> = {
 			{
 				key: SETTINGS_KEYS.SPOMIN_TIMEOUT_MS,
 				label: 'Spomin timeout (ms)',
-				help: 'Short deadline for fail-open retrieval and memory management requests.',
-				defaultValue: 750,
+				help: 'Fail-open deadline. Chat continues with local recall if Spomin takes longer.',
+				defaultValue: 2000,
 				type: SettingsFieldType.INPUT,
 				section: SETTINGS_SECTION_SLUGS.MEMORY,
 				isPositiveInteger: true,

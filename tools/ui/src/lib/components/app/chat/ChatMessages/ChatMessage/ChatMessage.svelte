@@ -16,7 +16,7 @@
 	} from '$lib/components/app/chat';
 	import { parseFilesToMessageExtras } from '$lib/utils/browser-only';
 	import { deriveAgenticSections } from '$lib/utils';
-	import type { DatabaseMessageExtraMcpPrompt } from '$lib/types';
+	import type { DatabaseMessageExtraMcpPrompt, DatabaseRetrievalTrace } from '$lib/types';
 	import { ROUTES } from '$lib/constants/routes';
 
 	interface Props {
@@ -26,6 +26,7 @@
 		isLastAssistantMessage?: boolean;
 		isLastUserMessage?: boolean;
 		nextAssistantMessage?: DatabaseMessage | null;
+		retrievalTraces?: DatabaseRetrievalTrace[];
 		siblingInfo?: ChatMessageSiblingInfo | null;
 	}
 
@@ -36,6 +37,7 @@
 		isLastAssistantMessage = false,
 		isLastUserMessage = false,
 		nextAssistantMessage = null,
+		retrievalTraces = [],
 		siblingInfo = null
 	}: Props = $props();
 
@@ -366,6 +368,7 @@
 			{isLastUserMessage}
 			{message}
 			{nextAssistantMessage}
+			{retrievalTraces}
 			onConfirmDelete={handleConfirmDelete}
 			onCopy={handleCopy}
 			onDelete={handleDelete}

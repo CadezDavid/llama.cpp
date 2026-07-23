@@ -1,5 +1,6 @@
 import { toast } from 'svelte-sonner';
 import { isAbortError } from '$lib/utils/abort';
+import { memoryDebug } from '$lib/utils/memory-debug';
 import { isRouterMode, contextSize as serverContextSize } from '$lib/stores/server.svelte';
 import {
 	modelsStore,
@@ -111,9 +112,20 @@ class CompactionStore {
 	}
 
 	async preflight(input: CompactionPreflightInput): Promise<boolean> {
-		if (input.mode === 'off') return true;
+		if (input.mode === 'off') {
+			memoryDebug('compaction.preflight.skipped', {
+				conversationId: input.conversationId,
+				reason: 'disabled'
+			});
+			return true;
+		}
 		const existing = this.operations.get(input.conversationId);
-		if (existing) return await existing;
+		if (existing) {
+			memoryDebug('compaction.preflight.join-existing', {
+				conversationId: input.conversationId
+			});
+			return await existing;
+		}
 		const operation = this.operationTail
 			.catch(() => undefined)
 			.then(() => this.runPreflight(input))
@@ -132,7 +144,13 @@ class CompactionStore {
 		try {
 			await this.preparePreflight(input);
 			const measurement = this.preflightMeasurement;
-			if (!measurement?.triggered) return true;
+			if (!measurement?.triggered) {
+				memoryDebug('compaction.preflight.continue', {
+					conversationId: input.conversationId,
+					reason: 'below-trigger'
+				});
+				return true;
+			}
 
 			const snoozePercent = this.snoozePercentByConversation.get(input.conversationId);
 			if (
@@ -140,10 +158,21 @@ class CompactionStore {
 				snoozePercent !== undefined &&
 				measurement.utilizationPercent < snoozePercent
 			) {
+				memoryDebug('compaction.preflight.continue', {
+					conversationId: input.conversationId,
+					reason: 'snoozed',
+					utilizationPercent: measurement.utilizationPercent,
+					snoozePercent
+				});
 				return true;
 			}
 
 			if (this.policy?.mode === 'ask') {
+				memoryDebug('compaction.preflight.await-confirmation', {
+					conversationId: input.conversationId,
+					hardLimitExceeded: measurement.hardLimitExceeded,
+					utilizationPercent: measurement.utilizationPercent
+				});
 				this.mode = 'ask';
 				this.step = 'measure';
 				this.open = true;
@@ -154,6 +183,11 @@ class CompactionStore {
 
 			return await this.runAutomaticCompaction();
 		} catch (error) {
+			memoryDebug('compaction.preflight.error', {
+				conversationId: input.conversationId,
+				hardLimitExceeded: this.preflightMeasurement?.hardLimitExceeded,
+				error
+			});
 			this.error = error instanceof Error ? error.message : String(error);
 			if (this.preflightMeasurement?.hardLimitExceeded) {
 				this.mode = 'ask';
@@ -203,6 +237,12 @@ class CompactionStore {
 				this.beforeTokenCount,
 				this.policy
 			);
+			memoryDebug('compaction.preflight.measured', {
+				conversationId: input.conversationId,
+				beforeTokenCount: this.beforeTokenCount,
+				activeCompactionId: this.activeCompaction?.record.id,
+				measurement: this.preflightMeasurement
+			});
 			if (!this.preflightMeasurement.triggered) return;
 
 			const protectedTurns = await this.resolveProtectedTurnCount(this.policy);
@@ -217,6 +257,17 @@ class CompactionStore {
 			for (let index = 0; index < this.candidates.length; index++) {
 				await this.measureCandidate(index);
 			}
+			memoryDebug('compaction.candidates.measured', {
+				conversationId: input.conversationId,
+				protectedTurns,
+				candidateCount: this.candidates.length,
+				candidates: this.candidates.map((candidate) => ({
+					endMessageId: candidate.endMessageId,
+					turnCount: candidate.turnCount,
+					sourceMessageCount: candidate.sourceMessageIds.length,
+					sourceTokenCount: candidate.sourceTokenCount
+				}))
+			});
 			const largest = this.candidates[this.candidates.length - 1];
 			const allowance = CompactionService.getBudget(
 				this.contextSize,
@@ -302,6 +353,14 @@ class CompactionStore {
 		const source = this.messages.filter((message) =>
 			candidate.sourceMessageIds.includes(message.id)
 		);
+		memoryDebug('compaction.automatic.start', {
+			conversationId: input.conversationId,
+			activationMode,
+			sourceMessageCount: candidate.sourceMessageIds.length,
+			deltaMessageCount: deltaSourceMessageIds.length,
+			beforeTokenCount: this.beforeTokenCount,
+			sourceTokenCount: this.sourceTokenCount
+		});
 
 		try {
 			const pending = await DatabaseService.createPendingCompaction({
@@ -377,6 +436,15 @@ class CompactionStore {
 					policy,
 					budget.minimumSavingsTokens
 				);
+				memoryDebug('compaction.automatic.attempt', {
+					conversationId: input.conversationId,
+					attempt,
+					strict,
+					projectedTokenCount: this.projectedTokenCount,
+					savedTokens: this.beforeTokenCount - this.projectedTokenCount,
+					accepted,
+					validationErrorCount: this.validationErrors.length
+				});
 				if (accepted) break;
 				this.validationErrors = [
 					`The projected prompt remains above ${policy.targetPercent + 5}% of usable input or saves too few tokens`
@@ -407,6 +475,14 @@ class CompactionStore {
 				this.messages
 			);
 			this.open = false;
+			memoryDebug('compaction.automatic.activated', {
+				conversationId: input.conversationId,
+				compactionId: pending.id,
+				attempts,
+				durationMs: Math.round(performance.now() - startedAt),
+				projectedTokenCount: this.projectedTokenCount,
+				savedTokens: this.beforeTokenCount - this.projectedTokenCount
+			});
 			toast.success(
 				policy.mode === 'automatic'
 					? 'Conversation compacted automatically'
@@ -414,6 +490,12 @@ class CompactionStore {
 			);
 			return true;
 		} catch (error) {
+			memoryDebug('compaction.automatic.error', {
+				conversationId: input.conversationId,
+				pendingCompactionId: this.pendingCompactionId,
+				aborted: isAbortError(error),
+				error
+			});
 			if (this.pendingCompactionId) {
 				await DatabaseService.deletePendingCompaction(this.pendingCompactionId);
 				this.pendingCompactionId = null;
@@ -536,8 +618,8 @@ class CompactionStore {
 			this.policy = CompactionService.createPolicy({
 				mode: String(currentConfig.compactionMode ?? 'ask'),
 				contextSize: this.contextSize,
-			maxOutputTokens: Number(currentConfig.max_tokens) || undefined,
-			retrievalReserveTokens: Number(currentConfig.totalRecallTokenBudget) || 2500,
+				maxOutputTokens: Number(currentConfig.max_tokens) || undefined,
+				retrievalReserveTokens: Number(currentConfig.totalRecallTokenBudget) || 2500,
 				triggerPercent: Number(currentConfig.compactionTriggerPercent) || 78,
 				targetPercent: Number(currentConfig.compactionTargetPercent) || 50,
 				protectedTurns: Number(currentConfig.compactionProtectedTurns) || 8
@@ -568,6 +650,9 @@ class CompactionStore {
 					throw new Error('There are not enough complete old turns to compact safely');
 				}
 				await this.selectBestCandidate();
+				for (let index = 0; index < this.candidates.length; index++) {
+					await this.measureCandidate(index);
+				}
 			}
 		} catch (error) {
 			this.error = error instanceof Error ? error.message : String(error);
@@ -613,14 +698,9 @@ class CompactionStore {
 		const candidate = this.candidates[index];
 		if (!candidate) return;
 		this.selectedCandidateIndex = index;
-		const source = this.messages.filter((message) =>
-			candidate.sourceMessageIds.includes(message.id)
-		);
-		this.sourceTokenCount = await ChatService.tokenizePrompt(
-			CompactionService.serializeMessages(source),
-			this.model
-		);
-		candidate.sourceTokenCount = this.sourceTokenCount;
+		await this.measureCandidate(index);
+		if (this.selectedCandidateIndex !== index) return;
+		this.sourceTokenCount = candidate.sourceTokenCount;
 		this.budget = CompactionService.getBudget(
 			this.contextSize,
 			this.sourceTokenCount,
@@ -731,6 +811,13 @@ class CompactionStore {
 		const conversation = conversationsStore.activeConversation;
 		if (!conversation?.currNode || !this.pendingCompactionId || !this.canApply) return;
 		this.applying = true;
+		const compactionId = this.pendingCompactionId;
+		memoryDebug('compaction.manual.apply.start', {
+			conversationId: conversation.id,
+			compactionId,
+			beforeTokenCount: this.beforeTokenCount,
+			projectedTokenCount: this.projectedTokenCount
+		});
 		try {
 			await DatabaseService.activateCompaction(
 				this.pendingCompactionId,
@@ -747,8 +834,18 @@ class CompactionStore {
 			this.pendingCompactionId = null;
 			await this.refreshActive();
 			this.open = false;
+			memoryDebug('compaction.manual.apply.complete', {
+				conversationId: conversation.id,
+				compactionId,
+				savedTokens: this.beforeTokenCount - this.projectedTokenCount
+			});
 			toast.success('Conversation compacted');
 		} catch (error) {
+			memoryDebug('compaction.manual.apply.error', {
+				conversationId: conversation.id,
+				compactionId,
+				error
+			});
 			this.error = error instanceof Error ? error.message : String(error);
 		} finally {
 			this.applying = false;
@@ -758,9 +855,15 @@ class CompactionStore {
 	async restore(): Promise<void> {
 		const conversation = conversationsStore.activeConversation;
 		if (!conversation?.currNode) return;
+		memoryDebug('compaction.restore.start', {
+			conversationId: conversation.id,
+			anchorMessageId: conversation.currNode,
+			compactionId: this.activeCompaction?.record.id
+		});
 		await DatabaseService.createCompactionRestoreEvent(conversation.id, conversation.currNode);
 		await this.refreshActive();
 		this.open = false;
+		memoryDebug('compaction.restore.complete', { conversationId: conversation.id });
 		toast.success('Original conversation context restored');
 	}
 

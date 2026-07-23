@@ -18,6 +18,7 @@ import type {
 	DatabaseRetrievalHitUsage
 } from '$lib/types';
 import { ChatContextService } from './chat-context.service';
+import { memoryDebug } from '$lib/utils/memory-debug';
 
 function createArchiveChunks(
 	record: DatabaseCompaction,
@@ -268,18 +269,9 @@ export class DatabaseService {
 							.where('conversationId')
 							.equals(forkId)
 							.delete();
-						await db[IDXDB_TABLES.archiveChunks]
-							.where('conversationId')
-							.equals(forkId)
-							.delete();
-						await db[IDXDB_TABLES.archiveTerms]
-							.where('conversationId')
-							.equals(forkId)
-							.delete();
-						await db[IDXDB_TABLES.retrievalTraces]
-							.where('conversationId')
-							.equals(forkId)
-							.delete();
+						await db[IDXDB_TABLES.archiveChunks].where('conversationId').equals(forkId).delete();
+						await db[IDXDB_TABLES.archiveTerms].where('conversationId').equals(forkId).delete();
+						await db[IDXDB_TABLES.retrievalTraces].where('conversationId').equals(forkId).delete();
 						await db[IDXDB_TABLES.retrievalHitUsage]
 							.where('conversationId')
 							.equals(forkId)
@@ -409,22 +401,10 @@ export class DatabaseService {
 					.where('conversationId')
 					.anyOf(cleanIds)
 					.delete();
-				await db[IDXDB_TABLES.archiveChunks]
-					.where('conversationId')
-					.anyOf(cleanIds)
-					.delete();
-				await db[IDXDB_TABLES.archiveTerms]
-					.where('conversationId')
-					.anyOf(cleanIds)
-					.delete();
-				await db[IDXDB_TABLES.retrievalTraces]
-					.where('conversationId')
-					.anyOf(cleanIds)
-					.delete();
-				await db[IDXDB_TABLES.retrievalHitUsage]
-					.where('conversationId')
-					.anyOf(cleanIds)
-					.delete();
+				await db[IDXDB_TABLES.archiveChunks].where('conversationId').anyOf(cleanIds).delete();
+				await db[IDXDB_TABLES.archiveTerms].where('conversationId').anyOf(cleanIds).delete();
+				await db[IDXDB_TABLES.retrievalTraces].where('conversationId').anyOf(cleanIds).delete();
+				await db[IDXDB_TABLES.retrievalHitUsage].where('conversationId').anyOf(cleanIds).delete();
 			}
 		);
 	}
@@ -442,7 +422,8 @@ export class DatabaseService {
 				db[IDXDB_TABLES.compactions],
 				db[IDXDB_TABLES.compactionProjectionEvents],
 				db[IDXDB_TABLES.archiveChunks],
-				db[IDXDB_TABLES.archiveTerms]
+				db[IDXDB_TABLES.archiveTerms],
+				db[IDXDB_TABLES.retrievalTraces]
 			],
 			async () => {
 				const message = await db[IDXDB_TABLES.messages].get(messageId);
@@ -468,6 +449,18 @@ export class DatabaseService {
 					.where('anchorMessageId')
 					.equals(messageId)
 					.delete();
+				const deletedTraceCount = await db[IDXDB_TABLES.retrievalTraces]
+					.where('conversationId')
+					.equals(message.convId)
+					.filter(
+						(trace) => trace.anchorMessageId === messageId || trace.responseMessageId === messageId
+					)
+					.delete();
+				memoryDebug('retrieval.trace.delete-message', {
+					conversationId: message.convId,
+					messageId,
+					deletedTraceCount
+				});
 				if (invalidIds.length > 0) {
 					const invalidChunks = await db[IDXDB_TABLES.archiveChunks]
 						.where('compactionId')
@@ -507,7 +500,8 @@ export class DatabaseService {
 				db[IDXDB_TABLES.compactions],
 				db[IDXDB_TABLES.compactionProjectionEvents],
 				db[IDXDB_TABLES.archiveChunks],
-				db[IDXDB_TABLES.archiveTerms]
+				db[IDXDB_TABLES.archiveTerms],
+				db[IDXDB_TABLES.retrievalTraces]
 			],
 			async () => {
 				// Get all messages in the conversation to find descendants
@@ -545,6 +539,21 @@ export class DatabaseService {
 					.where('anchorMessageId')
 					.anyOf(allToDelete)
 					.delete();
+				const deletedIds = new Set(allToDelete);
+				const deletedTraceCount = await db[IDXDB_TABLES.retrievalTraces]
+					.where('conversationId')
+					.equals(conversationId)
+					.filter(
+						(trace) =>
+							deletedIds.has(trace.anchorMessageId) ||
+							(!!trace.responseMessageId && deletedIds.has(trace.responseMessageId))
+					)
+					.delete();
+				memoryDebug('retrieval.trace.delete-branch', {
+					conversationId,
+					deletedMessageCount: allToDelete.length,
+					deletedTraceCount
+				});
 				if (invalidIds.length > 0) {
 					const invalidChunks = await db[IDXDB_TABLES.archiveChunks]
 						.where('compactionId')
@@ -794,22 +803,30 @@ export class DatabaseService {
 
 	static async addRetrievalTrace(trace: DatabaseRetrievalTrace): Promise<void> {
 		await db[IDXDB_TABLES.retrievalTraces].add(trace);
+		memoryDebug('retrieval.trace.persisted', {
+			traceId: trace.id,
+			conversationId: trace.conversationId,
+			anchorMessageId: trace.anchorMessageId,
+			responseMessageId: trace.responseMessageId,
+			hitCount: trace.hits.length,
+			injectedCount: trace.injectedHitIds.length,
+			injectedTokenCount: trace.injectedTokenCount
+		});
 	}
 
 	static async getRetrievalTraces(
 		conversationId: string,
-		limit = 20
+		limit?: number
 	): Promise<DatabaseRetrievalTrace[]> {
-		return (await db[IDXDB_TABLES.retrievalTraces]
+		const traces = await db[IDXDB_TABLES.retrievalTraces]
 			.where('conversationId')
 			.equals(conversationId)
-			.reverse()
-			.sortBy('createdAt')).slice(0, limit);
+			.toArray();
+		traces.sort((left, right) => right.createdAt - left.createdAt);
+		return limit === undefined ? traces : traces.slice(0, limit);
 	}
 
-	static async getRetrievalHitUsage(
-		conversationId: string
-	): Promise<DatabaseRetrievalHitUsage[]> {
+	static async getRetrievalHitUsage(conversationId: string): Promise<DatabaseRetrievalHitUsage[]> {
 		return await db[IDXDB_TABLES.retrievalHitUsage]
 			.where('conversationId')
 			.equals(conversationId)
@@ -1125,7 +1142,8 @@ export class DatabaseService {
 				db[IDXDB_TABLES.compactions],
 				db[IDXDB_TABLES.compactionProjectionEvents],
 				db[IDXDB_TABLES.archiveChunks],
-				db[IDXDB_TABLES.archiveTerms]
+				db[IDXDB_TABLES.archiveTerms],
+				db[IDXDB_TABLES.retrievalTraces]
 			],
 			async () => {
 				const sourceConv = await db[IDXDB_TABLES.conversations].get(sourceConvId);
@@ -1264,10 +1282,12 @@ export class DatabaseService {
 					.where('conversationId')
 					.equals(sourceConvId)
 					.toArray();
+				const archiveIdMap = new Map<string, string>();
 				for (const chunk of sourceArchive) {
 					const compactionId = compactionIdMap.get(chunk.compactionId);
 					if (!compactionId || !chunk.sourceMessageIds.every((id) => idMap.has(id))) continue;
 					const newId = uuid();
+					archiveIdMap.set(chunk.id, newId);
 					const cloned = {
 						...chunk,
 						id: newId,
@@ -1285,6 +1305,56 @@ export class DatabaseService {
 						}))
 					);
 				}
+
+				const remapHitId = (id: string): string => {
+					if (!id.startsWith('local:')) return id;
+					const mapped = archiveIdMap.get(id.slice('local:'.length));
+					return mapped ? `local:${mapped}` : id;
+				};
+				const sourceTraces = await db[IDXDB_TABLES.retrievalTraces]
+					.where('conversationId')
+					.equals(sourceConvId)
+					.toArray();
+				let clonedTraceCount = 0;
+				for (const trace of sourceTraces) {
+					const anchorMessageId = idMap.get(trace.anchorMessageId);
+					const responseMessageId = trace.responseMessageId
+						? idMap.get(trace.responseMessageId)
+						: undefined;
+					if (!anchorMessageId || (trace.responseMessageId && !responseMessageId)) continue;
+					await db[IDXDB_TABLES.retrievalTraces].add({
+						...trace,
+						id: uuid(),
+						conversationId: newConvId,
+						anchorMessageId,
+						responseMessageId,
+						hits: trace.hits.map((hit) => {
+							const provenance = hit.provenance ? { ...hit.provenance } : undefined;
+							if (provenance) {
+								if (typeof provenance.compactionId === 'string') {
+									provenance.compactionId =
+										compactionIdMap.get(provenance.compactionId) ?? provenance.compactionId;
+								}
+								if (typeof provenance.chunkId === 'string') {
+									provenance.chunkId = archiveIdMap.get(provenance.chunkId) ?? provenance.chunkId;
+								}
+								if (Array.isArray(provenance.sourceMessageIds)) {
+									provenance.sourceMessageIds = provenance.sourceMessageIds.map((id) =>
+										typeof id === 'string' ? (idMap.get(id) ?? id) : id
+									);
+								}
+							}
+							return { ...hit, id: remapHitId(hit.id), provenance };
+						}),
+						injectedHitIds: trace.injectedHitIds.map(remapHitId)
+					});
+					clonedTraceCount++;
+				}
+				memoryDebug('retrieval.trace.forked', {
+					sourceConversationId: sourceConvId,
+					conversationId: newConvId,
+					clonedTraceCount
+				});
 
 				return newConv;
 			}

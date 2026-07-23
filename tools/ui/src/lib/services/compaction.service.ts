@@ -10,6 +10,7 @@ import type {
 	DatabaseMessage,
 	ResolvedCompaction
 } from '$lib/types';
+import { memoryDebug } from '$lib/utils/memory-debug';
 import { ChatContextService } from './chat-context.service';
 import { ChatService } from './chat.service';
 import { DatabaseService } from './database.service';
@@ -88,7 +89,7 @@ export class CompactionService {
 			1,
 			contextSize - outputReserveTokens - retrievalReserveTokens - safetyMarginTokens
 		);
-		return {
+		const policy = {
 			mode,
 			contextSize,
 			outputReserveTokens,
@@ -102,18 +103,28 @@ export class CompactionService {
 			protectedTurns,
 			protectedTailTokens: Math.floor(usableInputTokens * 0.25)
 		};
+		memoryDebug('compaction.policy.created', policy);
+		return policy;
 	}
 
 	static evaluatePreflight(
 		promptTokens: number,
 		policy: CompactionPolicy
 	): CompactionPreflightMeasurement {
-		return {
+		const measurement = {
 			promptTokens,
 			utilizationPercent: (promptTokens / policy.usableInputTokens) * 100,
 			triggered: promptTokens >= policy.triggerTokens,
 			hardLimitExceeded: promptTokens > policy.usableInputTokens
 		};
+		memoryDebug('compaction.preflight.evaluated', {
+			...measurement,
+			mode: policy.mode,
+			triggerTokens: policy.triggerTokens,
+			targetTokens: policy.targetTokens,
+			usableInputTokens: policy.usableInputTokens
+		});
+		return measurement;
 	}
 
 	static selectAutomaticCandidate(
@@ -310,6 +321,15 @@ export class CompactionService {
 	static async generateSummary(
 		input: CompactionGenerationInput
 	): Promise<CompactionGenerationResult> {
+		const startedAt = performance.now();
+		memoryDebug('compaction.generation.start', {
+			sourceMessageCount: input.sourceMessageIds.length,
+			deltaMessageCount: input.deltaSourceMessageIds.length,
+			hasPreviousCompaction: Boolean(input.previousCompaction),
+			model: input.model,
+			maxTokens: input.maxTokens,
+			strict: Boolean(input.strict)
+		});
 		const response = await ChatService.sendMessage(
 			CompactionService.buildSummaryMessages(input),
 			{
@@ -324,7 +344,14 @@ export class CompactionService {
 		);
 		if (input.signal?.aborted) throw new DOMException('Compaction cancelled', 'AbortError');
 		const summary = typeof response === 'string' ? response.trim() : '';
-		return { summary, validationErrors: CompactionService.validateSummary(summary) };
+		const validationErrors = CompactionService.validateSummary(summary);
+		memoryDebug('compaction.generation.complete', {
+			durationMs: Math.round(performance.now() - startedAt),
+			summaryCharacterCount: summary.length,
+			validationErrorCount: validationErrors.length,
+			validationErrors
+		});
+		return { summary, validationErrors };
 	}
 
 	static replacementMessages(record: DatabaseCompaction): ApiChatMessageData[] {
@@ -359,18 +386,58 @@ export class CompactionService {
 				return depth || right.createdAt - left.createdAt;
 			});
 		const selected = applicable[0];
-		if (!selected || selected.action === 'restore' || !selected.compactionId) return null;
+		if (!selected || selected.action === 'restore' || !selected.compactionId) {
+			memoryDebug('compaction.resolve.none', {
+				conversationId,
+				reason: !selected ? 'no-applicable-event' : selected.action
+			});
+			return null;
+		}
 		const record = records.find((candidate) => candidate.id === selected.compactionId);
-		if (!record || record.status !== 'ready') return null;
+		if (!record || record.status !== 'ready') {
+			memoryDebug('compaction.resolve.none', {
+				conversationId,
+				compactionId: selected.compactionId,
+				reason: !record ? 'record-missing' : `status-${record.status}`
+			});
+			return null;
+		}
 
 		const indexes = record.sourceMessageIds.map((id) => pathIndex.get(id));
-		if (indexes.some((index) => index === undefined)) return null;
-		const start = indexes[0] as number;
-		if (indexes.some((index, offset) => index !== start + offset)) return null;
-		const source = activePath.slice(start, start + indexes.length);
-		if ((await ChatContextService.fingerprintMessages(source)) !== record.sourceFingerprint)
+		if (indexes.some((index) => index === undefined)) {
+			memoryDebug('compaction.resolve.none', {
+				conversationId,
+				compactionId: record.id,
+				reason: 'source-not-on-active-path'
+			});
 			return null;
+		}
+		const start = indexes[0] as number;
+		if (indexes.some((index, offset) => index !== start + offset)) {
+			memoryDebug('compaction.resolve.none', {
+				conversationId,
+				compactionId: record.id,
+				reason: 'source-not-contiguous'
+			});
+			return null;
+		}
+		const source = activePath.slice(start, start + indexes.length);
+		if ((await ChatContextService.fingerprintMessages(source)) !== record.sourceFingerprint) {
+			memoryDebug('compaction.resolve.none', {
+				conversationId,
+				compactionId: record.id,
+				reason: 'source-fingerprint-mismatch'
+			});
+			return null;
+		}
 
+		memoryDebug('compaction.resolve.active', {
+			conversationId,
+			compactionId: record.id,
+			generation: record.generation,
+			sourceMessageCount: record.sourceMessageIds.length,
+			anchorMessageId: selected.anchorMessageId
+		});
 		return {
 			record,
 			event: selected,

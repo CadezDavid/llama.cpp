@@ -22,7 +22,7 @@
 		return new SpominService({
 			baseUrl: String(current.spominBaseUrl || 'http://127.0.0.1:8084'),
 			apiToken: String(current.spominApiToken || ''),
-			timeoutMs: Number(current.spominTimeoutMs) || 750
+			timeoutMs: Number(current.spominTimeoutMs) || 2000
 		});
 	}
 

@@ -1,5 +1,6 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onDestroy, onMount } from 'svelte';
+	import { SvelteMap } from 'svelte/reactivity';
 	import { beforeNavigate, afterNavigate } from '$app/navigation';
 	import { ChatMessage, ChatMessageUserPending } from '$lib/components/app';
 	import { setChatActionsContext } from '$lib/contexts';
@@ -12,6 +13,7 @@
 		chatInjectPendingMessage
 	} from '$lib/stores/chat.svelte';
 	import { conversationsStore, activeConversation } from '$lib/stores/conversations.svelte';
+	import { DatabaseService } from '$lib/services/database.service';
 	import { config } from '$lib/stores/settings.svelte';
 	import {
 		agenticPendingSteeringMessageContent,
@@ -25,6 +27,7 @@
 		formatMessageForClipboard,
 		hasAgenticContent
 	} from '$lib/utils';
+	import type { DatabaseRetrievalTrace } from '$lib/types';
 
 	interface Props {
 		messages?: DatabaseMessage[];
@@ -35,9 +38,11 @@
 	let { messages = [], onUserAction, onMessagesReady }: Props = $props();
 
 	let allConversationMessages = $state<DatabaseMessage[]>([]);
+	let retrievalTraces = $state<DatabaseRetrievalTrace[]>([]);
 	let isVisible = $state(false);
 	let previousConversationId = $state<string | null>(null);
 	let previousRouteId = $state<string | null>(null);
+	let traceRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 
 	const currentConfig = config();
 
@@ -115,13 +120,39 @@
 		const conversation = activeConversation();
 
 		if (conversation) {
-			conversationsStore.getConversationMessages(conversation.id).then((messages) => {
-				allConversationMessages = messages;
+			const conversationId = conversation.id;
+			Promise.all([
+				conversationsStore.getConversationMessages(conversationId),
+				DatabaseService.getRetrievalTraces(conversationId)
+			]).then(([loadedMessages, loadedTraces]) => {
+				if (activeConversation()?.id !== conversationId) return;
+				allConversationMessages = loadedMessages;
+				retrievalTraces = loadedTraces;
 			});
 		} else {
 			allConversationMessages = [];
+			retrievalTraces = [];
 		}
 	}
+
+	$effect(() => {
+		const signature = messages
+			.map((message) => `${message.id}:${message.content.length}:${message.toolCalls?.length ?? 0}`)
+			.join('|');
+		void signature;
+		if (traceRefreshTimer) clearTimeout(traceRefreshTimer);
+		traceRefreshTimer = setTimeout(() => {
+			const conversationId = activeConversation()?.id;
+			if (!conversationId) return;
+			DatabaseService.getRetrievalTraces(conversationId).then((loaded) => {
+				if (activeConversation()?.id === conversationId) retrievalTraces = loaded;
+			});
+		}, 250);
+	});
+
+	onDestroy(() => {
+		if (traceRefreshTimer) clearTimeout(traceRefreshTimer);
+	});
 
 	// Track conversation changes to trigger transition even on same route
 	$effect(() => {
@@ -188,8 +219,32 @@
 			isLastAssistantMessage: boolean;
 			isLastUserMessage: boolean;
 			nextAssistantMessage: DatabaseMessage | null;
+			retrievalTraces: DatabaseRetrievalTrace[];
 			siblingInfo: ChatMessageSiblingInfo;
 		}> = [];
+		const visibleIds = new Set(filteredMessages.map((message) => message.id));
+		const tracesByUserId = new SvelteMap<string, DatabaseRetrievalTrace[]>();
+		for (const trace of retrievalTraces) {
+			const relatedId =
+				trace.responseMessageId && visibleIds.has(trace.responseMessageId)
+					? trace.responseMessageId
+					: visibleIds.has(trace.anchorMessageId)
+						? trace.anchorMessageId
+						: null;
+			if (!relatedId) continue;
+			const relatedIndex = filteredMessages.findIndex((message) => message.id === relatedId);
+			let userId: string | null = null;
+			for (let index = relatedIndex; index >= 0; index--) {
+				if (filteredMessages[index].role === MessageRole.USER) {
+					userId = filteredMessages[index].id;
+					break;
+				}
+			}
+			if (!userId) continue;
+			const bucket = tracesByUserId.get(userId);
+			if (bucket) bucket.push(trace);
+			else tracesByUserId.set(userId, [trace]);
+		}
 
 		for (let i = 0; i < filteredMessages.length; i++) {
 			const msg = filteredMessages[i];
@@ -240,6 +295,7 @@
 				isLastAssistantMessage: false,
 				isLastUserMessage: false,
 				nextAssistantMessage: null,
+				retrievalTraces: tracesByUserId.get(msg.id) ?? [],
 				siblingInfo
 			});
 		}
@@ -277,7 +333,7 @@
 		{isVisible ? 'opacity-100' : 'opacity-0'}
 		{previousRouteId === '/(chat)/chat/[id]' ? '' : 'delay-300'}"
 >
-	{#each displayMessages as { message, toolMessages, isLastAssistantMessage, isLastUserMessage, nextAssistantMessage, siblingInfo } (message.id)}
+	{#each displayMessages as { message, toolMessages, isLastAssistantMessage, isLastUserMessage, nextAssistantMessage, retrievalTraces, siblingInfo } (message.id)}
 		<ChatMessage
 			class="mx-auto mt-12 w-full max-w-3xl"
 			{message}
@@ -285,6 +341,7 @@
 			{isLastAssistantMessage}
 			{isLastUserMessage}
 			{nextAssistantMessage}
+			{retrievalTraces}
 			{siblingInfo}
 		/>
 	{/each}

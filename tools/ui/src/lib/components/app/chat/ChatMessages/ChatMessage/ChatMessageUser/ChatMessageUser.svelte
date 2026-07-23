@@ -2,6 +2,7 @@
 	import {
 		ChatMessageActionIcons,
 		ChatMessageEditForm,
+		ChatMessageMemoryContext,
 		ChatMessageStatistics,
 		ChatMessageUserBubble
 	} from '$lib/components/app/chat';
@@ -10,6 +11,7 @@
 	import { isLoading } from '$lib/stores/chat.svelte';
 	import { MessageRole, ChatMessageStatisticsMode } from '$lib/enums';
 	import { config } from '$lib/stores/settings.svelte';
+	import type { DatabaseRetrievalTrace } from '$lib/types';
 
 	interface Props {
 		class?: string;
@@ -23,6 +25,7 @@
 		} | null;
 		isLastUserMessage?: boolean;
 		nextAssistantMessage?: DatabaseMessage | null;
+		retrievalTraces?: DatabaseRetrievalTrace[];
 		showDeleteDialog: boolean;
 		onEdit: () => void;
 		onDelete: () => void;
@@ -40,6 +43,7 @@
 		deletionInfo,
 		isLastUserMessage = false,
 		nextAssistantMessage = null,
+		retrievalTraces = [],
 		showDeleteDialog,
 		onEdit,
 		onDelete,
@@ -98,6 +102,8 @@
 			attachments={message.extra}
 			renderMarkdown={true}
 		/>
+
+		<ChatMessageMemoryContext traces={retrievalTraces} />
 
 		{#if showStoredReadingStats}
 			<!-- Reading stats sourced from the assistant message that followed this turn -->
