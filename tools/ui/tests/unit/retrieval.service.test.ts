@@ -7,6 +7,7 @@ import type { DatabaseMessage } from '$lib/types';
 const settings = {
 	spominEnabled: false,
 	spominBaseUrl: 'http://127.0.0.1:8084',
+	spominCandidateLimit: 20,
 	spominResultLimit: 3,
 	spominTokenBudget: 1000,
 	spominTimeoutMs: 2000,
@@ -18,6 +19,12 @@ const settings = {
 	totalTokenBudget: 2500,
 	semanticThreshold: 0.62,
 	lexicalThreshold: 0.34
+};
+
+const activeCompaction = {
+	id: 'compact-1',
+	generation: 1,
+	sourceMessageIds: ['old-1']
 };
 
 function message(id: string, role: MessageRole, content: string): DatabaseMessage {
@@ -35,6 +42,166 @@ function message(id: string, role: MessageRole, content: string): DatabaseMessag
 
 describe('RetrievalService', () => {
 	afterEach(() => vi.restoreAllMocks());
+
+	it('does not inspect retained archives or call embeddings without an active compaction', async () => {
+		const archiveLookup = vi
+			.spyOn(DatabaseService, 'getConversationArchiveChunks')
+			.mockResolvedValue([]);
+		vi.spyOn(DatabaseService, 'getRetrievalHitUsage').mockResolvedValue([]);
+		const fetchRequest = vi.spyOn(globalThis, 'fetch');
+
+		const result = await RetrievalService.prepare({
+			conversationId: 'chat-1',
+			anchorMessageId: 'user-1',
+			messages: [message('user-1', MessageRole.USER, 'What did we decide earlier?')],
+			settings
+		});
+
+		expect(archiveLookup).not.toHaveBeenCalled();
+		expect(fetchRequest).not.toHaveBeenCalled();
+		expect(result.trace.providers.local).toEqual({
+			status: 'not-applicable',
+			detail: 'conversation is not compacted'
+		});
+	});
+
+	it('reports an active compaction with no archived fragments without calling embeddings', async () => {
+		vi.spyOn(DatabaseService, 'getConversationArchiveChunks').mockResolvedValue([]);
+		vi.spyOn(DatabaseService, 'getRetrievalHitUsage').mockResolvedValue([]);
+		const fetchRequest = vi.spyOn(globalThis, 'fetch');
+
+		const result = await RetrievalService.prepare({
+			conversationId: 'chat-1',
+			anchorMessageId: 'user-1',
+			messages: [message('user-1', MessageRole.USER, 'What did we decide earlier?')],
+			activeCompaction,
+			settings
+		});
+
+		expect(fetchRequest).not.toHaveBeenCalled();
+		expect(result.trace.providers.local).toEqual({
+			status: 'ok',
+			detail: 'no archived fragments'
+		});
+	});
+
+	it('identifies an embedding timeout while keeping lexical recall available', async () => {
+		vi.spyOn(DatabaseService, 'getConversationArchiveChunks').mockResolvedValue([
+			{
+				id: 'chunk-1',
+				conversationId: 'chat-1',
+				compactionId: 'compact-1',
+				generation: 1,
+				sourceMessageIds: ['old-1'],
+				text: 'user: The database choice was SQLite.',
+				terms: ['the', 'database', 'choice', 'was', 'sqlite'],
+				createdAt: 1,
+				embeddingStatus: 'ready'
+			}
+		]);
+		vi.spyOn(DatabaseService, 'getRetrievalHitUsage').mockResolvedValue([]);
+		vi.spyOn(globalThis, 'fetch').mockRejectedValue(
+			new DOMException('The operation was aborted.', 'AbortError')
+		);
+
+		const result = await RetrievalService.prepare({
+			conversationId: 'chat-1',
+			anchorMessageId: 'user-1',
+			messages: [message('user-1', MessageRole.USER, 'Which database did we choose?')],
+			activeCompaction,
+			settings
+		});
+
+		expect(result.blocks).toHaveLength(1);
+		expect(result.trace.providers.local).toEqual({
+			status: 'ok',
+			detail: 'lexical-only - embedding timed out'
+		});
+	});
+
+	it('searches the complete active compacted range across generations and ignores stale archives', async () => {
+		vi.spyOn(DatabaseService, 'getConversationArchiveChunks').mockResolvedValue([
+			{
+				id: 'old-duplicate',
+				conversationId: 'chat-1',
+				compactionId: 'compact-1',
+				generation: 1,
+				sourceMessageIds: ['old-1'],
+				text: 'user: The database choice was SQLite.',
+				terms: ['the', 'database', 'choice', 'was', 'sqlite'],
+				createdAt: 1,
+				embedding: [1, 0],
+				embeddingStatus: 'ready'
+			},
+			{
+				id: 'old-current',
+				conversationId: 'chat-1',
+				compactionId: 'compact-2',
+				generation: 2,
+				sourceMessageIds: ['old-1'],
+				text: 'user: The database choice was SQLite.',
+				terms: ['the', 'database', 'choice', 'was', 'sqlite'],
+				createdAt: 2,
+				embedding: [1, 0],
+				embeddingStatus: 'ready'
+			},
+			{
+				id: 'new-delta',
+				conversationId: 'chat-1',
+				compactionId: 'compact-2',
+				generation: 2,
+				sourceMessageIds: ['old-2'],
+				text: 'assistant: SQLite keeps local persistence simple.',
+				terms: ['sqlite', 'keeps', 'local', 'persistence', 'simple'],
+				createdAt: 2,
+				embedding: [1, 0],
+				embeddingStatus: 'ready'
+			},
+			{
+				id: 'restored-stale',
+				conversationId: 'chat-1',
+				compactionId: 'compact-old',
+				generation: 1,
+				sourceMessageIds: ['restored-1'],
+				text: 'user: This restored section must never be recalled.',
+				terms: ['this', 'restored', 'section', 'must', 'never', 'be', 'recalled'],
+				createdAt: 3,
+				embedding: [1, 0],
+				embeddingStatus: 'ready'
+			}
+		]);
+		vi.spyOn(DatabaseService, 'getRetrievalHitUsage').mockResolvedValue([]);
+		vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+			new Response(
+				JSON.stringify({
+					data: [{ index: 0, embedding: [1, 0] }]
+				}),
+				{ status: 200, headers: { 'content-type': 'application/json' } }
+			)
+		);
+
+		const result = await RetrievalService.prepare({
+			conversationId: 'chat-1',
+			anchorMessageId: 'user-1',
+			messages: [message('user-1', MessageRole.USER, 'Which SQLite choice did we make?')],
+			activeCompaction: {
+				id: 'compact-2',
+				generation: 2,
+				sourceMessageIds: ['old-1', 'old-2']
+			},
+			settings
+		});
+
+		expect(result.trace.hits.map((hit) => hit.id)).toEqual(
+			expect.arrayContaining(['local:old-current', 'local:new-delta'])
+		);
+		expect(result.trace.hits.map((hit) => hit.id)).not.toContain('local:old-duplicate');
+		expect(result.trace.hits.map((hit) => hit.id)).not.toContain('local:restored-stale');
+		expect(result.trace.providers.local).toEqual({
+			status: 'ok',
+			detail: 'lexical+semantic'
+		});
+	});
 
 	it('uses recent conversation context and returns matching archive blocks', async () => {
 		vi.spyOn(DatabaseService, 'getConversationArchiveChunks').mockResolvedValue([
@@ -61,7 +228,7 @@ describe('RetrievalService', () => {
 				message('assistant-1', MessageRole.ASSISTANT, 'Yes, there was a database decision.'),
 				message('user-2', MessageRole.USER, 'Which database did we choose?')
 			],
-			compactionGeneration: 1,
+			activeCompaction,
 			settings
 		});
 
@@ -181,7 +348,7 @@ describe('RetrievalService', () => {
 				message('user-1', MessageRole.USER, 'Which database choice applies locally?'),
 				message('user-2', MessageRole.USER, 'Which database choice applies locally?')
 			],
-			compactionGeneration: 1,
+			activeCompaction,
 			settings
 		});
 
@@ -213,7 +380,7 @@ describe('RetrievalService', () => {
 			conversationId: 'chat-1',
 			anchorMessageId: 'user-1',
 			messages: [message('user-1', MessageRole.USER, 'Which database choice applies locally?')],
-			compactionGeneration: 1,
+			activeCompaction,
 			settings: { ...settings, localTokenBudget: 1 }
 		});
 
@@ -232,29 +399,44 @@ describe('RetrievalService', () => {
 			new Response(
 				JSON.stringify({
 					query: 'database',
-					semantic_available: true,
-					results: [
-						{
-							id: 'below-thresholds',
-							text: 'Do not include this result.',
-							source: 'test',
-							tier: 'archive',
-							created_at: new Date().toISOString(),
-							score: 0.9,
-							semantic_score: 0.5,
-							lexical_coverage: 0.1
-						},
-						{
-							id: 'lexical-match',
-							text: 'SQLite was selected for the local database.',
-							source: 'test',
-							tier: 'archive',
-							created_at: new Date().toISOString(),
-							score: 0.4,
-							semantic_score: null,
-							lexical_coverage: 0.4
-						}
-					]
+					profile: { id: 'profile-1', model_id: 'embedding-test' },
+					semantic: {
+						status: 'complete',
+						results: [
+							{
+								id: 'below-thresholds',
+								text: 'Do not include this result.',
+								source: 'test',
+								tier: 'archive',
+								created_at: new Date().toISOString(),
+								semantic_score: 0.5,
+								memory_ids: ['below-thresholds']
+							}
+						]
+					},
+					keyword: {
+						status: 'complete',
+						results: [
+							{
+								id: 'below-thresholds',
+								text: 'Do not include this result.',
+								source: 'test',
+								tier: 'archive',
+								created_at: new Date().toISOString(),
+								lexical_coverage: 0.1,
+								memory_ids: ['below-thresholds']
+							},
+							{
+								id: 'lexical-match',
+								text: 'SQLite was selected for the local database.',
+								source: 'test',
+								tier: 'archive',
+								created_at: new Date().toISOString(),
+								lexical_coverage: 0.4,
+								memory_ids: ['lexical-match']
+							}
+						]
+					}
 				}),
 				{ status: 200, headers: { 'content-type': 'application/json' } }
 			)
@@ -264,21 +446,21 @@ describe('RetrievalService', () => {
 			conversationId: 'chat-1',
 			anchorMessageId: 'user-1',
 			messages: [message('user-1', MessageRole.USER, 'Which database did we choose?')],
-			compactionGeneration: 0,
 			settings: { ...settings, spominEnabled: true }
 		});
 
 		expect(result.blocks).toHaveLength(1);
 		expect(result.blocks[0].id).toBe('spomin:lexical-match');
-		expect(result.trace.providers.spomin.detail).toBe('hybrid');
+		expect(result.trace.providers.spomin.detail).toBe(
+			'raw-semantic+keyword; semantic=1; keyword=2; merged=2; profile=profile-1'
+		);
 		expect(result.trace.hits).toContainEqual(
 			expect.objectContaining({
 				id: 'spomin:below-thresholds',
 				selected: false,
 				reason: 'below-threshold',
 				semanticScore: 0.5,
-				lexicalScore: 0.1,
-				providerScore: 0.9
+				lexicalScore: 0.1
 			})
 		);
 	});
@@ -290,8 +472,9 @@ describe('RetrievalService', () => {
 			new Response(
 				JSON.stringify({
 					query: 'salary debts June',
-					semantic_available: true,
-					results: []
+					profile: null,
+					semantic: { status: 'complete', results: [] },
+					keyword: { status: 'complete', results: [] }
 				}),
 				{ status: 200, headers: { 'content-type': 'application/json' } }
 			)
@@ -307,12 +490,14 @@ describe('RetrievalService', () => {
 					'Please recall my salary debts and financial plan for June.'
 				)
 			],
-			compactionGeneration: 0,
 			settings: { ...settings, spominEnabled: true }
 		});
 
 		expect(result.blocks).toEqual([]);
-		expect(result.trace.providers.spomin).toEqual({ status: 'ok', detail: 'no-results' });
+		expect(result.trace.providers.spomin).toEqual({
+			status: 'ok',
+			detail: 'no-results; semantic=0; keyword=0; merged=0'
+		});
 	});
 
 	it('distinguishes Spomin results that all fail the configured thresholds', async () => {
@@ -322,19 +507,22 @@ describe('RetrievalService', () => {
 			new Response(
 				JSON.stringify({
 					query: 'salary debts June',
-					semantic_available: true,
-					results: [
-						{
-							id: 'weak',
-							text: 'An unrelated memory.',
-							source: 'test',
-							tier: 'archive',
-							created_at: new Date().toISOString(),
-							score: 0.2,
-							semantic_score: 0.2,
-							lexical_coverage: 0
-						}
-					]
+					profile: null,
+					semantic: {
+						status: 'complete',
+						results: [
+							{
+								id: 'weak',
+								text: 'An unrelated memory.',
+								source: 'test',
+								tier: 'archive',
+								created_at: new Date().toISOString(),
+								semantic_score: 0.2,
+								memory_ids: ['weak']
+							}
+						]
+					},
+					keyword: { status: 'complete', results: [] }
 				}),
 				{ status: 200, headers: { 'content-type': 'application/json' } }
 			)
@@ -350,14 +538,13 @@ describe('RetrievalService', () => {
 					'Please recall my salary debts and financial plan for June.'
 				)
 			],
-			compactionGeneration: 0,
 			settings: { ...settings, spominEnabled: true }
 		});
 
 		expect(result.blocks).toEqual([]);
 		expect(result.trace.providers.spomin).toEqual({
 			status: 'ok',
-			detail: 'all-below-threshold'
+			detail: 'all-below-threshold; semantic=1; keyword=0; merged=1'
 		});
 		expect(result.trace.hits[0]).toMatchObject({
 			id: 'spomin:weak',
@@ -377,7 +564,6 @@ describe('RetrievalService', () => {
 			conversationId: 'chat-1',
 			anchorMessageId: 'user-1',
 			messages: [message('user-1', MessageRole.USER, 'Recall the exact database choice.')],
-			compactionGeneration: 0,
 			settings: { ...settings, spominEnabled: true }
 		});
 
@@ -392,7 +578,12 @@ describe('RetrievalService', () => {
 					id: 'spomin:memory-1',
 					source: 'long-term-memory' as const,
 					content: 'Injected durable memory',
-					provenance: { memoryIds: ['memory-1'], project: 'llama', score: 0.9 }
+					provenance: {
+						chunkId: 'chunk-1',
+						memoryIds: ['memory-1'],
+						project: 'llama',
+						score: 0.9
+					}
 				},
 				{
 					id: 'local:chunk-2',
@@ -431,10 +622,17 @@ describe('RetrievalService', () => {
 				injectedHitIds: [],
 				injectedTokenCount: 0
 			},
-			usage: []
+			usage: [],
+			spominFeedback: {
+				baseUrl: 'http://127.0.0.1:8084',
+				timeoutMs: 2000
+			}
 		};
 		const addTrace = vi.spyOn(DatabaseService, 'addRetrievalTrace').mockResolvedValue();
 		vi.spyOn(DatabaseService, 'putRetrievalHitUsage').mockResolvedValue();
+		const fetchRequest = vi
+			.spyOn(globalThis, 'fetch')
+			.mockResolvedValue(new Response(JSON.stringify({ recorded: true }), { status: 200 }));
 
 		await RetrievalService.finalize(preparation, ['spomin:memory-1'], 1200);
 
@@ -446,5 +644,18 @@ describe('RetrievalService', () => {
 		});
 		expect(saved.hits[1].contentSnapshot).toBeUndefined();
 		expect(saved.hits[1].reason).toBe('exact-prompt-budget');
+		expect(fetchRequest).toHaveBeenCalledWith(
+			'http://127.0.0.1:8084/v2/memories/access',
+			expect.objectContaining({
+				method: 'POST',
+				body: JSON.stringify({
+					event_id: 'trace-snapshot:injected',
+					client: 'llama.cpp-webui',
+					event_type: 'injected',
+					context_id: 'chat-1',
+					chunk_ids: ['chunk-1']
+				})
+			})
+		);
 	});
 });

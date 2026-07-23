@@ -1,8 +1,9 @@
 export interface MemoryProviderCapabilities {
 	api_version: string;
-	retrieval: string[];
+	query_channels: string[];
 	filters: string[];
 	memory_mutations: string[];
+	embedding_profiles: boolean;
 	automatic_writes: boolean;
 }
 
@@ -16,7 +17,6 @@ export interface MemoryRecord {
 }
 
 export interface MemoryRetrievalHit extends MemoryRecord {
-	score: number;
 	semantic_score?: number | null;
 	keyword_score?: number | null;
 	lexical_coverage?: number;
@@ -24,11 +24,38 @@ export interface MemoryRetrievalHit extends MemoryRecord {
 	memory_ids?: string[];
 }
 
+export interface MemoryEmbeddingProfile {
+	id: string;
+	model_id: string;
+	configured_model: string;
+	revision: string;
+	dimensions: number;
+	metadata?: Record<string, unknown>;
+}
+
+export interface MemoryQueryChannel {
+	status: 'complete' | 'unavailable' | 'not_requested';
+	error?: string;
+	results: MemoryRetrievalHit[];
+}
+
 export interface MemoryRetrievalResponse {
 	query: string;
-	semantic_available: boolean;
-	degraded_reason?: string | null;
-	results: MemoryRetrievalHit[];
+	profile?: MemoryEmbeddingProfile | null;
+	semantic: MemoryQueryChannel;
+	keyword: MemoryQueryChannel;
+}
+
+export interface MemoryEmbeddingStatus {
+	status: 'ready' | 'reindexing' | 'unavailable';
+	error?: string;
+	profile?: MemoryEmbeddingProfile | null;
+	total: number;
+	ready: number;
+	pending: number;
+	processing: number;
+	failed: number;
+	stale: number;
 }
 
 export interface SpominClientOptions {
@@ -88,7 +115,10 @@ export interface DatabaseRetrievalTrace {
 	queryFingerprint: string;
 	queryTerms: string[];
 	compactionGeneration: number;
-	providers: Record<string, { status: 'ok' | 'timeout' | 'error' | 'disabled'; detail?: string }>;
+	providers: Record<
+		string,
+		{ status: 'ok' | 'timeout' | 'error' | 'disabled' | 'not-applicable'; detail?: string }
+	>;
 	hits: RetrievalTraceHit[];
 	injectedHitIds: string[];
 	injectedTokenCount: number;

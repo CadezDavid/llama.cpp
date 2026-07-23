@@ -1,5 +1,6 @@
 import type {
 	MemoryProviderCapabilities,
+	MemoryEmbeddingStatus,
 	MemoryRecord,
 	MemoryRetrievalResponse,
 	SpominClientOptions
@@ -79,30 +80,63 @@ export class SpominService {
 	}
 
 	async capabilities(): Promise<MemoryProviderCapabilities> {
-		return await this.request('/v1/memory/capabilities');
+		return await this.request('/v2/capabilities');
 	}
 
 	async retrieve(input: {
 		query: string;
-		limit?: number;
+		candidateLimit?: number;
 		project?: string;
 		excludeConversationId?: string;
 	}): Promise<MemoryRetrievalResponse> {
-		const response = await this.request<MemoryRetrievalResponse>('/v1/memory/retrieve', {
+		const response = await this.request<MemoryRetrievalResponse>('/v2/memories/query', {
 			method: 'POST',
 			body: JSON.stringify({
 				query: input.query,
-				limit: input.limit,
+				channels: ['semantic', 'keyword'],
+				semantic_limit: input.candidateLimit,
+				keyword_limit: input.candidateLimit,
 				project: input.project || undefined,
 				exclude_conversation_id: input.excludeConversationId
 			})
 		});
 		memoryDebug('spomin.retrieve.complete', {
-			resultCount: response.results.length,
-			semanticAvailable: response.semantic_available,
-			degradedReason: response.degraded_reason
+			semanticResultCount: response.semantic.results.length,
+			keywordResultCount: response.keyword.results.length,
+			semanticStatus: response.semantic.status,
+			profileId: response.profile?.id
 		});
 		return response;
+	}
+
+	async recordAccess(input: {
+		eventId: string;
+		chunkIds: string[];
+		contextId?: string;
+	}): Promise<boolean> {
+		if (!input.chunkIds.length) return false;
+		const response = await this.request<{ recorded: boolean }>('/v2/memories/access', {
+			method: 'POST',
+			body: JSON.stringify({
+				event_id: input.eventId,
+				client: 'llama.cpp-webui',
+				event_type: 'injected',
+				context_id: input.contextId,
+				chunk_ids: input.chunkIds
+			})
+		});
+		return response.recorded;
+	}
+
+	async embeddingStatus(): Promise<MemoryEmbeddingStatus> {
+		return await this.request('/v2/embeddings/status');
+	}
+
+	async reindex(force = false): Promise<MemoryEmbeddingStatus> {
+		return await this.request('/v2/embeddings/reindex', {
+			method: 'POST',
+			body: JSON.stringify({ force })
+		});
 	}
 
 	async list(input: { limit?: number; project?: string } = {}): Promise<MemoryRecord[]> {
@@ -110,7 +144,7 @@ export class SpominService {
 		if (input.limit) params.set('limit', String(input.limit));
 		if (input.project) params.set('project', input.project);
 		const suffix = params.size ? `?${params}` : '';
-		const response = await this.request<{ results: MemoryRecord[] }>(`/v1/memories${suffix}`);
+		const response = await this.request<{ results: MemoryRecord[] }>(`/v2/memories${suffix}`);
 		return response.results;
 	}
 
@@ -119,7 +153,7 @@ export class SpominService {
 		project?: string;
 		tier?: 'archive' | 'core';
 	}): Promise<MemoryRecord> {
-		return await this.request('/v1/memories', {
+		return await this.request('/v2/memories', {
 			method: 'POST',
 			body: JSON.stringify({ ...input, source: 'llama.cpp-webui' })
 		});
@@ -129,13 +163,13 @@ export class SpominService {
 		id: string,
 		changes: { text?: string; project?: string | null; tier?: 'archive' | 'core' }
 	): Promise<MemoryRecord> {
-		return await this.request(`/v1/memories/${encodeURIComponent(id)}`, {
+		return await this.request(`/v2/memories/${encodeURIComponent(id)}`, {
 			method: 'PATCH',
 			body: JSON.stringify(changes)
 		});
 	}
 
 	async delete(id: string): Promise<void> {
-		await this.request(`/v1/memories/${encodeURIComponent(id)}`, { method: 'DELETE' });
+		await this.request(`/v2/memories/${encodeURIComponent(id)}`, { method: 'DELETE' });
 	}
 }

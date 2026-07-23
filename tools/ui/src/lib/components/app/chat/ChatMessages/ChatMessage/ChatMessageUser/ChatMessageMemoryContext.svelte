@@ -37,8 +37,8 @@
 		}
 		const problem = providerProblem(trace);
 		if (problem) return `Memory context: unavailable - ${problem}`;
-		const enabled = Object.values(trace.providers).some(
-			(provider) => provider.status !== 'disabled'
+		const enabled = Object.values(trace.providers).some((provider) =>
+			['ok', 'timeout', 'error'].includes(provider.status)
 		);
 		return enabled ? 'Memory context: none - no relevant matches' : 'Memory context: disabled';
 	}
@@ -47,6 +47,10 @@
 		if (value === 'spomin') return 'Spomin';
 		if (value === 'local') return 'Conversation recall';
 		return value;
+	}
+
+	function providerStatus(value: string): string {
+		return value === 'not-applicable' ? 'not applicable' : value;
 	}
 
 	function sourceLabel(hit: RetrievalTraceHit): string {
@@ -134,7 +138,7 @@
 						<div class="font-medium text-foreground/80">Providers</div>
 						{#each Object.entries(trace.providers) as [name, provider] (name)}
 							<div>
-								{providerLabel(name)}: {provider.status}{provider.detail
+								{providerLabel(name)}: {providerStatus(provider.status)}{provider.detail
 									? ` (${provider.detail})`
 									: ''}
 							</div>
