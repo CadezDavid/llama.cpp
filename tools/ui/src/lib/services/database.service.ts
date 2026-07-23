@@ -497,6 +497,8 @@ export class DatabaseService {
 	): Promise<DatabaseCompaction> {
 		const pending: DatabaseCompaction = {
 			...record,
+			sourceMessageIds: [...record.sourceMessageIds],
+			deltaSourceMessageIds: [...record.deltaSourceMessageIds],
 			id: uuid(),
 			status: 'pending',
 			createdAt: Date.now()
