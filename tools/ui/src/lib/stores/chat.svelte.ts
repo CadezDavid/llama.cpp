@@ -154,18 +154,29 @@ class ChatStore {
 		try {
 			const currentConfig = config();
 			const conversation = await DatabaseService.getConversation(conversationId);
+			const spominEnabled = Boolean(currentConfig.spominEnabled);
+			if (!activeCompaction && !spominEnabled) {
+				return await ChatContextService.prepare(baseInput);
+			}
 			const preparation = await RetrievalService.prepare({
 				conversationId,
 				anchorMessageId: messages.at(-1)!.id,
 				responseMessageId,
 				messages,
-				compactionGeneration: activeCompaction?.record.generation ?? 0,
+				activeCompaction: activeCompaction
+					? {
+							id: activeCompaction.record.id,
+							generation: activeCompaction.record.generation,
+							sourceMessageIds: activeCompaction.record.sourceMessageIds
+						}
+					: undefined,
 				settings: {
-					spominEnabled: Boolean(currentConfig.spominEnabled),
+					spominEnabled,
 					spominBaseUrl: String(currentConfig.spominBaseUrl || 'http://127.0.0.1:8084'),
 					spominApiToken: String(currentConfig.spominApiToken || ''),
 					spominProject:
 						conversation?.memoryProject || String(currentConfig.spominProject || '') || undefined,
+					spominCandidateLimit: Number(currentConfig.spominCandidateLimit) || 20,
 					spominResultLimit: Number(currentConfig.spominResultLimit) || 3,
 					spominTokenBudget: Number(currentConfig.spominTokenBudget) || 1000,
 					spominTimeoutMs: Number(currentConfig.spominTimeoutMs) || 2000,

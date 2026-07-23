@@ -6,6 +6,7 @@ import type {
 	DatabaseRetrievalHitUsage,
 	DatabaseRetrievalTrace,
 	MemoryRetrievalHit,
+	MemoryRetrievalResponse,
 	RetrievalTraceHit
 } from '$lib/types';
 import { uuid } from '$lib/utils';
@@ -18,6 +19,7 @@ interface RetrievalSettings {
 	spominBaseUrl: string;
 	spominApiToken?: string;
 	spominProject?: string;
+	spominCandidateLimit: number;
 	spominResultLimit: number;
 	spominTokenBudget: number;
 	spominTimeoutMs: number;
@@ -56,10 +58,27 @@ interface RetrievalQuery {
 	supportingCharacterCount: number;
 }
 
+interface ActiveCompactionScope {
+	id: string;
+	generation: number;
+	sourceMessageIds: string[];
+}
+
+interface LocalCandidateResult {
+	candidates: Candidate[];
+	evaluations: CandidateEvaluation[];
+	detail: string;
+}
+
 export interface RetrievalPreparation {
 	blocks: ChatContextBlock[];
 	trace: DatabaseRetrievalTrace;
 	usage: DatabaseRetrievalHitUsage[];
+	spominFeedback?: {
+		baseUrl: string;
+		apiToken?: string;
+		timeoutMs: number;
+	};
 }
 
 const WORD_RE = /[\p{L}\p{N}_-]+/gu;
@@ -225,23 +244,42 @@ export class RetrievalService {
 
 	private static async localCandidates(
 		conversationId: string,
+		activeCompaction: ActiveCompactionScope,
 		query: string,
 		queryTerms: string[],
 		settings: RetrievalSettings
-	): Promise<{
-		candidates: Candidate[];
-		evaluations: CandidateEvaluation[];
-		semantic: boolean;
-	}> {
-		const chunks = await DatabaseService.getConversationArchiveChunks(conversationId);
+	): Promise<LocalCandidateResult> {
+		const archived = await DatabaseService.getConversationArchiveChunks(conversationId);
+		const activeMessageIds = new Set(activeCompaction.sourceMessageIds);
+		const matching = archived.filter(
+			(chunk) =>
+				chunk.sourceMessageIds.length > 0 &&
+				chunk.sourceMessageIds.every((messageId) => activeMessageIds.has(messageId))
+		);
+		const unique = new Map<string, DatabaseArchiveChunk>();
+		for (const chunk of matching) {
+			const key = `${chunk.sourceMessageIds.join('\u0000')}\u0000${chunk.text}`;
+			const existing = unique.get(key);
+			if (!existing || chunk.createdAt > existing.createdAt) unique.set(key, chunk);
+		}
+		const chunks = Array.from(unique.values());
 		memoryDebug('retrieval.local.archive-loaded', {
 			conversationId,
+			compactionId: activeCompaction.id,
+			compactionGeneration: activeCompaction.generation,
+			compactedMessageCount: activeMessageIds.size,
+			archiveCount: archived.length,
 			chunkCount: chunks.length,
+			ignoredArchiveCount: archived.length - matching.length,
+			duplicateArchiveCount: matching.length - chunks.length,
 			pendingEmbeddingCount: chunks.filter((chunk) => chunk.embeddingStatus === 'pending').length,
 			readyEmbeddingCount: chunks.filter((chunk) => chunk.embeddingStatus === 'ready').length
 		});
-		if (!chunks.length) return { candidates: [], evaluations: [], semantic: false };
+		if (!chunks.length) {
+			return { candidates: [], evaluations: [], detail: 'no archived fragments' };
+		}
 		let queryEmbedding: number[] | undefined;
+		let detail = 'lexical+semantic';
 		try {
 			const pending = chunks.filter((chunk) => chunk.embeddingStatus === 'pending').slice(0, 15);
 			const values = await RetrievalService.embeddings(
@@ -266,9 +304,14 @@ export class RetrievalService {
 		} catch (error) {
 			memoryDebug('retrieval.local.semantic-fallback', {
 				conversationId,
+				compactionId: activeCompaction.id,
 				error
 			});
 			queryEmbedding = undefined;
+			detail =
+				error instanceof DOMException && error.name === 'AbortError'
+					? 'lexical-only - embedding timed out'
+					: 'lexical-only - embedding unavailable';
 		}
 
 		const ranked = chunks
@@ -321,28 +364,30 @@ export class RetrievalService {
 				reason
 			}))
 		});
-		return { candidates, evaluations, semantic: !!queryEmbedding };
+		return { candidates, evaluations, detail };
 	}
 
 	private static evaluateSpominCandidates(
 		results: MemoryRetrievalHit[],
-		settings: RetrievalSettings
+		settings: RetrievalSettings,
+		profile?: MemoryRetrievalResponse['profile']
 	): CandidateEvaluation[] {
 		return results.map((result) => {
 			const candidate: Candidate = {
 				id: `spomin:${result.memory_ids?.[0] ?? result.id}`,
 				text: result.text,
 				source: 'long-term-memory',
-				score: Math.max(result.semantic_score ?? 0, result.lexical_coverage ?? 0, result.score),
+				score: Math.max(result.semantic_score ?? 0, result.lexical_coverage ?? 0),
 				lexicalScore: result.lexical_coverage ?? undefined,
 				semanticScore: result.semantic_score ?? undefined,
-				providerScore: result.score,
 				provenance: {
 					chunkId: result.id,
 					memoryIds: result.memory_ids,
 					project: result.project,
 					tier: result.tier,
-					createdAt: result.created_at
+					createdAt: result.created_at,
+					embeddingProfileId: profile?.id,
+					embeddingModelId: profile?.model_id
 				}
 			};
 			const accepted =
@@ -356,12 +401,24 @@ export class RetrievalService {
 		});
 	}
 
+	private static mergeSpominChannels(response: MemoryRetrievalResponse): MemoryRetrievalHit[] {
+		const merged = new Map<string, MemoryRetrievalHit>();
+		for (const result of response.semantic.results) {
+			merged.set(result.id, { ...result });
+		}
+		for (const result of response.keyword.results) {
+			const current = merged.get(result.id);
+			merged.set(result.id, current ? { ...current, ...result } : { ...result });
+		}
+		return [...merged.values()];
+	}
+
 	static async prepare(input: {
 		conversationId: string;
 		anchorMessageId: string;
 		responseMessageId?: string;
 		messages: DatabaseMessage[];
-		compactionGeneration: number;
+		activeCompaction?: ActiveCompactionScope;
 		settings: RetrievalSettings;
 	}): Promise<RetrievalPreparation> {
 		const retrievalQuery = RetrievalService.buildRetrievalQuery(input.messages);
@@ -379,7 +436,9 @@ export class RetrievalService {
 			anchorMessageId: input.anchorMessageId,
 			messageCount: input.messages.length,
 			userTurn,
-			compactionGeneration: input.compactionGeneration,
+			compactionId: input.activeCompaction?.id,
+			compactionGeneration: input.activeCompaction?.generation ?? 0,
+			compactedMessageCount: input.activeCompaction?.sourceMessageIds.length ?? 0,
 			explicitRecall,
 			spominEnabled: input.settings.spominEnabled,
 			queryStrategy: retrievalQuery.strategy,
@@ -398,12 +457,16 @@ export class RetrievalService {
 			}
 		});
 
-		const localPromise = RetrievalService.localCandidates(
-			input.conversationId,
-			query,
-			queryTerms,
-			input.settings
-		);
+		const localPromise =
+			input.activeCompaction && input.activeCompaction.sourceMessageIds.length > 0
+				? RetrievalService.localCandidates(
+						input.conversationId,
+						input.activeCompaction,
+						query,
+						queryTerms,
+						input.settings
+					)
+				: Promise.resolve(null);
 		const spominPromise = input.settings.spominEnabled
 			? new SpominService({
 					baseUrl: input.settings.spominBaseUrl,
@@ -411,7 +474,7 @@ export class RetrievalService {
 					timeoutMs: input.settings.spominTimeoutMs
 				}).retrieve({
 					query,
-					limit: input.settings.spominResultLimit,
+					candidateLimit: input.settings.spominCandidateLimit,
 					project: input.settings.spominProject,
 					excludeConversationId: input.conversationId
 				})
@@ -422,12 +485,17 @@ export class RetrievalService {
 		let remote: Candidate[] = [];
 		let localEvaluations: CandidateEvaluation[] = [];
 		let remoteEvaluations: CandidateEvaluation[] = [];
-		if (localResult.status === 'fulfilled') {
+		if (localResult.status === 'fulfilled' && localResult.value) {
 			local = localResult.value.candidates;
 			localEvaluations = localResult.value.evaluations;
 			providers.local = {
 				status: 'ok',
-				detail: localResult.value.semantic ? 'lexical+semantic' : 'lexical-only'
+				detail: localResult.value.detail
+			};
+		} else if (localResult.status === 'fulfilled') {
+			providers.local = {
+				status: 'not-applicable',
+				detail: 'conversation is not compacted'
 			};
 		} else {
 			providers.local = { status: 'error', detail: String(localResult.reason) };
@@ -435,25 +503,40 @@ export class RetrievalService {
 		if (!input.settings.spominEnabled) {
 			providers.spomin = { status: 'disabled' };
 		} else if (spominResult.status === 'fulfilled' && spominResult.value) {
+			const mergedResults = RetrievalService.mergeSpominChannels(spominResult.value);
 			remoteEvaluations = RetrievalService.evaluateSpominCandidates(
-				spominResult.value.results,
-				input.settings
+				mergedResults,
+				input.settings,
+				spominResult.value.profile
 			);
 			remote = remoteEvaluations
 				.filter((evaluation) => evaluation.accepted)
 				.map((evaluation) => evaluation.candidate);
-			const detail = !spominResult.value.results.length
+			const detail = !mergedResults.length
 				? 'no-results'
 				: !remote.length
 					? 'all-below-threshold'
-					: spominResult.value.semantic_available
-						? 'hybrid'
-						: 'keyword-only';
+					: spominResult.value.semantic.status === 'complete' &&
+						  spominResult.value.keyword.status === 'complete'
+						? 'raw-semantic+keyword'
+						: spominResult.value.semantic.status === 'complete'
+							? 'semantic-only'
+							: 'keyword-only';
+			const channelSummary = [
+				detail,
+				`semantic=${spominResult.value.semantic.results.length}`,
+				`keyword=${spominResult.value.keyword.results.length}`,
+				`merged=${mergedResults.length}`,
+				spominResult.value.profile ? `profile=${spominResult.value.profile.id.slice(0, 12)}` : null
+			]
+				.filter(Boolean)
+				.join('; ');
 			providers.spomin = {
 				status: 'ok',
-				detail: spominResult.value.degraded_reason
-					? `${detail}: ${spominResult.value.degraded_reason}`
-					: detail
+				detail:
+					spominResult.value.semantic.status === 'unavailable'
+						? `${channelSummary}; ${spominResult.value.semantic.error ?? 'semantic unavailable'}`
+						: channelSummary
 			};
 		} else {
 			const reason = spominResult.status === 'rejected' ? spominResult.reason : 'unavailable';
@@ -469,7 +552,15 @@ export class RetrievalService {
 			localCandidateCount: local.length,
 			localEvaluatedCount: localEvaluations.length,
 			spominReturnedCount: remoteEvaluations.length,
-			spominCandidateCount: remote.length
+			spominCandidateCount: remote.length,
+			spominSemanticCount:
+				spominResult.status === 'fulfilled' && spominResult.value
+					? spominResult.value.semantic.results.length
+					: 0,
+			spominKeywordCount:
+				spominResult.status === 'fulfilled' && spominResult.value
+					? spominResult.value.keyword.results.length
+					: 0
 		});
 
 		const previous = await DatabaseService.getRetrievalHitUsage(input.conversationId);
@@ -494,7 +585,8 @@ export class RetrievalService {
 			let reason: string | undefined;
 			if (prior && userTurn - prior.lastInjectedUserTurn < 3) {
 				const topicChanged = similarity(queryTerms, prior.queryTerms ?? []) < 0.55;
-				const generationChanged = input.compactionGeneration !== prior.compactionGeneration;
+				const generationChanged =
+					(input.activeCompaction?.generation ?? 0) !== prior.compactionGeneration;
 				const scoreImproved = candidate.score >= prior.score + 0.15;
 				if (!topicChanged && !generationChanged && !scoreImproved && !explicitRecall) {
 					reason = userTurn - prior.lastInjectedUserTurn <= 1 ? 'consecutive-request' : 'cooldown';
@@ -511,6 +603,7 @@ export class RetrievalService {
 		});
 
 		const selected: Candidate[] = [];
+		let selectedSpomin = 0;
 		const budgets = new Map([
 			['conversation-recall', input.settings.localTokenBudget],
 			['long-term-memory', input.settings.spominTokenBudget]
@@ -519,17 +612,25 @@ export class RetrievalService {
 		for (const candidate of eligible.sort((left, right) => right.score - left.score)) {
 			const count = tokenEstimate(candidate.text);
 			const sourceBudget = budgets.get(candidate.source) ?? 0;
-			if (count > sourceBudget || totalTokens + count > input.settings.totalTokenBudget) {
+			const overResultLimit =
+				candidate.source === 'long-term-memory' &&
+				selectedSpomin >= input.settings.spominResultLimit;
+			if (
+				overResultLimit ||
+				count > sourceBudget ||
+				totalTokens + count > input.settings.totalTokenBudget
+			) {
 				const hit = traceHits.find(
 					(item) => item.id === candidate.id && item.source === candidate.source
 				);
 				if (hit) {
 					hit.selected = false;
-					hit.reason = 'token-budget';
+					hit.reason = overResultLimit ? 'result-limit' : 'token-budget';
 				}
 				continue;
 			}
 			selected.push(candidate);
+			if (candidate.source === 'long-term-memory') selectedSpomin += 1;
 			budgets.set(candidate.source, sourceBudget - count);
 			totalTokens += count;
 			const hit = traceHits.find(
@@ -572,7 +673,7 @@ export class RetrievalService {
 			query,
 			queryFingerprint,
 			queryTerms,
-			compactionGeneration: input.compactionGeneration,
+			compactionGeneration: input.activeCompaction?.generation ?? 0,
 			providers,
 			hits: traceHits,
 			injectedHitIds: [],
@@ -595,9 +696,16 @@ export class RetrievalService {
 				queryFingerprint,
 				queryTerms,
 				score: candidate.score,
-				compactionGeneration: input.compactionGeneration,
+				compactionGeneration: input.activeCompaction?.generation ?? 0,
 				updatedAt: Date.now()
-			}))
+			})),
+			spominFeedback: input.settings.spominEnabled
+				? {
+						baseUrl: input.settings.spominBaseUrl,
+						apiToken: input.settings.spominApiToken,
+						timeoutMs: input.settings.spominTimeoutMs
+					}
+				: undefined
 		};
 	}
 
@@ -636,11 +744,32 @@ export class RetrievalService {
 				.filter((hit) => hit.reason === 'exact-prompt-budget')
 				.map((hit) => hit.id)
 		});
+		const spominChunkIds = [...selectedBlocks.values()]
+			.filter((block) => block.source === 'long-term-memory')
+			.map((block) => block.provenance?.chunkId)
+			.filter((id): id is string => typeof id === 'string');
+		const feedback = preparation.spominFeedback;
 		await Promise.all([
 			DatabaseService.addRetrievalTrace(preparation.trace),
 			DatabaseService.putRetrievalHitUsage(
 				preparation.usage.filter((record) => selected.has(record.hitId))
-			)
+			),
+			feedback && spominChunkIds.length
+				? new SpominService(feedback)
+						.recordAccess({
+							eventId: `${preparation.trace.id}:injected`,
+							chunkIds: spominChunkIds,
+							contextId: preparation.trace.conversationId
+						})
+						.catch((error) => {
+							memoryDebug('spomin.access.error', {
+								traceId: preparation.trace.id,
+								chunkCount: spominChunkIds.length,
+								error
+							});
+							return false;
+						})
+				: Promise.resolve(false)
 		]);
 	}
 }

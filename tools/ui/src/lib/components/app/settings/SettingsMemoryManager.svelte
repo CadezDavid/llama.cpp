@@ -5,7 +5,7 @@
 	import { DatabaseService } from '$lib/services/database.service';
 	import { config } from '$lib/stores/settings.svelte';
 	import { conversationsStore } from '$lib/stores/conversations.svelte';
-	import type { DatabaseRetrievalTrace, MemoryRecord } from '$lib/types';
+	import type { DatabaseRetrievalTrace, MemoryEmbeddingStatus, MemoryRecord } from '$lib/types';
 
 	let records = $state<MemoryRecord[]>([]);
 	let loading = $state(false);
@@ -16,6 +16,7 @@
 	let tier = $state<'archive' | 'core'>('archive');
 	let conversationProject = $state(conversationsStore.activeConversation?.memoryProject ?? '');
 	let traces = $state<DatabaseRetrievalTrace[]>([]);
+	let embeddingStatus = $state<MemoryEmbeddingStatus | null>(null);
 
 	function client(): SpominService {
 		const current = config();
@@ -39,7 +40,23 @@
 			}
 			reachable = await service.health();
 			if (!reachable) throw new Error('Spomin is not reachable');
-			records = await service.list({ limit: 50, project: String(config().spominProject || '') });
+			[records, embeddingStatus] = await Promise.all([
+				service.list({ limit: 50, project: String(config().spominProject || '') }),
+				service.embeddingStatus()
+			]);
+		} catch (reason) {
+			error = reason instanceof Error ? reason.message : String(reason);
+		} finally {
+			loading = false;
+		}
+	}
+
+	async function rebuildEmbeddings(): Promise<void> {
+		if (!confirm('Rebuild every memory embedding for the active model profile?')) return;
+		loading = true;
+		error = null;
+		try {
+			embeddingStatus = await client().reindex(true);
 		} catch (reason) {
 			error = reason instanceof Error ? reason.message : String(reason);
 		} finally {
@@ -132,6 +149,37 @@
 		</p>
 	{/if}
 	{#if error}<p class="text-sm text-destructive">{error}</p>{/if}
+
+	{#if embeddingStatus}
+		<div class="space-y-2 rounded-md border p-3 text-xs">
+			<div class="flex items-start justify-between gap-3">
+				<div>
+					<p class="font-medium">Embedding index: {embeddingStatus.status}</p>
+					<p class="text-muted-foreground">
+						{embeddingStatus.ready}/{embeddingStatus.total} chunks ready,
+						{embeddingStatus.pending} pending, {embeddingStatus.processing} processing,
+						{embeddingStatus.failed} failed, {embeddingStatus.stale} stale
+					</p>
+					{#if embeddingStatus.profile}
+						<p class="mt-1 break-all text-muted-foreground">
+							{embeddingStatus.profile.model_id} - revision
+							{embeddingStatus.profile.revision} -
+							{embeddingStatus.profile.dimensions} dimensions
+						</p>
+					{/if}
+					{#if embeddingStatus.error}
+						<p class="mt-1 text-destructive">{embeddingStatus.error}</p>
+					{/if}
+				</div>
+				<Button variant="outline" disabled={loading} onclick={() => void rebuildEmbeddings()}>
+					Rebuild embeddings
+				</Button>
+			</div>
+			<p class="text-muted-foreground">
+				Change Spomin's EMBEDDER_REVISION when replacing model weights under the same model name.
+			</p>
+		</div>
+	{/if}
 
 	<div class="space-y-2 rounded-md border p-3">
 		<textarea

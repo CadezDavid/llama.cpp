@@ -72,6 +72,7 @@ export const SETTINGS_KEYS = {
 	SPOMIN_BASE_URL: 'spominBaseUrl',
 	SPOMIN_API_TOKEN: 'spominApiToken',
 	SPOMIN_PROJECT: 'spominProject',
+	SPOMIN_CANDIDATE_LIMIT: 'spominCandidateLimit',
 	SPOMIN_RESULT_LIMIT: 'spominResultLimit',
 	SPOMIN_TOKEN_BUDGET: 'spominTokenBudget',
 	SPOMIN_TIMEOUT_MS: 'spominTimeoutMs',

@@ -483,9 +483,19 @@ const SETTINGS_REGISTRY: Record<string, SettingsSectionEntry> = {
 				dependsOn: SETTINGS_KEYS.SPOMIN_ENABLED
 			},
 			{
+				key: SETTINGS_KEYS.SPOMIN_CANDIDATE_LIMIT,
+				label: 'Spomin candidate pool per channel',
+				help: 'Raw semantic and keyword candidates requested before WebUI ranking.',
+				defaultValue: 20,
+				type: SettingsFieldType.INPUT,
+				section: SETTINGS_SECTION_SLUGS.MEMORY,
+				isPositiveInteger: true,
+				dependsOn: SETTINGS_KEYS.SPOMIN_ENABLED
+			},
+			{
 				key: SETTINGS_KEYS.SPOMIN_RESULT_LIMIT,
 				label: 'Spomin result limit',
-				help: 'Maximum long-term memories considered for one request.',
+				help: 'Maximum long-term memories attached after WebUI ranking.',
 				defaultValue: 3,
 				type: SettingsFieldType.INPUT,
 				section: SETTINGS_SECTION_SLUGS.MEMORY,

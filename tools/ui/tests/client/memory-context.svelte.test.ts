@@ -79,6 +79,29 @@ describe('ChatMessageMemoryContext', () => {
 			.toBeVisible();
 	});
 
+	it('explains when conversation recall does not apply', async () => {
+		const screen = await render(ChatMessageMemoryContext, {
+			traces: [
+				trace({
+					providers: {
+						local: {
+							status: 'not-applicable',
+							detail: 'conversation is not compacted'
+						},
+						spomin: { status: 'ok', detail: 'no-results' }
+					}
+				})
+			]
+		});
+
+		await screen.getByText('Memory context: none - no relevant matches').click();
+		await expect
+			.element(
+				screen.getByText('Conversation recall: not applicable (conversation is not compacted)')
+			)
+			.toBeVisible();
+	});
+
 	it('handles legacy injected traces without a text snapshot', async () => {
 		const screen = await render(ChatMessageMemoryContext, {
 			traces: [
