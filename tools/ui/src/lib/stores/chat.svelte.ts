@@ -57,8 +57,10 @@ import type {
 	ApiChatMessageData,
 	ApiProcessingState,
 	ApiStreamSession,
+	ChatContextBlock,
 	DatabaseMessage,
 	DatabaseMessageExtra,
+	PrepareChatContextInput,
 	PreparedChatContext,
 	CompactionMode
 } from '$lib/types';
@@ -73,6 +75,15 @@ import {
 
 interface ConversationStateEntry {
 	lastAccessed: number;
+}
+
+interface RecallSnapshot {
+	traceId?: string;
+	blocks: ChatContextBlock[];
+}
+
+interface PreparedConversationContext extends PreparedChatContext {
+	recallSnapshot: RecallSnapshot;
 }
 
 class ChatStore {
@@ -129,13 +140,17 @@ class ChatStore {
 		model?: string | null,
 		excludeReasoning?: boolean,
 		measurementOptions?: SettingsChatServiceOptions,
-		includeRecall = true
-	): Promise<PreparedChatContext> {
+		includeRecall = true,
+		recallSnapshot?: RecallSnapshot,
+		agenticTurn?: number
+	): Promise<PreparedConversationContext> {
 		memoryDebug('chat.context.prepare', {
 			conversationId,
 			messageCount: messages.length,
 			model,
 			includeRecall,
+			reusingRecall: recallSnapshot !== undefined,
+			agenticTurn,
 			excludeReasoning: Boolean(excludeReasoning)
 		});
 		const activeCompaction = await CompactionService.resolveActiveCompaction(
@@ -148,15 +163,41 @@ class ChatStore {
 			excludeReasoning,
 			projections: activeCompaction ? [CompactionService.toProjection(activeCompaction)] : []
 		};
+		if (recallSnapshot !== undefined) {
+			const fitted = await this.fitRecallBlocks(
+				baseInput,
+				recallSnapshot.blocks,
+				conversationId,
+				model,
+				measurementOptions,
+				'reuse',
+				agenticTurn
+			);
+			memoryDebug('chat.context.recall-reused', {
+				conversationId,
+				traceId: recallSnapshot.traceId,
+				agenticTurn,
+				contextBlockIds: fitted.blocks.map((block) => block.id),
+				finalPromptTokenCount: fitted.finalTokens,
+				requestMessageCount: fitted.prepared.requestMessages.length
+			});
+			return { ...fitted.prepared, recallSnapshot };
+		}
 		if (!includeRecall || !messages.at(-1)?.id) {
-			return await ChatContextService.prepare(baseInput);
+			return {
+				...(await ChatContextService.prepare(baseInput)),
+				recallSnapshot: { blocks: [] }
+			};
 		}
 		try {
 			const currentConfig = config();
 			const conversation = await DatabaseService.getConversation(conversationId);
 			const spominEnabled = Boolean(currentConfig.spominEnabled);
 			if (!activeCompaction && !spominEnabled) {
-				return await ChatContextService.prepare(baseInput);
+				return {
+					...(await ChatContextService.prepare(baseInput)),
+					recallSnapshot: { blocks: [] }
+				};
 			}
 			const preparation = await RetrievalService.prepare({
 				conversationId,
@@ -190,56 +231,95 @@ class ChatStore {
 					lexicalThreshold: Number(currentConfig.lexicalRecallThreshold) || 0.34
 				}
 			});
-			let blocks = preparation.blocks;
-			let prepared = await ChatContextService.prepare({ ...baseInput, contextBlocks: blocks });
-			let finalTokens: number | undefined;
-			const modelContextSize = isRouterMode()
-				? ((model ? modelsStore.getModelContextSize(model) : null) ??
-					selectedModelContextSize() ??
-					0)
-				: (contextSize() ?? 0);
-			if (modelContextSize && blocks.length) {
-				const outputReserve =
-					Number(currentConfig.max_tokens) || Math.min(8192, modelContextSize * 0.1);
-				const maximumInput =
-					modelContextSize - outputReserve - Math.max(256, modelContextSize * 0.02);
-				while (true) {
-					finalTokens = (
-						await ChatService.measurePrompt(prepared.requestMessages, {
-							...measurementOptions,
-							model: model || undefined
-						})
-					).tokenCount;
-					if (finalTokens <= maximumInput || blocks.length === 0) break;
-					memoryDebug('chat.context.drop-recall-block', {
-						conversationId,
-						droppedBlockId: blocks.at(-1)?.id,
-						promptTokens: finalTokens,
-						maximumInput,
-						remainingBlockCount: blocks.length - 1
-					});
-					blocks = blocks.slice(0, -1);
-					prepared = await ChatContextService.prepare({ ...baseInput, contextBlocks: blocks });
-				}
-			}
+			const fitted = await this.fitRecallBlocks(
+				baseInput,
+				preparation.blocks,
+				conversationId,
+				model,
+				measurementOptions,
+				'select'
+			);
 			await RetrievalService.finalize(
 				preparation,
-				blocks.map((block) => block.id),
-				finalTokens
+				fitted.blocks.map((block) => block.id),
+				fitted.finalTokens
 			);
+			const selectedSnapshot: RecallSnapshot = {
+				traceId: preparation.trace.id,
+				blocks: fitted.blocks
+			};
 			memoryDebug('chat.context.ready', {
 				conversationId,
 				activeCompactionId: activeCompaction?.record.id,
-				contextBlockIds: blocks.map((block) => block.id),
-				finalPromptTokenCount: finalTokens,
-				requestMessageCount: prepared.requestMessages.length
+				traceId: selectedSnapshot.traceId,
+				contextBlockIds: fitted.blocks.map((block) => block.id),
+				finalPromptTokenCount: fitted.finalTokens,
+				requestMessageCount: fitted.prepared.requestMessages.length
 			});
-			return prepared;
+			return { ...fitted.prepared, recallSnapshot: selectedSnapshot };
 		} catch (error) {
 			memoryDebug('chat.context.recall-fallback', { conversationId, error });
 			console.warn('[ChatStore] Recall unavailable; continuing without recalled context:', error);
-			return await ChatContextService.prepare(baseInput);
+			return {
+				...(await ChatContextService.prepare(baseInput)),
+				recallSnapshot: { blocks: [] }
+			};
 		}
+	}
+
+	private async fitRecallBlocks(
+		baseInput: PrepareChatContextInput,
+		blocks: ChatContextBlock[],
+		conversationId: string,
+		model: string | null | undefined,
+		measurementOptions: SettingsChatServiceOptions | undefined,
+		mode: 'select' | 'reuse',
+		agenticTurn?: number
+	): Promise<{
+		prepared: PreparedChatContext;
+		blocks: ChatContextBlock[];
+		finalTokens?: number;
+	}> {
+		let fittedBlocks = [...blocks];
+		let prepared = await ChatContextService.prepare({
+			...baseInput,
+			contextBlocks: fittedBlocks
+		});
+		let finalTokens: number | undefined;
+		const modelContextSize = isRouterMode()
+			? ((model ? modelsStore.getModelContextSize(model) : null) ?? selectedModelContextSize() ?? 0)
+			: (contextSize() ?? 0);
+		if (modelContextSize && fittedBlocks.length) {
+			const currentConfig = config();
+			const outputReserve =
+				Number(currentConfig.max_tokens) || Math.min(8192, modelContextSize * 0.1);
+			const maximumInput =
+				modelContextSize - outputReserve - Math.max(256, modelContextSize * 0.02);
+			while (true) {
+				finalTokens = (
+					await ChatService.measurePrompt(prepared.requestMessages, {
+						...measurementOptions,
+						model: model || undefined
+					})
+				).tokenCount;
+				if (finalTokens <= maximumInput || fittedBlocks.length === 0) break;
+				memoryDebug('chat.context.drop-recall-block', {
+					conversationId,
+					mode,
+					agenticTurn,
+					droppedBlockId: fittedBlocks.at(-1)?.id,
+					promptTokens: finalTokens,
+					maximumInput,
+					remainingBlockCount: fittedBlocks.length - 1
+				});
+				fittedBlocks = fittedBlocks.slice(0, -1);
+				prepared = await ChatContextService.prepare({
+					...baseInput,
+					contextBlocks: fittedBlocks
+				});
+			}
+		}
+		return { prepared, blocks: fittedBlocks, finalTokens };
 	}
 
 	private async runCompactionPreflight(
@@ -1511,7 +1591,7 @@ class ChatStore {
 				lastCreatedInFlow = msg.id;
 				return msg;
 			},
-			prepareMessages: async () => {
+			prepareMessages: async (turn) => {
 				const conversation = await DatabaseService.getConversation(convId);
 				if (!conversation?.currNode) return null;
 				const storedMessages = await DatabaseService.getConversationMessages(convId);
@@ -1550,7 +1630,10 @@ class ChatStore {
 					currentMessageId,
 					effectiveModel,
 					!!apiOptions.excludeReasoningFromContext,
-					apiOptions
+					apiOptions,
+					true,
+					preparedContext.recallSnapshot,
+					turn
 				);
 				return refreshed.requestMessages;
 			},
