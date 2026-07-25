@@ -171,13 +171,55 @@ describe('ChatContextService', () => {
 		];
 
 		const result = await ChatContextService.prepare({
-				transcriptMessages: transcript,
-				contextBlocks: [
-					{ id: 'recall-1', source: 'conversation-recall', content: 'Historical text' }
-				]
-			});
+			transcriptMessages: transcript,
+			contextBlocks: [{ id: 'recall-1', source: 'conversation-recall', content: 'Historical text' }]
+		});
 
 		expect(result.requestMessages[0].content).toContain('Historical text');
 		expect(result.requestMessages[1].content).toBe('Partial answer');
+	});
+
+	it('reuses frozen retrieval while adding a completed tool exchange', async () => {
+		const blocks = [
+			{
+				id: 'memory-1',
+				source: 'long-term-memory' as const,
+				content: 'The project uses SQLite.'
+			}
+		];
+		const firstTurn = [message('1', MessageRole.USER, 'Which database does the project use?')];
+		const laterTurn = [
+			...firstTurn,
+			message('2', MessageRole.ASSISTANT, '', {
+				toolCalls: JSON.stringify([
+					{
+						id: 'call-1',
+						type: 'function',
+						function: { name: 'inspect_project', arguments: '{}' }
+					}
+				])
+			}),
+			message('3', MessageRole.TOOL, 'package.json confirms the database dependency', {
+				toolCallId: 'call-1'
+			})
+		];
+
+		const first = await ChatContextService.prepare({
+			transcriptMessages: firstTurn,
+			contextBlocks: blocks
+		});
+		const later = await ChatContextService.prepare({
+			transcriptMessages: laterTurn,
+			contextBlocks: blocks
+		});
+
+		expect(first.contextBlockIds).toEqual(['memory-1']);
+		expect(later.contextBlockIds).toEqual(first.contextBlockIds);
+		expect(later.requestMessages[0].content).toEqual(first.requestMessages[0].content);
+		expect(later.requestMessages.at(-1)).toMatchObject({
+			role: MessageRole.TOOL,
+			content: 'package.json confirms the database dependency',
+			tool_call_id: 'call-1'
+		});
 	});
 });
