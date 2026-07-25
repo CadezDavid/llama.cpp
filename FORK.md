@@ -76,23 +76,23 @@ all select from the same validated candidates used by automatic compaction.
 ## Branch guide
 
 The branches are deliberately separated so that upstream updates, TurboQuant,
-individual memory features, and combined builds can be maintained independently.
+individual memory stages, and the two complete products remain easy to
+distinguish.
 
-| Branch                          | Purpose                                                                                          |
-| ------------------------------- | ------------------------------------------------------------------------------------------------ |
-| `mainline`                      | Clean tracking branch for current upstream llama.cpp. Fork-specific features do not belong here. |
-| `turboquant-original`           | Original TurboQuant development line, kept as a reference without the fork's mainline merges.    |
-| `turboquant`                    | TurboQuant combined with newer llama.cpp changes and local TurboQuant-related fixes.             |
-| `memory/foundation`             | Shared prompt-projection, ephemeral-context, request-building, and token-measurement foundation. |
-| `memory/compaction`             | Conversation compaction implementation and tests.                                                |
-| `memory/spomin`                 | Spomin configuration, storage integration, and explicit recall.                                  |
-| `memory/automatic-retrieval`    | Automatic conversation and long-term memory retrieval before inference.                          |
-| `integration/mainline-memory`   | Completed memory features integrated on the normal llama.cpp base.                               |
-| `integration/turboquant-memory` | Completed memory features integrated with the maintained TurboQuant branch.                      |
+| Branch                        | Purpose                                                                                          |
+| ----------------------------- | ------------------------------------------------------------------------------------------------ |
+| `mainline`                    | Clean tracking branch for current upstream llama.cpp. Fork-specific features do not belong here. |
+| `turboquant-original`         | Original TurboQuant development line, kept as a reference without the fork's mainline merges.    |
+| `turboquant`                  | TurboQuant combined with newer llama.cpp changes and local TurboQuant-related fixes.             |
+| `feature/compaction`          | Memory foundation plus conversation compaction implementation and tests.                         |
+| `feature/spomin`              | Compaction stage plus Spomin configuration, storage integration, and explicit recall.            |
+| `feature/automatic-retrieval` | Spomin stage plus automatic conversation and long-term memory retrieval before inference.        |
+| `memory`                      | Complete memory product on the normal llama.cpp base.                                            |
+| `memory-turboquant`           | Complete memory product integrated with the maintained TurboQuant branch.                        |
 
-The `memory/*` branches are development lines, not separate competing products.
-Each feature should be developed and reviewed on its own branch, then combined
-through the integration branches.
+The `feature/*` branches are dependency-ordered intermediate builds, not
+separate competing products. The `memory` branch is the canonical landing
+branch for the complete non-TurboQuant memory stack.
 
 ## Which branch to use
 
@@ -101,13 +101,13 @@ through the integration branches.
   TurboQuant work.
 - Use `turboquant` when you want TurboQuant with the fork's newer llama.cpp
   baseline but without the memory feature stack.
-- Use `integration/mainline-memory` for the combined memory work without
-  TurboQuant.
-- Use `integration/turboquant-memory` for the full combined fork.
-- Use a `memory/*` branch only when developing or testing that specific stage.
+- Use `memory` for the complete memory product without TurboQuant.
+- Use `memory-turboquant` for the complete memory product with TurboQuant.
+- Use a `feature/*` branch only when developing or testing that intermediate
+  stage.
 
-The integration branches contain the completed memory stack. The feature
-branches remain useful for isolated testing and maintenance.
+The two product branches contain the completed memory stack. The feature
+branches remain useful for focused testing and maintenance.
 
 ## Updating the fork
 
@@ -116,11 +116,11 @@ Upstream and feature history should remain easy to distinguish:
 1. Update `mainline` from `ggml-org/llama.cpp`.
 2. Preserve `turboquant-original` as the original TurboQuant reference.
 3. Merge current mainline changes into `turboquant` when needed.
-4. Base feature work on `memory/foundation` and keep feature commits on the
-   matching `memory/*` branch.
-5. Combine completed memory stages in `integration/mainline-memory`.
-6. Merge the combined memory work into `integration/turboquant-memory` and
-   resolve TurboQuant-specific conflicts there.
+4. Use the matching `feature/*` branch when an intermediate stage needs
+   isolated development or testing.
+5. Merge completed memory work into `memory`.
+6. Merge `memory` into `memory-turboquant` and resolve TurboQuant-specific
+   conflicts there.
 
 This structure keeps the two external baselines reproducible and prevents
 experimental memory work from becoming mixed into every branch.
