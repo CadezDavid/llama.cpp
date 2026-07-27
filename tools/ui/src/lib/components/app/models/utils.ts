@@ -30,6 +30,16 @@ export function filterModelOptions(options: ModelOption[], searchTerm: string): 
 	);
 }
 
+export function isModelSelectionAvailable(
+	options: ModelOption[],
+	selectedModelId: string | null,
+	conversationModel: string | null
+): boolean {
+	if (selectedModelId) return options.some((option) => option.id === selectedModelId);
+	if (conversationModel) return options.some((option) => option.model === conversationModel);
+	return false;
+}
+
 export function groupModelOptions(
 	filteredOptions: ModelOption[],
 	favoriteIds: Set<string>,

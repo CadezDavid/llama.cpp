@@ -83,7 +83,6 @@ export const SETTINGS_KEYS = {
 	LOCAL_RECALL_TOKEN_BUDGET: 'localRecallTokenBudget',
 	TOTAL_RECALL_TOKEN_BUDGET: 'totalRecallTokenBudget',
 	SEMANTIC_RECALL_THRESHOLD: 'semanticRecallThreshold',
-	LEXICAL_RECALL_THRESHOLD: 'lexicalRecallThreshold',
 	// Developer
 	DISABLE_REASONING_PARSING: 'disableReasoningParsing',
 	EXCLUDE_REASONING_FROM_CONTEXT: 'excludeReasoningFromContext',

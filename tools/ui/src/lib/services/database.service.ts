@@ -40,7 +40,6 @@ function createArchiveChunks(
 				generation: record.generation,
 				sourceMessageIds: [message.id],
 				text: `${message.role}: ${piece}`,
-				terms: Array.from(new Set(piece.toLowerCase().match(/[\p{L}\p{N}_-]+/gu) ?? [])),
 				createdAt: Date.now(),
 				embeddingStatus: 'pending' as const
 			}));
@@ -707,16 +706,7 @@ export class DatabaseService {
 				};
 				await db[IDXDB_TABLES.compactionProjectionEvents].add(event);
 				const archiveChunks = createArchiveChunks(record, sourceMessages);
-				const archiveTerms: DatabaseArchiveTerm[] = archiveChunks.flatMap((chunk) =>
-					chunk.terms.map((term) => ({
-						id: `${chunk.id}:${term}`,
-						conversationId: chunk.conversationId,
-						chunkId: chunk.id,
-						term
-					}))
-				);
 				if (archiveChunks.length) await db[IDXDB_TABLES.archiveChunks].bulkAdd(archiveChunks);
-				if (archiveTerms.length) await db[IDXDB_TABLES.archiveTerms].bulkAdd(archiveTerms);
 				return event;
 			}
 		);
@@ -824,6 +814,18 @@ export class DatabaseService {
 			.toArray();
 		traces.sort((left, right) => right.createdAt - left.createdAt);
 		return limit === undefined ? traces : traces.slice(0, limit);
+	}
+
+	static async getRetrievalTraceForResponse(
+		conversationId: string,
+		responseMessageId: string
+	): Promise<DatabaseRetrievalTrace | undefined> {
+		const traces = await db[IDXDB_TABLES.retrievalTraces]
+			.where('conversationId')
+			.equals(conversationId)
+			.filter((trace) => trace.responseMessageId === responseMessageId)
+			.toArray();
+		return traces.sort((left, right) => right.createdAt - left.createdAt)[0];
 	}
 
 	static async getRetrievalHitUsage(conversationId: string): Promise<DatabaseRetrievalHitUsage[]> {
@@ -1086,16 +1088,6 @@ export class DatabaseService {
 					}
 					if (archiveChunks?.length) {
 						await db[IDXDB_TABLES.archiveChunks].bulkPut(archiveChunks);
-						await db[IDXDB_TABLES.archiveTerms].bulkPut(
-							archiveChunks.flatMap((chunk) =>
-								chunk.terms.map((term) => ({
-									id: `${chunk.id}:${term}`,
-									conversationId: chunk.conversationId,
-									chunkId: chunk.id,
-									term
-								}))
-							)
-						);
 					}
 					if (retrievalTraces?.length) {
 						await db[IDXDB_TABLES.retrievalTraces].bulkPut(retrievalTraces);
@@ -1228,24 +1220,7 @@ export class DatabaseService {
 					const sourceMessages = sourceMessageIds.map(
 						(id) => clonedMessages.find((message) => message.id === id)!
 					);
-					const fingerprintData = JSON.stringify(
-						sourceMessages.map((message) => ({
-							id: message.id,
-							role: message.role,
-							content: message.content,
-							reasoningContent: message.reasoningContent,
-							toolCalls: message.toolCalls,
-							toolCallId: message.toolCallId,
-							extra: message.extra
-						}))
-					);
-					const digest = await crypto.subtle.digest(
-						'SHA-256',
-						new TextEncoder().encode(fingerprintData)
-					);
-					const sourceFingerprint = Array.from(new Uint8Array(digest), (byte) =>
-						byte.toString(16).padStart(2, '0')
-					).join('');
+					const sourceFingerprint = await ChatContextService.fingerprintMessages(sourceMessages);
 					await db[IDXDB_TABLES.compactions].add({
 						...record,
 						id: newId,
@@ -1296,14 +1271,6 @@ export class DatabaseService {
 						sourceMessageIds: chunk.sourceMessageIds.map((id) => idMap.get(id)!)
 					};
 					await db[IDXDB_TABLES.archiveChunks].add(cloned);
-					await db[IDXDB_TABLES.archiveTerms].bulkAdd(
-						cloned.terms.map((term) => ({
-							id: `${newId}:${term}`,
-							conversationId: newConvId,
-							chunkId: newId,
-							term
-						}))
-					);
 				}
 
 				const remapHitId = (id: string): string => {

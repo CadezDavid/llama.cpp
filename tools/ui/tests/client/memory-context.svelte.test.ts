@@ -62,12 +62,12 @@ describe('ChatMessageMemoryContext', () => {
 		await expect.element(screen.getByText(/below-threshold/)).toBeVisible();
 	});
 
-	it('makes an empty timeout visible without opening diagnostics', async () => {
+	it('makes a semantic recall failure visible without opening diagnostics', async () => {
 		const screen = await render(ChatMessageMemoryContext, {
 			traces: [
 				trace({
 					providers: {
-						local: { status: 'ok', detail: 'lexical-only' },
+						local: { status: 'error', detail: 'embedding unavailable' },
 						spomin: { status: 'timeout' }
 					}
 				})
@@ -75,7 +75,7 @@ describe('ChatMessageMemoryContext', () => {
 		});
 
 		await expect
-			.element(screen.getByText('Memory context: unavailable - Spomin timed out'))
+			.element(screen.getByText('Memory context: unavailable - Conversation recall unavailable'))
 			.toBeVisible();
 	});
 
@@ -124,6 +124,23 @@ describe('ChatMessageMemoryContext', () => {
 		await screen.getByText('Memory context: 1 item, 10 tokens').click();
 		await expect
 			.element(screen.getByText('Text snapshot is unavailable for this legacy request.'))
+			.toBeVisible();
+	});
+
+	it('labels a regenerated answer as reusing the original selection', async () => {
+		const screen = await render(ChatMessageMemoryContext, {
+			traces: [
+				trace({
+					reusedFromTraceId: 'trace-original'
+				})
+			]
+		});
+
+		await screen.getByText('Memory context: none - no relevant matches').click();
+		await expect
+			.element(
+				screen.getByText('Reused the original memory selection; providers were not queried again.')
+			)
 			.toBeVisible();
 	});
 });

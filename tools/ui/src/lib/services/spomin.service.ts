@@ -93,16 +93,24 @@ export class SpominService {
 			method: 'POST',
 			body: JSON.stringify({
 				query: input.query,
-				channels: ['semantic', 'keyword'],
+				channels: ['semantic'],
 				semantic_limit: input.candidateLimit,
-				keyword_limit: input.candidateLimit,
 				project: input.project || undefined,
 				exclude_conversation_id: input.excludeConversationId
 			})
 		});
+		if (response.semantic.status !== 'complete') {
+			throw new Error(
+				`Spomin semantic retrieval failed: ${response.semantic.error ?? response.semantic.status}`
+			);
+		}
+		for (const result of response.semantic.results) {
+			if (typeof result.semantic_score !== 'number' || !Number.isFinite(result.semantic_score)) {
+				throw new Error(`Spomin semantic result ${result.id} has no valid semantic score`);
+			}
+		}
 		memoryDebug('spomin.retrieve.complete', {
 			semanticResultCount: response.semantic.results.length,
-			keywordResultCount: response.keyword.results.length,
 			semanticStatus: response.semantic.status,
 			profileId: response.profile?.id
 		});

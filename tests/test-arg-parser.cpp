@@ -121,6 +121,24 @@ static void test(void) {
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.verbosity > 1);
 
+    {
+        common_params group_params;
+        argv = {"binary_name", "--models-group-limits", "generation=1,auxiliary=2"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), group_params, LLAMA_EXAMPLE_SERVER));
+        assert(group_params.models_group_limits.size() == 2);
+        assert(group_params.models_group_limits.at("generation") == 1);
+        assert(group_params.models_group_limits.at("auxiliary") == 2);
+
+        argv = {"binary_name", "--models-group-limits", "generation=0"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), group_params, LLAMA_EXAMPLE_SERVER));
+
+        argv = {"binary_name", "--models-group-limits", "generation=1,generation=2"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), group_params, LLAMA_EXAMPLE_SERVER));
+
+        argv = {"binary_name", "--models-group-limits", "bad group=1"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), group_params, LLAMA_EXAMPLE_SERVER));
+    }
+
     argv = {"binary_name", "-m", "abc.gguf", "--predict", "6789", "--batch-size", "9090"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.model.path == "abc.gguf");

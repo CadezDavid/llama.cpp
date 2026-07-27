@@ -220,6 +220,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--models-dir PATH` | directory containing models for the router server (default: disabled)<br/>(env: LLAMA_ARG_MODELS_DIR) |
 | `--models-preset PATH` | path to INI file containing model presets for the router server (default: disabled)<br/>(env: LLAMA_ARG_MODELS_PRESET) |
 | `--models-max N` | for router server, maximum number of models to load simultaneously (default: 4, 0 = unlimited)<br/>(env: LLAMA_ARG_MODELS_MAX) |
+| `--models-group-limits GROUP=N,...` | for router server, maximum number of simultaneously loaded models per named group<br/>(env: LLAMA_ARG_MODELS_GROUP_LIMITS) |
 | `--models-autoload, --no-models-autoload` | for router server, whether to automatically load models (default: enabled)<br/>(env: LLAMA_ARG_MODELS_AUTOLOAD) |
 | `--jinja, --no-jinja` | whether to use jinja template engine for chat (default: enabled)<br/>(env: LLAMA_ARG_JINJA) |
 | `--reasoning-format FORMAT` | controls whether thought tags are allowed and/or extracted from the response, and in which format they're returned; one of:<br/>- none: leaves thoughts unparsed in `message.content`<br/>- deepseek: puts thoughts in `message.reasoning_content`<br/>- deepseek-legacy: keeps `<think>` tags in `message.content` while also populating `message.reasoning_content`<br/>(default: auto)<br/>(env: LLAMA_ARG_THINK) |
@@ -1695,6 +1696,35 @@ The precedence rule for preset options is as follows:
 We also offer additional options that are exclusive to presets (these aren't treated as command-line arguments):
 - `load-on-startup` (boolean): Controls whether the model loads automatically when the server starts
 - `stop-timeout` (int, seconds): After requested unload, wait for this many seconds before forcing termination (default: 10)
+- `model-group` (string): Assigns the model to a capacity group declared by `--models-group-limits`
+
+Group limits are enforced before the global `--models-max` limit. When a group is full, the router unloads the least recently used model from that group before loading the requested model. The global limit remains an aggregate ceiling across grouped and ungrouped models.
+
+For example, the following keeps room for one generation model and one auxiliary model:
+
+```sh
+llama-server \
+    --models-preset ./my-models.ini \
+    --models-max 2 \
+    --models-group-limits generation=1,auxiliary=1
+```
+
+```ini
+[chat-a]
+model = /models/chat-a.gguf
+model-group = generation
+
+[chat-b]
+model = /models/chat-b.gguf
+model-group = generation
+
+[embeddings]
+model = /models/embeddings.gguf
+model-group = auxiliary
+embeddings = true
+device = none
+load-on-startup = true
+```
 
 ### Routing requests
 

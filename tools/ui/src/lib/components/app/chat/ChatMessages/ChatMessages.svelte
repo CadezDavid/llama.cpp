@@ -25,7 +25,8 @@
 		buildSiblingInfoMap,
 		copyToClipboard,
 		formatMessageForClipboard,
-		hasAgenticContent
+		hasAgenticContent,
+		visibleTraceMessageId
 	} from '$lib/utils';
 	import type { DatabaseRetrievalTrace } from '$lib/types';
 
@@ -225,12 +226,7 @@
 		const visibleIds = new Set(filteredMessages.map((message) => message.id));
 		const tracesByUserId = new SvelteMap<string, DatabaseRetrievalTrace[]>();
 		for (const trace of retrievalTraces) {
-			const relatedId =
-				trace.responseMessageId && visibleIds.has(trace.responseMessageId)
-					? trace.responseMessageId
-					: visibleIds.has(trace.anchorMessageId)
-						? trace.anchorMessageId
-						: null;
+			const relatedId = visibleTraceMessageId(trace, visibleIds);
 			if (!relatedId) continue;
 			const relatedIndex = filteredMessages.findIndex((message) => message.id === relatedId);
 			let userId: string | null = null;

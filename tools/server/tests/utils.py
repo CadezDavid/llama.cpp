@@ -91,6 +91,7 @@ class ServerProcess:
     api_key: str | None = None
     models_dir: str | None = None
     models_max: int | None = None
+    models_group_limits: str | None = None
     models_preset: str | None = None
     no_models_autoload: bool | None = None
     lora_files: List[str] | None = None
@@ -170,6 +171,8 @@ class ServerProcess:
             server_args.extend(["--models-dir", self.models_dir])
         if self.models_max is not None:
             server_args.extend(["--models-max", self.models_max])
+        if self.models_group_limits is not None:
+            server_args.extend(["--models-group-limits", self.models_group_limits])
         if self.models_preset:
             server_args.extend(["--models-preset", self.models_preset])
         if self.cors_origins:

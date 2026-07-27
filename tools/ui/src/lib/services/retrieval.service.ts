@@ -11,6 +11,7 @@ import type {
 } from '$lib/types';
 import { uuid } from '$lib/utils';
 import { memoryDebug } from '$lib/utils/memory-debug';
+import { sha256 } from '$lib/utils/sha256';
 import { DatabaseService } from './database.service';
 import { SpominService } from './spomin.service';
 
@@ -30,7 +31,6 @@ interface RetrievalSettings {
 	localTokenBudget: number;
 	totalTokenBudget: number;
 	semanticThreshold: number;
-	lexicalThreshold: number;
 }
 
 interface Candidate {
@@ -38,7 +38,6 @@ interface Candidate {
 	text: string;
 	source: 'conversation-recall' | 'long-term-memory';
 	score: number;
-	lexicalScore?: number;
 	semanticScore?: number;
 	providerScore?: number;
 	provenance: Record<string, unknown>;
@@ -53,7 +52,6 @@ interface CandidateEvaluation {
 interface RetrievalQuery {
 	value: string;
 	latestUser: string;
-	terms: string[];
 	strategy: 'latest-only' | 'context-expanded';
 	supportingCharacterCount: number;
 }
@@ -81,43 +79,16 @@ export interface RetrievalPreparation {
 	};
 }
 
+export interface RecallSnapshot {
+	traceId?: string;
+	blocks: ChatContextBlock[];
+}
+
 const WORD_RE = /[\p{L}\p{N}_-]+/gu;
-const STOP_WORDS = new Set([
-	'a',
-	'an',
-	'and',
-	'are',
-	'did',
-	'do',
-	'for',
-	'how',
-	'i',
-	'in',
-	'is',
-	'it',
-	'of',
-	'on',
-	'or',
-	'that',
-	'the',
-	'to',
-	'was',
-	'we',
-	'what',
-	'which',
-	'with',
-	'you'
-]);
 const CONTEXT_REFERENCE_RE =
 	/\b(that one|this|those|these|the same|same one|what about|as before|earlier one|previous one)\b/i;
 const MAX_SUPPORTING_CONTEXT_CHARACTERS = 1200;
 const MAX_TRACE_EVALUATIONS = 20;
-
-function terms(text: string): string[] {
-	return Array.from(
-		new Set((text.toLowerCase().match(WORD_RE) ?? []).filter((term) => !STOP_WORDS.has(term)))
-	);
-}
 
 function cosine(left: number[], right: number[]): number {
 	if (!left.length || left.length !== right.length) return 0;
@@ -132,19 +103,69 @@ function cosine(left: number[], right: number[]): number {
 	return leftNorm && rightNorm ? dot / Math.sqrt(leftNorm * rightNorm) : 0;
 }
 
-function similarity(left: string[], right: string[]): number {
-	const a = new Set(left);
-	const b = new Set(right);
-	const union = new Set([...a, ...b]);
-	if (!union.size) return 1;
-	return [...a].filter((term) => b.has(term)).length / union.size;
-}
-
 function tokenEstimate(text: string): number {
 	return Math.max(1, Math.ceil((text.match(WORD_RE)?.length ?? 0) * 1.35));
 }
 
 export class RetrievalService {
+	static snapshotFromTrace(trace: DatabaseRetrievalTrace): RecallSnapshot | null {
+		const hits = new Map(trace.hits.map((hit) => [hit.id, hit]));
+		const blocks: ChatContextBlock[] = [];
+		for (const id of trace.injectedHitIds) {
+			const hit = hits.get(id);
+			if (!hit || typeof hit.contentSnapshot !== 'string') return null;
+			blocks.push({
+				id: hit.id,
+				source: hit.source,
+				content: hit.contentSnapshot,
+				provenance: hit.provenance ? { ...hit.provenance } : undefined
+			});
+		}
+		return {
+			traceId: trace.reusedFromTraceId ?? trace.id,
+			blocks
+		};
+	}
+
+	static buildReusedTrace(
+		sourceTrace: DatabaseRetrievalTrace,
+		responseMessageId: string,
+		selectedBlockIds: string[],
+		finalPromptTokenCount?: number
+	): DatabaseRetrievalTrace {
+		const selected = new Set(selectedBlockIds);
+		const previouslyInjected = new Set(sourceTrace.injectedHitIds);
+		const hits = sourceTrace.hits.map((hit) => {
+			const isSelected = selected.has(hit.id);
+			return {
+				...hit,
+				selected: isSelected,
+				reason: isSelected
+					? undefined
+					: previouslyInjected.has(hit.id)
+						? 'exact-prompt-budget'
+						: hit.reason,
+				provenance: hit.provenance ? { ...hit.provenance } : undefined
+			};
+		});
+		return {
+			...sourceTrace,
+			id: uuid(),
+			responseMessageId,
+			reusedFromTraceId: sourceTrace.reusedFromTraceId ?? sourceTrace.id,
+			createdAt: Date.now(),
+			providers: Object.fromEntries(
+				Object.entries(sourceTrace.providers).map(([name, provider]) => [name, { ...provider }])
+			),
+			hits,
+			injectedHitIds: [...selectedBlockIds],
+			injectedTokenCount: hits
+				.filter((hit) => selected.has(hit.id))
+				.reduce((sum, hit) => sum + (hit.tokenCount ?? 0), 0),
+			finalPromptTokenCount
+		};
+	}
+
 	private static buildRetrievalQuery(messages: DatabaseMessage[]): RetrievalQuery {
 		const conversational = messages.filter(
 			(message) =>
@@ -155,8 +176,8 @@ export class RetrievalService {
 			(message) => message.role === MessageRole.USER
 		);
 		const latestUser = latestUserIndex >= 0 ? conversational[latestUserIndex].content.trim() : '';
-		const queryTerms = terms(latestUser);
-		const contextDependent = queryTerms.length < 4 || CONTEXT_REFERENCE_RE.test(latestUser);
+		const contextDependent =
+			(latestUser.match(WORD_RE)?.length ?? 0) < 4 || CONTEXT_REFERENCE_RE.test(latestUser);
 		const supportingContext = contextDependent
 			? conversational
 					.slice(0, latestUserIndex)
@@ -170,7 +191,6 @@ export class RetrievalService {
 				? `Current user request:\n${latestUser}\n\nRecent context:\n${supportingContext}`
 				: `Current user request:\n${latestUser}`,
 			latestUser,
-			terms: queryTerms,
 			strategy: supportingContext ? 'context-expanded' : 'latest-only',
 			supportingCharacterCount: supportingContext.length
 		};
@@ -181,10 +201,7 @@ export class RetrievalService {
 	}
 
 	static async fingerprint(value: string): Promise<string> {
-		const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value));
-		return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join(
-			''
-		);
+		return await sha256(value);
 	}
 
 	private static async embeddings(
@@ -218,6 +235,19 @@ export class RetrievalService {
 			const embeddings = body.data
 				.sort((left, right) => left.index - right.index)
 				.map((item) => item.embedding);
+			if (
+				embeddings.length !== input.length ||
+				embeddings.some(
+					(embedding) =>
+						!embedding.length ||
+						embedding.length !== embeddings[0].length ||
+						embedding.some((value) => !Number.isFinite(value))
+				)
+			) {
+				throw new Error(
+					`Embedding response shape mismatch: expected ${input.length} valid vectors, received ${embeddings.length}`
+				);
+			}
 			memoryDebug('retrieval.embedding.complete', {
 				resultCount: embeddings.length,
 				dimensions: embeddings[0]?.length ?? 0,
@@ -236,17 +266,10 @@ export class RetrievalService {
 		}
 	}
 
-	private static lexicalScore(queryTerms: string[], chunk: DatabaseArchiveChunk): number {
-		if (!queryTerms.length) return 0;
-		const chunkTerms = new Set(chunk.terms);
-		return queryTerms.filter((term) => chunkTerms.has(term)).length / queryTerms.length;
-	}
-
 	private static async localCandidates(
 		conversationId: string,
 		activeCompaction: ActiveCompactionScope,
 		query: string,
-		queryTerms: string[],
 		settings: RetrievalSettings
 	): Promise<LocalCandidateResult> {
 		const archived = await DatabaseService.getConversationArchiveChunks(conversationId);
@@ -278,53 +301,35 @@ export class RetrievalService {
 		if (!chunks.length) {
 			return { candidates: [], evaluations: [], detail: 'no archived fragments' };
 		}
-		let queryEmbedding: number[] | undefined;
-		let detail = 'lexical+semantic';
-		try {
-			const pending = chunks.filter((chunk) => chunk.embeddingStatus === 'pending').slice(0, 15);
-			const values = await RetrievalService.embeddings(
-				[query, ...pending.map((chunk) => chunk.text)],
-				settings
-			);
-			queryEmbedding = values[0];
-			await Promise.all(
-				pending.map((chunk, index) =>
-					DatabaseService.updateArchiveChunk(chunk.id, {
-						embedding: values[index + 1],
-						embeddingModel: settings.embeddingModel,
-						embeddingStatus: 'ready',
-						embeddingError: undefined
-					})
-				)
-			);
-			pending.forEach((chunk, index) => {
-				chunk.embedding = values[index + 1];
-				chunk.embeddingStatus = 'ready';
-			});
-		} catch (error) {
-			memoryDebug('retrieval.local.semantic-fallback', {
-				conversationId,
-				compactionId: activeCompaction.id,
-				error
-			});
-			queryEmbedding = undefined;
-			detail =
-				error instanceof DOMException && error.name === 'AbortError'
-					? 'lexical-only - embedding timed out'
-					: 'lexical-only - embedding unavailable';
-		}
+		const pending = chunks.filter((chunk) => chunk.embeddingStatus === 'pending').slice(0, 15);
+		const values = await RetrievalService.embeddings(
+			[query, ...pending.map((chunk) => chunk.text)],
+			settings
+		);
+		const queryEmbedding = values[0];
+		await Promise.all(
+			pending.map((chunk, index) =>
+				DatabaseService.updateArchiveChunk(chunk.id, {
+					embedding: values[index + 1],
+					embeddingModel: settings.embeddingModel,
+					embeddingStatus: 'ready',
+					embeddingError: undefined
+				})
+			)
+		);
+		pending.forEach((chunk, index) => {
+			chunk.embedding = values[index + 1];
+			chunk.embeddingStatus = 'ready';
+		});
 
 		const ranked = chunks
 			.map((chunk) => {
-				const lexical = RetrievalService.lexicalScore(queryTerms, chunk);
-				const semantic =
-					queryEmbedding && chunk.embedding ? cosine(queryEmbedding, chunk.embedding) : 0;
+				const semantic = chunk.embedding ? cosine(queryEmbedding, chunk.embedding) : 0;
 				return {
 					id: `local:${chunk.id}`,
 					text: chunk.text,
 					source: 'conversation-recall' as const,
-					score: Math.max(lexical, semantic),
-					lexicalScore: lexical,
+					score: semantic,
 					semanticScore: semantic,
 					provenance: {
 						compactionId: chunk.compactionId,
@@ -336,9 +341,7 @@ export class RetrievalService {
 			.sort((left, right) => right.score - left.score);
 		let acceptedCount = 0;
 		const evaluations = ranked.slice(0, MAX_TRACE_EVALUATIONS).map((candidate) => {
-			const aboveThreshold =
-				(candidate.lexicalScore ?? 0) >= settings.lexicalThreshold ||
-				(candidate.semanticScore ?? 0) >= settings.semanticThreshold;
+			const aboveThreshold = (candidate.semanticScore ?? 0) >= settings.semanticThreshold;
 			if (!aboveThreshold) {
 				return { candidate, accepted: false, reason: 'below-threshold' };
 			}
@@ -358,13 +361,12 @@ export class RetrievalService {
 			candidates: evaluations.map(({ candidate, accepted, reason }) => ({
 				id: candidate.id,
 				score: candidate.score,
-				lexicalScore: candidate.lexicalScore,
 				semanticScore: candidate.semanticScore,
 				accepted,
 				reason
 			}))
 		});
-		return { candidates, evaluations, detail };
+		return { candidates, evaluations, detail: 'semantic' };
 	}
 
 	private static evaluateSpominCandidates(
@@ -377,8 +379,7 @@ export class RetrievalService {
 				id: `spomin:${result.memory_ids?.[0] ?? result.id}`,
 				text: result.text,
 				source: 'long-term-memory',
-				score: Math.max(result.semantic_score ?? 0, result.lexical_coverage ?? 0),
-				lexicalScore: result.lexical_coverage ?? undefined,
+				score: result.semantic_score ?? 0,
 				semanticScore: result.semantic_score ?? undefined,
 				provenance: {
 					chunkId: result.id,
@@ -390,27 +391,13 @@ export class RetrievalService {
 					embeddingModelId: profile?.model_id
 				}
 			};
-			const accepted =
-				(result.lexical_coverage ?? 0) >= settings.lexicalThreshold ||
-				(result.semantic_score ?? 0) >= settings.semanticThreshold;
+			const accepted = (result.semantic_score ?? 0) >= settings.semanticThreshold;
 			return {
 				candidate,
 				accepted,
 				reason: accepted ? undefined : 'below-threshold'
 			};
 		});
-	}
-
-	private static mergeSpominChannels(response: MemoryRetrievalResponse): MemoryRetrievalHit[] {
-		const merged = new Map<string, MemoryRetrievalHit>();
-		for (const result of response.semantic.results) {
-			merged.set(result.id, { ...result });
-		}
-		for (const result of response.keyword.results) {
-			const current = merged.get(result.id);
-			merged.set(result.id, current ? { ...current, ...result } : { ...result });
-		}
-		return [...merged.values()];
 	}
 
 	static async prepare(input: {
@@ -424,7 +411,6 @@ export class RetrievalService {
 		const retrievalQuery = RetrievalService.buildRetrievalQuery(input.messages);
 		const query = retrievalQuery.value;
 		const latestUser = retrievalQuery.latestUser;
-		const queryTerms = retrievalQuery.terms;
 		const queryFingerprint = await RetrievalService.fingerprint(query);
 		const userTurn = input.messages.filter((message) => message.role === MessageRole.USER).length;
 		const explicitRecall = /\b(remember|recall|previously|before|earlier|last time)\b/i.test(
@@ -444,7 +430,6 @@ export class RetrievalService {
 			queryStrategy: retrievalQuery.strategy,
 			currentMessageCharacterCount: latestUser.length,
 			supportingContextCharacterCount: retrievalQuery.supportingCharacterCount,
-			queryTermCount: queryTerms.length,
 			fingerprint: queryFingerprint,
 			budgets: {
 				local: input.settings.localTokenBudget,
@@ -452,8 +437,7 @@ export class RetrievalService {
 				total: input.settings.totalTokenBudget
 			},
 			thresholds: {
-				semantic: input.settings.semanticThreshold,
-				lexical: input.settings.lexicalThreshold
+				semantic: input.settings.semanticThreshold
 			}
 		});
 
@@ -463,7 +447,6 @@ export class RetrievalService {
 						input.conversationId,
 						input.activeCompaction,
 						query,
-						queryTerms,
 						input.settings
 					)
 				: Promise.resolve(null);
@@ -498,45 +481,41 @@ export class RetrievalService {
 				detail: 'conversation is not compacted'
 			};
 		} else {
-			providers.local = { status: 'error', detail: String(localResult.reason) };
+			providers.local = {
+				status:
+					localResult.reason instanceof DOMException &&
+					localResult.reason.name === 'AbortError'
+						? 'timeout'
+						: 'error',
+				detail: String(localResult.reason)
+			};
 		}
 		if (!input.settings.spominEnabled) {
 			providers.spomin = { status: 'disabled' };
 		} else if (spominResult.status === 'fulfilled' && spominResult.value) {
-			const mergedResults = RetrievalService.mergeSpominChannels(spominResult.value);
 			remoteEvaluations = RetrievalService.evaluateSpominCandidates(
-				mergedResults,
+				spominResult.value.semantic.results,
 				input.settings,
 				spominResult.value.profile
 			);
 			remote = remoteEvaluations
 				.filter((evaluation) => evaluation.accepted)
 				.map((evaluation) => evaluation.candidate);
-			const detail = !mergedResults.length
+			const detail = !spominResult.value.semantic.results.length
 				? 'no-results'
 				: !remote.length
 					? 'all-below-threshold'
-					: spominResult.value.semantic.status === 'complete' &&
-						  spominResult.value.keyword.status === 'complete'
-						? 'raw-semantic+keyword'
-						: spominResult.value.semantic.status === 'complete'
-							? 'semantic-only'
-							: 'keyword-only';
+					: 'semantic';
 			const channelSummary = [
 				detail,
 				`semantic=${spominResult.value.semantic.results.length}`,
-				`keyword=${spominResult.value.keyword.results.length}`,
-				`merged=${mergedResults.length}`,
 				spominResult.value.profile ? `profile=${spominResult.value.profile.id.slice(0, 12)}` : null
 			]
 				.filter(Boolean)
 				.join('; ');
 			providers.spomin = {
 				status: 'ok',
-				detail:
-					spominResult.value.semantic.status === 'unavailable'
-						? `${channelSummary}; ${spominResult.value.semantic.error ?? 'semantic unavailable'}`
-						: channelSummary
+				detail: channelSummary
 			};
 		} else {
 			const reason = spominResult.status === 'rejected' ? spominResult.reason : 'unavailable';
@@ -556,10 +535,6 @@ export class RetrievalService {
 			spominSemanticCount:
 				spominResult.status === 'fulfilled' && spominResult.value
 					? spominResult.value.semantic.results.length
-					: 0,
-			spominKeywordCount:
-				spominResult.status === 'fulfilled' && spominResult.value
-					? spominResult.value.keyword.results.length
 					: 0
 		});
 
@@ -572,7 +547,6 @@ export class RetrievalService {
 			id: candidate.id,
 			source: candidate.source,
 			score: candidate.score,
-			lexicalScore: candidate.lexicalScore,
 			semanticScore: candidate.semanticScore,
 			providerScore: candidate.providerScore,
 			selected: accepted,
@@ -584,7 +558,7 @@ export class RetrievalService {
 			const prior = previousById.get(`${candidate.source}:${candidate.id}`);
 			let reason: string | undefined;
 			if (prior && userTurn - prior.lastInjectedUserTurn < 3) {
-				const topicChanged = similarity(queryTerms, prior.queryTerms ?? []) < 0.55;
+				const topicChanged = queryFingerprint !== prior.queryFingerprint;
 				const generationChanged =
 					(input.activeCompaction?.generation ?? 0) !== prior.compactionGeneration;
 				const scoreImproved = candidate.score >= prior.score + 0.15;
@@ -647,7 +621,6 @@ export class RetrievalService {
 				id: candidate.id,
 				source: candidate.source,
 				score: candidate.score,
-				lexicalScore: candidate.lexicalScore,
 				semanticScore: candidate.semanticScore,
 				providerScore: candidate.providerScore
 			})),
@@ -658,7 +631,6 @@ export class RetrievalService {
 					source: hit.source,
 					reason: hit.reason,
 					score: hit.score,
-					lexicalScore: hit.lexicalScore,
 					semanticScore: hit.semanticScore,
 					providerScore: hit.providerScore
 				}))
@@ -672,7 +644,6 @@ export class RetrievalService {
 			createdAt: Date.now(),
 			query,
 			queryFingerprint,
-			queryTerms,
 			compactionGeneration: input.activeCompaction?.generation ?? 0,
 			providers,
 			hits: traceHits,
@@ -694,7 +665,6 @@ export class RetrievalService {
 				source: candidate.source,
 				lastInjectedUserTurn: userTurn,
 				queryFingerprint,
-				queryTerms,
 				score: candidate.score,
 				compactionGeneration: input.activeCompaction?.generation ?? 0,
 				updatedAt: Date.now()

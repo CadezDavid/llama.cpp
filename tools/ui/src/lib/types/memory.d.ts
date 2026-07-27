@@ -18,8 +18,6 @@ export interface MemoryRecord {
 
 export interface MemoryRetrievalHit extends MemoryRecord {
 	semantic_score?: number | null;
-	keyword_score?: number | null;
-	lexical_coverage?: number;
 	conversation_id?: string | null;
 	memory_ids?: string[];
 }
@@ -43,7 +41,6 @@ export interface MemoryRetrievalResponse {
 	query: string;
 	profile?: MemoryEmbeddingProfile | null;
 	semantic: MemoryQueryChannel;
-	keyword: MemoryQueryChannel;
 }
 
 export interface MemoryEmbeddingStatus {
@@ -73,7 +70,8 @@ export interface DatabaseArchiveChunk {
 	generation: number;
 	sourceMessageIds: string[];
 	text: string;
-	terms: string[];
+	/** Legacy field retained while old IndexedDB records remain readable. */
+	terms?: string[];
 	createdAt: number;
 	embedding?: number[];
 	embeddingModel?: string;
@@ -92,6 +90,7 @@ export interface RetrievalTraceHit {
 	id: string;
 	source: 'conversation-recall' | 'long-term-memory';
 	score: number;
+	/** Legacy diagnostic field. New retrievals are semantic-only. */
 	lexicalScore?: number;
 	semanticScore?: number;
 	providerScore?: number;
@@ -110,10 +109,13 @@ export interface DatabaseRetrievalTrace {
 	anchorMessageId: string;
 	/** Assistant message prepared by this request. Missing on legacy traces. */
 	responseMessageId?: string;
+	/** Original trace whose context selection was reused for regeneration. */
+	reusedFromTraceId?: string;
 	createdAt: number;
 	query: string;
 	queryFingerprint: string;
-	queryTerms: string[];
+	/** Legacy diagnostic field. New retrievals do not write query terms. */
+	queryTerms?: string[];
 	compactionGeneration: number;
 	providers: Record<
 		string,
@@ -132,7 +134,8 @@ export interface DatabaseRetrievalHitUsage {
 	source: 'conversation-recall' | 'long-term-memory';
 	lastInjectedUserTurn: number;
 	queryFingerprint: string;
-	queryTerms: string[];
+	/** Legacy cooldown field. New retrievals use queryFingerprint. */
+	queryTerms?: string[];
 	score: number;
 	compactionGeneration: number;
 	updatedAt: number;

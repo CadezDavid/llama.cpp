@@ -80,6 +80,7 @@ struct server_model_meta {
     std::string name;
     std::set<std::string> aliases; // additional names that resolve to this model
     std::set<std::string> tags;    // informational tags, not used for routing
+    std::string model_group;       // router capacity group, empty means ungrouped
     int port = 0;
     server_model_status status = SERVER_MODEL_STATUS_UNLOADED;
     int64_t last_used = 0; // for LRU unloading
@@ -136,6 +137,7 @@ private:
     std::mutex mutex;
     std::condition_variable cv;
     std::map<std::string, instance_t> mapping;
+    std::mutex load_mutex;
 
     // for stopping models — separate mutex prevents cv_stop from contending
     // with update_status() on mutex.
@@ -195,9 +197,10 @@ private:
     common_preset base_preset; // base preset from llama-server CLI args
 
     void update_meta(const std::string & name, const server_model_meta & meta);
+    std::string get_model_group(const common_preset & preset, const std::string & model_name) const;
 
-    // unload least recently used models if the limit is reached
-    void unload_lru();
+    // enforce group and global capacity before loading a model
+    void ensure_capacity(const std::string & model_group);
 
     // not thread-safe, caller must hold mutex
     void add_model(server_model_meta && meta);

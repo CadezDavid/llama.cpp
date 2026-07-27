@@ -16,7 +16,7 @@ import { DatabaseService } from '$lib/services/database.service';
 import { ChatService } from '$lib/services/chat.service';
 import { ChatContextService } from '$lib/services/chat-context.service';
 import { CompactionService } from '$lib/services/compaction.service';
-import { RetrievalService } from '$lib/services/retrieval.service';
+import { RetrievalService, type RecallSnapshot } from '$lib/services/retrieval.service';
 import { compactionStore } from '$lib/stores/compaction.svelte';
 import { streamIdentity } from '$lib/utils/stream-identity';
 import { getAuthHeaders } from '$lib/utils/api-headers';
@@ -62,6 +62,7 @@ import type {
 	DatabaseMessageExtra,
 	PrepareChatContextInput,
 	PreparedChatContext,
+	DatabaseRetrievalTrace,
 	CompactionMode
 } from '$lib/types';
 import {
@@ -77,13 +78,14 @@ interface ConversationStateEntry {
 	lastAccessed: number;
 }
 
-interface RecallSnapshot {
-	traceId?: string;
-	blocks: ChatContextBlock[];
-}
-
 interface PreparedConversationContext extends PreparedChatContext {
 	recallSnapshot: RecallSnapshot;
+	finalPromptTokenCount?: number;
+}
+
+interface RegenerationRecall {
+	snapshot: RecallSnapshot;
+	sourceTrace: DatabaseRetrievalTrace;
 }
 
 class ChatStore {
@@ -181,7 +183,11 @@ class ChatStore {
 				finalPromptTokenCount: fitted.finalTokens,
 				requestMessageCount: fitted.prepared.requestMessages.length
 			});
-			return { ...fitted.prepared, recallSnapshot };
+			return {
+				...fitted.prepared,
+				recallSnapshot: { ...recallSnapshot, blocks: fitted.blocks },
+				finalPromptTokenCount: fitted.finalTokens
+			};
 		}
 		if (!includeRecall || !messages.at(-1)?.id) {
 			return {
@@ -227,8 +233,7 @@ class ChatStore {
 					localResultLimit: Number(currentConfig.localRecallResultLimit) || 5,
 					localTokenBudget: Number(currentConfig.localRecallTokenBudget) || 1500,
 					totalTokenBudget: Number(currentConfig.totalRecallTokenBudget) || 2500,
-					semanticThreshold: Number(currentConfig.semanticRecallThreshold) || 0.62,
-					lexicalThreshold: Number(currentConfig.lexicalRecallThreshold) || 0.34
+					semanticThreshold: Number(currentConfig.semanticRecallThreshold) || 0.62
 				}
 			});
 			const fitted = await this.fitRecallBlocks(
@@ -256,7 +261,11 @@ class ChatStore {
 				finalPromptTokenCount: fitted.finalTokens,
 				requestMessageCount: fitted.prepared.requestMessages.length
 			});
-			return { ...fitted.prepared, recallSnapshot: selectedSnapshot };
+			return {
+				...fitted.prepared,
+				recallSnapshot: selectedSnapshot,
+				finalPromptTokenCount: fitted.finalTokens
+			};
 		} catch (error) {
 			memoryDebug('chat.context.recall-fallback', { conversationId, error });
 			console.warn('[ChatStore] Recall unavailable; continuing without recalled context:', error);
@@ -264,6 +273,52 @@ class ChatStore {
 				...(await ChatContextService.prepare(baseInput)),
 				recallSnapshot: { blocks: [] }
 			};
+		}
+	}
+
+	private async getRegenerationRecall(
+		conversationId: string,
+		responseMessageId: string
+	): Promise<RegenerationRecall | undefined> {
+		try {
+			const sourceTrace = await DatabaseService.getRetrievalTraceForResponse(
+				conversationId,
+				responseMessageId
+			);
+			if (!sourceTrace) {
+				memoryDebug('chat.regeneration.recall-fallback', {
+					conversationId,
+					responseMessageId,
+					reason: 'trace-not-found'
+				});
+				return undefined;
+			}
+			const snapshot = RetrievalService.snapshotFromTrace(sourceTrace);
+			if (!snapshot) {
+				memoryDebug('chat.regeneration.recall-fallback', {
+					conversationId,
+					responseMessageId,
+					traceId: sourceTrace.id,
+					reason: 'legacy-snapshot-unavailable'
+				});
+				return undefined;
+			}
+			memoryDebug('chat.regeneration.recall-ready', {
+				conversationId,
+				responseMessageId,
+				traceId: sourceTrace.id,
+				rootTraceId: snapshot.traceId,
+				contextBlockIds: snapshot.blocks.map((block) => block.id)
+			});
+			return { snapshot, sourceTrace };
+		} catch (error) {
+			memoryDebug('chat.regeneration.recall-fallback', {
+				conversationId,
+				responseMessageId,
+				reason: 'trace-load-failed',
+				error
+			});
+			return undefined;
 		}
 	}
 
@@ -1317,7 +1372,8 @@ class ChatStore {
 		onComplete?: (content: string) => Promise<void>,
 		onError?: (error: Error) => void,
 		modelOverride?: string | null,
-		firstUserMessageContent?: string
+		firstUserMessageContent?: string,
+		regenerationRecall?: RegenerationRecall
 	): Promise<void> {
 		// the ::model suffix in the stream identity is only for router mode, where it routes to the
 		// owning child. in single-model mode the identity stays the bare conv id so that attach, stop
@@ -1362,8 +1418,35 @@ class ChatStore {
 			assistantMessage.id,
 			effectiveModel,
 			!!apiOptions.excludeReasoningFromContext,
-			apiOptions
+			apiOptions,
+			true,
+			regenerationRecall?.snapshot
 		);
+		if (regenerationRecall) {
+			const reusedTrace = RetrievalService.buildReusedTrace(
+				regenerationRecall.sourceTrace,
+				assistantMessage.id,
+				preparedContext.contextBlockIds,
+				preparedContext.finalPromptTokenCount
+			);
+			try {
+				await DatabaseService.addRetrievalTrace(reusedTrace);
+				memoryDebug('chat.regeneration.trace-persisted', {
+					conversationId: assistantMessage.convId,
+					responseMessageId: assistantMessage.id,
+					traceId: reusedTrace.id,
+					reusedFromTraceId: reusedTrace.reusedFromTraceId,
+					contextBlockIds: preparedContext.contextBlockIds
+				});
+			} catch (error) {
+				memoryDebug('chat.regeneration.trace-persist-failed', {
+					conversationId: assistantMessage.convId,
+					responseMessageId: assistantMessage.id,
+					reusedFromTraceId: reusedTrace.reusedFromTraceId,
+					error
+				});
+			}
+		}
 		const preparedMessages = preparedContext.requestMessages;
 
 		// Mutable state for the current message being streamed
@@ -1953,6 +2036,7 @@ class ChatStore {
 		if (!result) return;
 		const { index: messageIndex } = result;
 		try {
+			const regenerationRecall = await this.getRegenerationRecall(activeConv.id, messageId);
 			const messagesToRemove = conversationsStore.activeMessages.slice(messageIndex);
 			for (const message of messagesToRemove) await DatabaseService.deleteMessage(message.id);
 			conversationsStore.sliceActiveMessages(messageIndex);
@@ -1967,7 +2051,12 @@ class ChatStore {
 			conversationsStore.addMessageToActive(assistantMessage);
 			await this.streamChatCompletion(
 				conversationsStore.activeMessages.slice(0, -1),
-				assistantMessage
+				assistantMessage,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				regenerationRecall
 			);
 		} catch (error) {
 			if (!isAbortError(error)) console.error('Failed to regenerate message:', error);
@@ -1984,6 +2073,7 @@ class ChatStore {
 			if (idx === -1) return;
 			const msg = conversationsStore.activeMessages[idx];
 			if (msg.role !== MessageRole.ASSISTANT) return;
+			const regenerationRecall = await this.getRegenerationRecall(activeConv.id, messageId);
 			const allMessages = await conversationsStore.getConversationMessages(activeConv.id);
 			const parentMessage = findMessageById(allMessages, msg.parent);
 			if (!parentMessage) return;
@@ -2016,7 +2106,9 @@ class ChatStore {
 				newAssistantMessage,
 				undefined,
 				undefined,
-				modelToUse
+				modelToUse,
+				undefined,
+				regenerationRecall
 			);
 		} catch (error) {
 			if (!isAbortError(error))

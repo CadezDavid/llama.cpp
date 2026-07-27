@@ -50,6 +50,7 @@ describe('CompactionRangeTimeline', () => {
 			selectedIndex: 0,
 			totalTokenCount: 500,
 			protectedTurns: 2,
+			protectedTokens: 100,
 			onSelect
 		});
 		const slider = screen.getByRole('slider', { name: 'Compact conversation through turn' });

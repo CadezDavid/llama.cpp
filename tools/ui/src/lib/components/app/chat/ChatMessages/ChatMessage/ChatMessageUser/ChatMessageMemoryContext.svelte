@@ -78,6 +78,7 @@
 			createdAt: new Date(trace.createdAt).toISOString(),
 			anchorMessageId: trace.anchorMessageId,
 			responseMessageId: trace.responseMessageId,
+			reusedFromTraceId: trace.reusedFromTraceId,
 			providers: trace.providers,
 			injectedTokenCount: trace.injectedTokenCount,
 			finalPromptTokenCount: trace.finalPromptTokenCount,
@@ -86,7 +87,6 @@
 					id,
 					source,
 					score,
-					lexicalScore,
 					semanticScore,
 					providerScore,
 					selected,
@@ -96,7 +96,6 @@
 					id,
 					source,
 					score,
-					lexicalScore,
 					semanticScore,
 					providerScore,
 					selected,
@@ -133,6 +132,12 @@
 							Copy safe diagnostics
 						</button>
 					</div>
+
+					{#if trace.reusedFromTraceId}
+						<div class="rounded border bg-background/50 p-2">
+							Reused the original memory selection; providers were not queried again.
+						</div>
+					{/if}
 
 					<div class="grid gap-1 rounded border bg-background/50 p-2">
 						<div class="font-medium text-foreground/80">Providers</div>

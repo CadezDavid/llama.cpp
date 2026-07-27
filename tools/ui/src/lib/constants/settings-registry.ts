@@ -485,7 +485,7 @@ const SETTINGS_REGISTRY: Record<string, SettingsSectionEntry> = {
 			{
 				key: SETTINGS_KEYS.SPOMIN_CANDIDATE_LIMIT,
 				label: 'Spomin candidate pool per channel',
-				help: 'Raw semantic and keyword candidates requested before WebUI ranking.',
+				help: 'Raw semantic candidates requested before WebUI ranking.',
 				defaultValue: 20,
 				type: SettingsFieldType.INPUT,
 				section: SETTINGS_SECTION_SLUGS.MEMORY,
@@ -579,14 +579,6 @@ const SETTINGS_REGISTRY: Record<string, SettingsSectionEntry> = {
 				label: 'Semantic recall threshold',
 				help: 'Minimum cosine similarity for a local semantic match.',
 				defaultValue: 0.62,
-				type: SettingsFieldType.INPUT,
-				section: SETTINGS_SECTION_SLUGS.MEMORY
-			},
-			{
-				key: SETTINGS_KEYS.LEXICAL_RECALL_THRESHOLD,
-				label: 'Lexical recall threshold',
-				help: 'Minimum query-term coverage for a local keyword match.',
-				defaultValue: 0.34,
 				type: SettingsFieldType.INPUT,
 				section: SETTINGS_SECTION_SLUGS.MEMORY
 			}

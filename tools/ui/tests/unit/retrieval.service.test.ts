@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MessageRole, MessageType } from '$lib/enums';
 import { DatabaseService } from '$lib/services/database.service';
 import { RetrievalService } from '$lib/services/retrieval.service';
-import type { DatabaseMessage } from '$lib/types';
+import type { DatabaseMessage, DatabaseRetrievalTrace } from '$lib/types';
 
 const settings = {
 	spominEnabled: false,
@@ -17,8 +17,7 @@ const settings = {
 	localResultLimit: 5,
 	localTokenBudget: 1500,
 	totalTokenBudget: 2500,
-	semanticThreshold: 0.62,
-	lexicalThreshold: 0.34
+	semanticThreshold: 0.62
 };
 
 const activeCompaction = {
@@ -40,8 +39,146 @@ function message(id: string, role: MessageRole, content: string): DatabaseMessag
 	};
 }
 
+function retrievalTrace(overrides: Partial<DatabaseRetrievalTrace> = {}): DatabaseRetrievalTrace {
+	return {
+		id: 'trace-1',
+		conversationId: 'chat-1',
+		anchorMessageId: 'user-1',
+		responseMessageId: 'assistant-1',
+		createdAt: 1,
+		query: 'current request',
+		queryFingerprint: 'fingerprint',
+		compactionGeneration: 1,
+		providers: {
+			local: { status: 'ok', detail: 'semantic' },
+			spomin: { status: 'ok', detail: 'semantic' }
+		},
+		hits: [],
+		injectedHitIds: [],
+		injectedTokenCount: 0,
+		...overrides
+	};
+}
+
 describe('RetrievalService', () => {
 	afterEach(() => vi.restoreAllMocks());
+
+	it('reconstructs an immutable recall snapshot in injected order', () => {
+		const trace = retrievalTrace({
+			reusedFromTraceId: 'root-trace',
+			hits: [
+				{
+					id: 'memory-1',
+					source: 'long-term-memory',
+					score: 0.9,
+					selected: true,
+					contentSnapshot: 'First memory',
+					provenance: { chunkId: 'chunk-1' }
+				},
+				{
+					id: 'memory-2',
+					source: 'conversation-recall',
+					score: 0.8,
+					selected: true,
+					contentSnapshot: 'Second memory'
+				}
+			],
+			injectedHitIds: ['memory-2', 'memory-1']
+		});
+
+		expect(RetrievalService.snapshotFromTrace(trace)).toEqual({
+			traceId: 'root-trace',
+			blocks: [
+				{
+					id: 'memory-2',
+					source: 'conversation-recall',
+					content: 'Second memory',
+					provenance: undefined
+				},
+				{
+					id: 'memory-1',
+					source: 'long-term-memory',
+					content: 'First memory',
+					provenance: { chunkId: 'chunk-1' }
+				}
+			]
+		});
+	});
+
+	it('reuses an empty result but rejects legacy injected hits without snapshots', () => {
+		expect(RetrievalService.snapshotFromTrace(retrievalTrace())).toEqual({
+			traceId: 'trace-1',
+			blocks: []
+		});
+		expect(
+			RetrievalService.snapshotFromTrace(
+				retrievalTrace({
+					hits: [
+						{
+							id: 'legacy',
+							source: 'conversation-recall',
+							score: 0.8,
+							selected: true
+						}
+					],
+					injectedHitIds: ['legacy']
+				})
+			)
+		).toBeNull();
+	});
+
+	it('builds a diagnostic trace without recording a new provider selection', () => {
+		const source = retrievalTrace({
+			hits: [
+				{
+					id: 'memory-1',
+					source: 'long-term-memory',
+					score: 0.9,
+					selected: true,
+					tokenCount: 20,
+					contentSnapshot: 'First memory'
+				},
+				{
+					id: 'memory-2',
+					source: 'conversation-recall',
+					score: 0.8,
+					selected: true,
+					tokenCount: 30,
+					contentSnapshot: 'Second memory'
+				},
+				{
+					id: 'skipped',
+					source: 'conversation-recall',
+					score: 0.2,
+					selected: false,
+					reason: 'below-threshold'
+				}
+			],
+			injectedHitIds: ['memory-1', 'memory-2'],
+			injectedTokenCount: 50
+		});
+
+		const reused = RetrievalService.buildReusedTrace(source, 'assistant-2', ['memory-1'], 1234);
+
+		expect(reused).toMatchObject({
+			conversationId: 'chat-1',
+			responseMessageId: 'assistant-2',
+			reusedFromTraceId: 'trace-1',
+			injectedHitIds: ['memory-1'],
+			injectedTokenCount: 20,
+			finalPromptTokenCount: 1234
+		});
+		expect(reused.id).not.toBe(source.id);
+		expect(reused.hits).toEqual([
+			expect.objectContaining({ id: 'memory-1', selected: true, reason: undefined }),
+			expect.objectContaining({
+				id: 'memory-2',
+				selected: false,
+				reason: 'exact-prompt-budget'
+			}),
+			expect.objectContaining({ id: 'skipped', selected: false, reason: 'below-threshold' })
+		]);
+	});
 
 	it('does not inspect retained archives or call embeddings without an active compaction', async () => {
 		const archiveLookup = vi
@@ -85,7 +222,7 @@ describe('RetrievalService', () => {
 		});
 	});
 
-	it('identifies an embedding timeout while keeping lexical recall available', async () => {
+	it('reports an embedding timeout without injecting local recall', async () => {
 		vi.spyOn(DatabaseService, 'getConversationArchiveChunks').mockResolvedValue([
 			{
 				id: 'chunk-1',
@@ -112,10 +249,10 @@ describe('RetrievalService', () => {
 			settings
 		});
 
-		expect(result.blocks).toHaveLength(1);
+		expect(result.blocks).toEqual([]);
 		expect(result.trace.providers.local).toEqual({
-			status: 'ok',
-			detail: 'lexical-only - embedding timed out'
+			status: 'timeout',
+			detail: 'AbortError: The operation was aborted.'
 		});
 	});
 
@@ -199,11 +336,11 @@ describe('RetrievalService', () => {
 		expect(result.trace.hits.map((hit) => hit.id)).not.toContain('local:restored-stale');
 		expect(result.trace.providers.local).toEqual({
 			status: 'ok',
-			detail: 'lexical+semantic'
+			detail: 'semantic'
 		});
 	});
 
-	it('uses recent conversation context and returns matching archive blocks', async () => {
+	it('returns archive blocks from semantic similarity', async () => {
 		vi.spyOn(DatabaseService, 'getConversationArchiveChunks').mockResolvedValue([
 			{
 				id: 'chunk-1',
@@ -214,11 +351,18 @@ describe('RetrievalService', () => {
 				text: 'user: The database choice was SQLite for local storage.',
 				terms: ['the', 'database', 'choice', 'was', 'sqlite', 'for', 'local', 'storage'],
 				createdAt: Date.now(),
+				embedding: [1, 0],
 				embeddingStatus: 'ready'
 			}
 		]);
 		vi.spyOn(DatabaseService, 'getRetrievalHitUsage').mockResolvedValue([]);
 		vi.spyOn(DatabaseService, 'updateArchiveChunk').mockResolvedValue();
+		vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+			new Response(JSON.stringify({ data: [{ index: 0, embedding: [1, 0] }] }), {
+				status: 200,
+				headers: { 'content-type': 'application/json' }
+			})
+		);
 
 		const result = await RetrievalService.prepare({
 			conversationId: 'chat-1',
@@ -237,7 +381,7 @@ describe('RetrievalService', () => {
 			id: 'local:chunk-1',
 			source: 'conversation-recall'
 		});
-		expect(result.trace.query).toContain('We discussed local persistence');
+		expect(result.trace.query).toBe('Current user request:\nWhich database did we choose?');
 		expect(result.trace.providers.spomin.status).toBe('disabled');
 	});
 
@@ -323,6 +467,7 @@ describe('RetrievalService', () => {
 				text: 'The local database choice was SQLite.',
 				terms: ['local', 'database', 'choice', 'was', 'sqlite'],
 				createdAt: Date.now(),
+				embedding: [1, 0],
 				embeddingStatus: 'ready'
 			}
 		]);
@@ -333,13 +478,20 @@ describe('RetrievalService', () => {
 				hitId: 'local:chunk-1',
 				source: 'conversation-recall',
 				lastInjectedUserTurn: 1,
-				queryFingerprint: 'old-hash',
-				queryTerms: ['database', 'choice', 'applies', 'locally'],
-				score: 0.75,
+				queryFingerprint: await RetrievalService.fingerprint(
+					'Current user request:\nWhich database choice applies locally?'
+				),
+				score: 0.9,
 				compactionGeneration: 1,
 				updatedAt: Date.now()
 			}
 		]);
+		vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+			new Response(JSON.stringify({ data: [{ index: 0, embedding: [1, 0] }] }), {
+				status: 200,
+				headers: { 'content-type': 'application/json' }
+			})
+		);
 
 		const result = await RetrievalService.prepare({
 			conversationId: 'chat-1',
@@ -371,10 +523,17 @@ describe('RetrievalService', () => {
 				text: 'The local database choice was SQLite.',
 				terms: ['local', 'database', 'choice', 'was', 'sqlite'],
 				createdAt: Date.now(),
+				embedding: [1, 0],
 				embeddingStatus: 'ready'
 			}
 		]);
 		vi.spyOn(DatabaseService, 'getRetrievalHitUsage').mockResolvedValue([]);
+		vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+			new Response(JSON.stringify({ data: [{ index: 0, embedding: [1, 0] }] }), {
+				status: 200,
+				headers: { 'content-type': 'application/json' }
+			})
+		);
 
 		const result = await RetrievalService.prepare({
 			conversationId: 'chat-1',
@@ -392,7 +551,7 @@ describe('RetrievalService', () => {
 		});
 	});
 
-	it('applies semantic and lexical thresholds independently to Spomin results', async () => {
+	it('applies the semantic threshold to Spomin results', async () => {
 		vi.spyOn(DatabaseService, 'getConversationArchiveChunks').mockResolvedValue([]);
 		vi.spyOn(DatabaseService, 'getRetrievalHitUsage').mockResolvedValue([]);
 		vi.spyOn(globalThis, 'fetch').mockResolvedValue(
@@ -411,29 +570,15 @@ describe('RetrievalService', () => {
 								created_at: new Date().toISOString(),
 								semantic_score: 0.5,
 								memory_ids: ['below-thresholds']
-							}
-						]
-					},
-					keyword: {
-						status: 'complete',
-						results: [
-							{
-								id: 'below-thresholds',
-								text: 'Do not include this result.',
-								source: 'test',
-								tier: 'archive',
-								created_at: new Date().toISOString(),
-								lexical_coverage: 0.1,
-								memory_ids: ['below-thresholds']
 							},
 							{
-								id: 'lexical-match',
+								id: 'semantic-match',
 								text: 'SQLite was selected for the local database.',
 								source: 'test',
 								tier: 'archive',
 								created_at: new Date().toISOString(),
-								lexical_coverage: 0.4,
-								memory_ids: ['lexical-match']
+								semantic_score: 0.8,
+								memory_ids: ['semantic-match']
 							}
 						]
 					}
@@ -450,17 +595,16 @@ describe('RetrievalService', () => {
 		});
 
 		expect(result.blocks).toHaveLength(1);
-		expect(result.blocks[0].id).toBe('spomin:lexical-match');
+		expect(result.blocks[0].id).toBe('spomin:semantic-match');
 		expect(result.trace.providers.spomin.detail).toBe(
-			'raw-semantic+keyword; semantic=1; keyword=2; merged=2; profile=profile-1'
+			'semantic; semantic=2; profile=profile-1'
 		);
 		expect(result.trace.hits).toContainEqual(
 			expect.objectContaining({
 				id: 'spomin:below-thresholds',
 				selected: false,
 				reason: 'below-threshold',
-				semanticScore: 0.5,
-				lexicalScore: 0.1
+				semanticScore: 0.5
 			})
 		);
 	});
@@ -473,8 +617,7 @@ describe('RetrievalService', () => {
 				JSON.stringify({
 					query: 'salary debts June',
 					profile: null,
-					semantic: { status: 'complete', results: [] },
-					keyword: { status: 'complete', results: [] }
+					semantic: { status: 'complete', results: [] }
 				}),
 				{ status: 200, headers: { 'content-type': 'application/json' } }
 			)
@@ -496,7 +639,7 @@ describe('RetrievalService', () => {
 		expect(result.blocks).toEqual([]);
 		expect(result.trace.providers.spomin).toEqual({
 			status: 'ok',
-			detail: 'no-results; semantic=0; keyword=0; merged=0'
+			detail: 'no-results; semantic=0'
 		});
 	});
 
@@ -521,8 +664,7 @@ describe('RetrievalService', () => {
 								memory_ids: ['weak']
 							}
 						]
-					},
-					keyword: { status: 'complete', results: [] }
+					}
 				}),
 				{ status: 200, headers: { 'content-type': 'application/json' } }
 			)
@@ -544,7 +686,7 @@ describe('RetrievalService', () => {
 		expect(result.blocks).toEqual([]);
 		expect(result.trace.providers.spomin).toEqual({
 			status: 'ok',
-			detail: 'all-below-threshold; semantic=1; keyword=0; merged=1'
+			detail: 'all-below-threshold; semantic=1'
 		});
 		expect(result.trace.hits[0]).toMatchObject({
 			id: 'spomin:weak',

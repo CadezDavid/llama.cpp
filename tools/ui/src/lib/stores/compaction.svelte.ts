@@ -66,6 +66,8 @@ class CompactionStore {
 	contextSize = $state(0);
 	beforeTokenCount = $state(0);
 	sourceTokenCount = $state(0);
+	protectedTurnCount = $state(0);
+	protectedTokenCount = $state(0);
 	projectedTokenCount = $state(0);
 	restoredTokenCount = $state(0);
 	summary = $state('');
@@ -206,6 +208,8 @@ class CompactionStore {
 		this.error = null;
 		this.validationErrors = [];
 		this.summary = '';
+		this.protectedTurnCount = 0;
+		this.protectedTokenCount = 0;
 		this.projectedTokenCount = 0;
 		this.preflightInput = input;
 		this.messages = [...input.messages];
@@ -245,11 +249,13 @@ class CompactionStore {
 			});
 			if (!this.preflightMeasurement.triggered) return;
 
-			const protectedTurns = await this.resolveProtectedTurnCount(this.policy);
+			const protectedTail = await this.resolveProtectedTail(this.policy);
+			this.protectedTurnCount = protectedTail.turnCount;
+			this.protectedTokenCount = protectedTail.tokenCount;
 			this.candidates = CompactionService.buildRangeCandidates(
 				this.messages,
 				this.activeCompaction?.record,
-				protectedTurns
+				protectedTail.turnCount
 			);
 			if (this.candidates.length === 0) {
 				throw new Error('There are not enough complete old turns to compact safely');
@@ -259,7 +265,8 @@ class CompactionStore {
 			}
 			memoryDebug('compaction.candidates.measured', {
 				conversationId: input.conversationId,
-				protectedTurns,
+				protectedTurns: protectedTail.turnCount,
+				protectedTokens: protectedTail.tokenCount,
 				candidateCount: this.candidates.length,
 				candidates: this.candidates.map((candidate) => ({
 					endMessageId: candidate.endMessageId,
@@ -291,16 +298,37 @@ class CompactionStore {
 		}
 	}
 
-	private async resolveProtectedTurnCount(policy: CompactionPolicy): Promise<number> {
+	private measurementOptions(): SettingsChatServiceOptions {
+		return (
+			this.preflightInput?.measurementOptions ?? {
+				excludeReasoningFromContext: !!config().excludeReasoningFromContext
+			}
+		);
+	}
+
+	private async measureMessages(messages: DatabaseMessage[]): Promise<number> {
+		const options = this.measurementOptions();
+		const prepared = await ChatService.prepareMessages(messages, {
+			model: this.model,
+			excludeReasoning: !!options.excludeReasoningFromContext
+		});
+		return (
+			await ChatService.measurePrompt(prepared, {
+				model: this.model,
+				enableThinking: options.enableThinking
+			})
+		).tokenCount;
+	}
+
+	private async resolveProtectedTail(
+		policy: CompactionPolicy
+	): Promise<{ turnCount: number; tokenCount: number }> {
 		const complete = CompactionService.groupTurns(this.messages).filter((turn) => turn.complete);
 		let protectedCount = 0;
 		let protectedTokens = 0;
 		for (let index = complete.length - 1; index >= 0; index--) {
-			const turn = complete[index];
-			const turnMessages = this.messages.slice(turn.startIndex, turn.endIndex + 1);
-			protectedTokens += await ChatService.tokenizePrompt(
-				CompactionService.serializeMessages(turnMessages),
-				this.model
+			protectedTokens = await this.measureMessages(
+				this.messages.slice(complete[index].startIndex, complete.at(-1)!.endIndex + 1)
 			);
 			protectedCount++;
 			if (
@@ -310,7 +338,7 @@ class CompactionStore {
 				break;
 			}
 		}
-		return protectedCount;
+		return { turnCount: protectedCount, tokenCount: protectedTokens };
 	}
 
 	private async measureCandidate(index: number): Promise<void> {
@@ -319,10 +347,7 @@ class CompactionStore {
 		const source = this.messages.filter((message) =>
 			candidate.sourceMessageIds.includes(message.id)
 		);
-		candidate.sourceTokenCount = await ChatService.tokenizePrompt(
-			CompactionService.serializeMessages(source),
-			this.model
-		);
+		candidate.sourceTokenCount = await this.measureMessages(source);
 	}
 
 	private async runAutomaticCompaction(): Promise<boolean> {
@@ -579,10 +604,14 @@ class CompactionStore {
 			this.projectedTokenCount = this.activeCompaction.record.projectedTokenCount;
 			const restored = await ChatContextService.prepare({
 				transcriptMessages: this.messages,
-				model: this.model
+				model: this.model,
+				excludeReasoning: !!this.measurementOptions().excludeReasoningFromContext
 			});
 			this.restoredTokenCount = (
-				await ChatService.measurePrompt(restored.stableMessages, { model: this.model })
+				await ChatService.measurePrompt(restored.stableMessages, {
+					...this.measurementOptions(),
+					model: this.model
+				})
 			).tokenCount;
 		}
 	}
@@ -604,6 +633,8 @@ class CompactionStore {
 		this.error = null;
 		this.validationErrors = [];
 		this.summary = '';
+		this.protectedTurnCount = 0;
+		this.protectedTokenCount = 0;
 		this.projectedTokenCount = 0;
 		try {
 			const conversation = conversationsStore.activeConversation;
@@ -634,16 +665,22 @@ class CompactionStore {
 			const prepared = await ChatContextService.prepare({
 				transcriptMessages: this.messages,
 				model: this.model,
+				excludeReasoning: !!this.measurementOptions().excludeReasoningFromContext,
 				projections: projection
 			});
 			this.beforeTokenCount = (
-				await ChatService.measurePrompt(prepared.stableMessages, { model: this.model })
+				await ChatService.measurePrompt(prepared.stableMessages, {
+					...this.measurementOptions(),
+					model: this.model
+				})
 			).tokenCount;
-			const protectedTurns = await this.resolveProtectedTurnCount(this.policy);
+			const protectedTail = await this.resolveProtectedTail(this.policy);
+			this.protectedTurnCount = protectedTail.turnCount;
+			this.protectedTokenCount = protectedTail.tokenCount;
 			this.candidates = CompactionService.buildRangeCandidates(
 				this.messages,
 				this.activeCompaction?.record,
-				protectedTurns
+				protectedTail.turnCount
 			);
 			if (this.mode === 'create') {
 				if (this.candidates.length === 0) {
@@ -776,6 +813,7 @@ class CompactionStore {
 			const prepared = await ChatContextService.prepare({
 				transcriptMessages: this.messages,
 				model: this.model,
+				excludeReasoning: !!this.measurementOptions().excludeReasoningFromContext,
 				projections: [
 					{
 						id: pending.id,
@@ -786,7 +824,10 @@ class CompactionStore {
 				]
 			});
 			this.projectedTokenCount = (
-				await ChatService.measurePrompt(prepared.stableMessages, { model: this.model })
+				await ChatService.measurePrompt(prepared.stableMessages, {
+					...this.measurementOptions(),
+					model: this.model
+				})
 			).tokenCount;
 			const savings = this.beforeTokenCount - this.projectedTokenCount;
 			if (savings < this.budget.minimumSavingsTokens) {

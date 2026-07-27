@@ -8,6 +8,7 @@
 	} from '$lib/stores/models.svelte';
 	import { isRouterMode, serverError } from '$lib/stores/server.svelte';
 	import { ModelsSelectorDropdown, ModelsSelectorSheet } from '$lib/components/app';
+	import { isModelSelectionAvailable } from '$lib/components/app/models/utils';
 	import { isMobile } from '$lib/stores/viewport.svelte';
 	import { activeMessages } from '$lib/stores/conversations.svelte';
 
@@ -143,16 +144,12 @@
 	$effect(() => {
 		if (!isRouter) {
 			isSelectedModelInCache = true;
-		} else if (conversationModel) {
-			isSelectedModelInCache = modelOptions().some((option) => option.model === conversationModel);
 		} else {
-			const currentModelId = selectedModelId();
-
-			if (!currentModelId) {
-				isSelectedModelInCache = false;
-			} else {
-				isSelectedModelInCache = modelOptions().some((option) => option.id === currentModelId);
-			}
+			isSelectedModelInCache = isModelSelectionAvailable(
+				modelOptions(),
+				selectedModelId(),
+				conversationModel
+			);
 		}
 	});
 

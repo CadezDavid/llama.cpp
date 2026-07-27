@@ -7,11 +7,19 @@
 		selectedIndex: number;
 		totalTokenCount: number;
 		protectedTurns: number;
+		protectedTokens: number;
 		onSelect: (index: number) => void;
 	}
 
-	let { candidates, messages, selectedIndex, totalTokenCount, protectedTurns, onSelect }: Props =
-		$props();
+	let {
+		candidates,
+		messages,
+		selectedIndex,
+		totalTokenCount,
+		protectedTurns,
+		protectedTokens,
+		onSelect
+	}: Props = $props();
 
 	let track: HTMLDivElement | null = $state(null);
 	let dragging = $state(false);
@@ -115,7 +123,7 @@
 					<div
 						class="absolute right-0 top-0 h-full rounded-r-full bg-amber-500/25"
 						style:width={`${protectedPercent}%`}
-						title={`${protectedTurns} recent turns remain literal`}
+						title={`${protectedTurns} recent turns remain literal (${protectedTokens.toLocaleString()} tokens)`}
 					></div>
 				{/if}
 			</div>
@@ -140,7 +148,7 @@
 
 		<div class="grid grid-cols-2 gap-3 rounded-md border bg-muted/20 p-3 text-sm sm:grid-cols-4">
 			<div>
-				<div class="text-muted-foreground">Compact</div>
+				<div class="text-muted-foreground">Replace history through</div>
 				{selected.turnCount} turns
 			</div>
 			<div>
@@ -148,12 +156,12 @@
 				{selected.sourceMessageIds.length}
 			</div>
 			<div>
-				<div class="text-muted-foreground">Source tokens</div>
+				<div class="text-muted-foreground">Original history selected</div>
 				{selected.sourceTokenCount.toLocaleString()}
 			</div>
 			<div>
 				<div class="text-muted-foreground">Recent history kept</div>
-				{protectedTurns}+ turns
+				{protectedTurns} turns / {protectedTokens.toLocaleString()} tokens
 			</div>
 		</div>
 

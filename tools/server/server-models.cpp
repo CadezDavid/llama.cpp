@@ -137,6 +137,7 @@ static void unset_reserved_args(common_preset & preset, bool unset_model_args) {
     preset.unset_option("LLAMA_API_KEY");
     preset.unset_option("LLAMA_ARG_MODELS_DIR");
     preset.unset_option("LLAMA_ARG_MODELS_MAX");
+    preset.unset_option("LLAMA_ARG_MODELS_GROUP_LIMITS");
     preset.unset_option("LLAMA_ARG_MODELS_PRESET");
     preset.unset_option("LLAMA_ARG_MODELS_AUTOLOAD");
     if (unset_model_args) {
@@ -259,6 +260,24 @@ server_models::server_models(
     load_models();
 }
 
+std::string server_models::get_model_group(
+        const common_preset & preset,
+        const std::string & model_name) const {
+    std::string model_group;
+    if (!preset.get_option(COMMON_ARG_PRESET_MODEL_GROUP, model_group)) {
+        return {};
+    }
+
+    model_group = string_strip(model_group);
+    if (model_group.empty()) {
+        throw std::runtime_error("model-group cannot be empty for model '" + model_name + "'");
+    }
+    if (base_params.models_group_limits.find(model_group) == base_params.models_group_limits.end()) {
+        throw std::runtime_error("model '" + model_name + "' references undeclared model-group '" + model_group + "'");
+    }
+    return model_group;
+}
+
 void server_models::add_model(server_model_meta && meta) {
     if (mapping.find(meta.name) != mapping.end()) {
         throw std::runtime_error(string_format("model '%s' appears multiple times", meta.name.c_str()));
@@ -293,6 +312,8 @@ void server_models::add_model(server_model_meta && meta) {
             }
         }
     }
+
+    meta.model_group = get_model_group(meta.preset, meta.name);
 
     // validate aliases do not conflict with existing names or aliases
     for (const auto & alias : meta.aliases) {
@@ -381,6 +402,11 @@ void server_models::load_models() {
         preset.merge(base_preset);
     }
 
+    std::map<std::string, std::string> model_groups;
+    for (const auto & [name, preset] : final_presets) {
+        model_groups[name] = get_model_group(preset, name);
+    }
+
     auto get_source = [&](const std::string & name) {
         return source_map.count(name) ? source_map.at(name) : SERVER_MODEL_SOURCE_PRESET;
     };
@@ -403,6 +429,7 @@ void server_models::load_models() {
             std::string info;
             if (!inst.meta.aliases.empty()) info += " (aliases: " + join_set(inst.meta.aliases) + ")";
             if (!inst.meta.tags.empty())    info += " [tags: "    + join_set(inst.meta.tags)    + "]";
+            if (!inst.meta.model_group.empty()) info += " [group: " + inst.meta.model_group + "]";
             SRV_INF("  %c %s%s\n", has_custom ? '*' : ' ', name.c_str(), info.c_str());
         }
     };
@@ -446,6 +473,7 @@ void server_models::load_models() {
                 /* name          */ name,
                 /* aliases       */ {},
                 /* tags          */ {},
+                /* model_group   */ {},
                 /* port          */ 0,
                 /* status        */ SERVER_MODEL_STATUS_UNLOADED,
                 /* last_used     */ 0,
@@ -469,10 +497,25 @@ void server_models::load_models() {
                 models_to_load.push_back(name);
             }
         }
-        if ((int)models_to_load.size() > base_params.models_max) {
+        if (base_params.models_max > 0 && (int) models_to_load.size() > base_params.models_max) {
             throw std::runtime_error(string_format(
                 "number of models to load on startup (%zu) exceeds models_max (%d)",
                 models_to_load.size(), base_params.models_max));
+        }
+        std::map<std::string, size_t> group_counts;
+        for (const auto & name : models_to_load) {
+            const auto & group = mapping.at(name).meta.model_group;
+            if (!group.empty()) {
+                group_counts[group]++;
+            }
+        }
+        for (const auto & [group, count] : group_counts) {
+            const int limit = base_params.models_group_limits.at(group);
+            if (count > (size_t) limit) {
+                throw std::runtime_error(string_format(
+                    "number of models to load on startup in group '%s' (%zu) exceeds its limit (%d)",
+                    group.c_str(), count, limit));
+            }
         }
 
         lk.unlock();
@@ -604,6 +647,8 @@ void server_models::load_models() {
                 }
             }
 
+            inst.meta.model_group = model_groups.at(name);
+
             inst.meta.exit_code = 0; // clear failed state so the model can be reloaded
             inst.meta.update_args(ctx_preset, bin_path);
             inst.meta.update_caps();
@@ -619,6 +664,7 @@ void server_models::load_models() {
                     /* name          */ name,
                     /* aliases       */ {},
                     /* tags          */ {},
+                    /* model_group   */ {},
                     /* port          */ 0,
                     /* status        */ SERVER_MODEL_STATUS_UNLOADED,
                     /* last_used     */ 0,
@@ -736,36 +782,53 @@ std::vector<server_model_meta> server_models::get_all_meta() {
     return result;
 }
 
-void server_models::unload_lru() {
-    if (base_params.models_max <= 0) {
-        return; // no limit
-    }
-    // remove one of the servers if we passed the models_max (least recently used - LRU)
-    std::string lru_model_name = "";
-    int64_t lru_last_used = ggml_time_ms();
-    size_t count_active = 0;
-    {
-        std::unique_lock<std::mutex> lk(mutex);
-        for (const auto & m : mapping) {
-            if (m.second.meta.is_running()) {
-                count_active++;
-                if (m.second.meta.last_used < lru_last_used) {
-                    lru_model_name = m.first;
-                    lru_last_used = m.second.meta.last_used;
+void server_models::ensure_capacity(const std::string & model_group) {
+    auto enforce_limit = [this](
+            const std::optional<std::string> & group,
+            size_t limit,
+            const std::string & label) {
+        while (true) {
+            std::string lru_model_name;
+            int64_t lru_last_used = ggml_time_ms();
+            size_t count_active = 0;
+            {
+                std::lock_guard<std::mutex> lk(mutex);
+                for (const auto & [name, inst] : mapping) {
+                    if (!inst.meta.is_running() || (group.has_value() && inst.meta.model_group != *group)) {
+                        continue;
+                    }
+                    count_active++;
+                    if (inst.meta.last_used < lru_last_used) {
+                        lru_model_name = name;
+                        lru_last_used = inst.meta.last_used;
+                    }
                 }
             }
-        }
-    }
-    if (!lru_model_name.empty() && count_active >= (size_t)base_params.models_max) {
-        SRV_INF("models_max limit reached, removing LRU name=%s\n", lru_model_name.c_str());
-        unload(lru_model_name);
-        // wait for unload to complete
-        {
+
+            if (count_active < limit) {
+                return;
+            }
+            if (lru_model_name.empty()) {
+                throw std::runtime_error(label + " limit reached, no model can be unloaded");
+            }
+
+            SRV_INF("%s limit reached, removing LRU name=%s\n", label.c_str(), lru_model_name.c_str());
+            unload(lru_model_name);
             std::unique_lock<std::mutex> lk(mutex);
             cv.wait(lk, [this, &lru_model_name]() {
-                return mapping[lru_model_name].meta.status == SERVER_MODEL_STATUS_UNLOADED;
+                auto it = mapping.find(lru_model_name);
+                return it == mapping.end() || !it->second.meta.is_running();
             });
         }
+    };
+
+    if (!model_group.empty()) {
+        auto it = base_params.models_group_limits.find(model_group);
+        GGML_ASSERT(it != base_params.models_group_limits.end());
+        enforce_limit(model_group, it->second, "model group '" + model_group + "'");
+    }
+    if (base_params.models_max > 0) {
+        enforce_limit(std::nullopt, base_params.models_max, "models_max");
     }
 }
 
@@ -774,11 +837,30 @@ void server_models::load(const std::string & name) {
 }
 
 void server_models::load(const std::string & name, const load_options & opts) {
+    std::unique_lock<std::mutex> load_lk(load_mutex, std::defer_lock);
+
     if (!opts.custom_meta.has_value()) {
-        if (!has_model(name)) {
+        auto target_meta = get_meta(name);
+        if (!target_meta.has_value()) {
             throw std::runtime_error("model name=" + name + " is not found");
         }
-        unload_lru();
+        if (target_meta->status != SERVER_MODEL_STATUS_UNLOADED) {
+            SRV_INF("model %s is not ready\n", name.c_str());
+            return;
+        }
+
+        load_lk.lock();
+        target_meta = get_meta(name);
+        if (!target_meta.has_value()) {
+            throw std::runtime_error("model name=" + name + " is not found");
+        }
+        if (target_meta->status != SERVER_MODEL_STATUS_UNLOADED) {
+            SRV_INF("model %s is not ready\n", name.c_str());
+            return;
+        }
+        ensure_capacity(target_meta->model_group);
+    } else {
+        load_lk.lock();
     }
 
     std::unique_lock<std::mutex> lk(mutex);
@@ -973,7 +1055,10 @@ void server_models::load(const std::string & name, const load_options & opts) {
             old_instance.subproc->terminate(); // force kill
         }
         if (old_instance.th.joinable()) {
-            old_instance.th.join();
+            std::thread old_thread = std::move(old_instance.th);
+            lk.unlock();
+            old_thread.join();
+            lk.lock();
         }
     }
 
@@ -1586,6 +1671,7 @@ void server_models_routes::init_routes() {
                 // TODO: add support for this on web UI
                 {"role",                 "router"},
                 {"max_instances",        params.models_max},
+                {"model_group_limits",   params.models_group_limits},
                 {"models_autoload",      params.models_autoload},
                 // this is a dummy response to make sure the UI doesn't break
                 {"model_alias", "llama-server"},
@@ -1702,6 +1788,7 @@ void server_models_routes::init_routes() {
                 {"id",            meta.name},
                 {"aliases",       meta.aliases},
                 {"tags",          meta.tags},
+                {"group",         meta.model_group},
                 {"object",        "model"},    // for OAI-compat
                 {"owned_by",      "llamacpp"}, // for OAI-compat
                 {"created",       t},          // for OAI-compat

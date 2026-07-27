@@ -2,15 +2,14 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MessageRole, MessageType } from '$lib/enums';
 import { CompactionService } from '$lib/services/compaction.service';
 import { DatabaseService } from '$lib/services/database.service';
-import { RetrievalService, type RetrievalPreparation } from '$lib/services/retrieval.service';
+import {
+	RetrievalService,
+	type RecallSnapshot,
+	type RetrievalPreparation
+} from '$lib/services/retrieval.service';
 import { chatStore } from '$lib/stores/chat.svelte';
 import { settingsStore } from '$lib/stores/settings.svelte';
 import type { ChatContextBlock, DatabaseMessage, PreparedChatContext } from '$lib/types';
-
-interface RecallSnapshot {
-	traceId?: string;
-	blocks: ChatContextBlock[];
-}
 
 type PrepareConversationContext = (
 	conversationId: string,

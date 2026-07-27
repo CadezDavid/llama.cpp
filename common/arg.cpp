@@ -3441,6 +3441,40 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MODELS_MAX"));
     add_opt(common_arg(
+        {"--models-group-limits"}, "GROUP=N,...",
+        "for router server, maximum number of simultaneously loaded models per named group",
+        [](common_params & params, const std::string & value) {
+            std::map<std::string, int> limits;
+            for (const auto & entry : string_split<std::string>(value, ',')) {
+                const auto separator = entry.find('=');
+                if (separator == std::string::npos || separator == 0 || separator + 1 == entry.size()) {
+                    throw std::invalid_argument("expected GROUP=N entries");
+                }
+
+                const std::string name = entry.substr(0, separator);
+                if (!std::isalnum((unsigned char) name.front()) ||
+                        std::any_of(name.begin(), name.end(), [](unsigned char c) {
+                            return !std::isalnum(c) && c != '.' && c != '_' && c != '-';
+                        })) {
+                    throw std::invalid_argument("invalid model group name: " + name);
+                }
+
+                size_t parsed = 0;
+                const int limit = std::stoi(entry.substr(separator + 1), &parsed);
+                if (parsed != entry.size() - separator - 1 || limit <= 0) {
+                    throw std::invalid_argument("model group limit must be a positive integer");
+                }
+                if (!limits.emplace(name, limit).second) {
+                    throw std::invalid_argument("duplicate model group: " + name);
+                }
+            }
+            if (limits.empty()) {
+                throw std::invalid_argument("at least one model group limit is required");
+            }
+            params.models_group_limits = std::move(limits);
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MODELS_GROUP_LIMITS"));
+    add_opt(common_arg(
         {"--models-autoload"},
         {"--no-models-autoload"},
         string_format("for router server, whether to automatically load models (default: %s)", params.models_autoload ? "enabled" : "disabled"),
@@ -4519,9 +4553,9 @@ void common_params_add_preset_options(std::vector<common_arg> & args) {
         [](common_params &, int) { /* unused */ }
     ).set_env(COMMON_ARG_PRESET_STOP_TIMEOUT).set_preset_only());
 
-    // args.push_back(common_arg(
-    //     {"pin"},
-    //     "in server router mode, do not unload this model if models_max is exceeded",
-    //     [](common_params &) { /* unused */ }
-    // ).set_preset_only());
+    args.push_back(common_arg(
+        {"model-group"}, "NAME",
+        "in server router mode, assign this model to a capacity group",
+        [](common_params &, const std::string &) { /* unused */ }
+    ).set_env(COMMON_ARG_PRESET_MODEL_GROUP).set_preset_only());
 }

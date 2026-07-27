@@ -145,6 +145,98 @@ def test_router_models_max_evicts_lru():
     assert _get_model_status(first) == "unloaded"
 
 
+def test_router_model_groups_evict_within_group():
+    global server
+
+    os.makedirs(TMP_DIR, exist_ok=True)
+    preset_path = os.path.join(TMP_DIR, "test_model_groups.ini")
+    with open(preset_path, "w") as f:
+        f.write(
+            "[generation-a]\n"
+            "hf-repo = ggml-org/test-model-stories260K\n"
+            "model-group = generation\n"
+            "\n"
+            "[generation-b]\n"
+            "hf-repo = ggml-org/test-model-stories260K-infill\n"
+            "model-group = generation\n"
+            "\n"
+            "[auxiliary]\n"
+            "hf-repo = ggml-org/tinygemma3-GGUF:Q8_0\n"
+            "model-group = auxiliary\n"
+        )
+
+    server.models_max = 2
+    server.models_group_limits = "generation=1,auxiliary=1"
+    server.models_preset = preset_path
+    server.api_key = "sk-model-groups"
+    auth_headers = {"Authorization": f"Bearer {server.api_key}"}
+
+    try:
+        server.start()
+
+        props = server.make_request("GET", "/props", headers=auth_headers)
+        assert props.status_code == 200
+        assert props.body["model_group_limits"] == {"generation": 1, "auxiliary": 1}
+
+        models = server.make_request("GET", "/models")
+        groups = {item["id"]: item["group"] for item in models.body["data"]}
+        assert groups["generation-a"] == "generation"
+        assert groups["generation-b"] == "generation"
+        assert groups["auxiliary"] == "auxiliary"
+
+        _load_model_and_wait("auxiliary", timeout=120, headers=auth_headers)
+        _load_model_and_wait("generation-a", timeout=120, headers=auth_headers)
+        _load_model_and_wait("generation-b", timeout=120, headers=auth_headers)
+
+        assert _get_model_status("auxiliary") == "loaded"
+        assert _get_model_status("generation-a") == "unloaded"
+        assert _get_model_status("generation-b") == "loaded"
+    finally:
+        os.remove(preset_path)
+
+
+def test_router_failed_model_retry_keeps_models_endpoint_responsive():
+    global server
+
+    os.makedirs(TMP_DIR, exist_ok=True)
+    preset_path = os.path.join(TMP_DIR, "test_failed_model_retry.ini")
+    with open(preset_path, "w") as f:
+        f.write(
+            "[broken]\n"
+            f"model = {os.path.join(TMP_DIR, 'missing-model.gguf')}\n"
+            "model-group = generation\n"
+        )
+
+    server.models_max = 1
+    server.models_group_limits = "generation=1"
+    server.models_preset = preset_path
+    server.api_key = "sk-failed-model-retry"
+    auth_headers = {"Authorization": f"Bearer {server.api_key}"}
+
+    try:
+        server.start()
+
+        first = server.make_request(
+            "POST", "/models/load", data={"model": "broken"}, headers=auth_headers
+        )
+        assert first.status_code == 200
+        _wait_for_model_status("broken", {"unloaded"})
+
+        second = server.make_request(
+            "POST",
+            "/models/load",
+            data={"model": "broken"},
+            headers=auth_headers,
+            timeout=10,
+        )
+        assert second.status_code == 200
+
+        models = server.make_request("GET", "/v1/models", timeout=10)
+        assert models.status_code == 200
+    finally:
+        os.remove(preset_path)
+
+
 def test_router_no_models_autoload():
     global server
     server.no_models_autoload = True

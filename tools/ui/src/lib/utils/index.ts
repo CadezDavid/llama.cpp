@@ -51,6 +51,7 @@ export { modelLoadFraction, modelLoadProgressText } from './progress';
 
 // Conversation utilities
 export { createMessageCountMap, getMessageCount } from './conversation-utils';
+export { visibleTraceMessageId } from './retrieval-traces';
 
 // Clipboard utilities
 export {

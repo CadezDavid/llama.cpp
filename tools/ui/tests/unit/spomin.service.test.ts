@@ -13,8 +13,7 @@ describe('SpominService', () => {
 				JSON.stringify({
 					query: 'database choice',
 					profile: null,
-					semantic: { status: 'complete', results: [] },
-					keyword: { status: 'complete', results: [] }
+					semantic: { status: 'complete', results: [] }
 				}),
 				{ status: 200 }
 			)
@@ -37,9 +36,8 @@ describe('SpominService', () => {
 		expect(fetchMock.mock.calls[0][1].headers.authorization).toBe('Bearer secret');
 		expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({
 			query: 'database choice',
-			channels: ['semantic', 'keyword'],
+			channels: ['semantic'],
 			semantic_limit: 20,
-			keyword_limit: 20,
 			project: 'alpha',
 			exclude_conversation_id: 'chat-1'
 		});
@@ -50,6 +48,59 @@ describe('SpominService', () => {
 		await expect(new SpominService({ baseUrl: 'http://127.0.0.1:8084' }).health()).resolves.toBe(
 			false
 		);
+	});
+
+	it('rejects an unavailable semantic channel', async () => {
+		vi.stubGlobal(
+			'fetch',
+			vi.fn().mockResolvedValue(
+				new Response(
+					JSON.stringify({
+						query: 'database choice',
+						semantic: { status: 'unavailable', error: 'embedding backend offline', results: [] }
+					}),
+					{ status: 200 }
+				)
+			)
+		);
+
+		await expect(
+			new SpominService({ baseUrl: 'http://127.0.0.1:8084' }).retrieve({
+				query: 'database choice'
+			})
+		).rejects.toThrow('Spomin semantic retrieval failed: embedding backend offline');
+	});
+
+	it('rejects semantic results without a valid score', async () => {
+		vi.stubGlobal(
+			'fetch',
+			vi.fn().mockResolvedValue(
+				new Response(
+					JSON.stringify({
+						query: 'database choice',
+						semantic: {
+							status: 'complete',
+							results: [
+								{
+									id: 'invalid',
+									text: 'Invalid result',
+									source: 'test',
+									tier: 'archive',
+									created_at: new Date().toISOString()
+								}
+							]
+						}
+					}),
+					{ status: 200 }
+				)
+			)
+		);
+
+		await expect(
+			new SpominService({ baseUrl: 'http://127.0.0.1:8084' }).retrieve({
+				query: 'database choice'
+			})
+		).rejects.toThrow('Spomin semantic result invalid has no valid semantic score');
 	});
 
 	it('reports only explicitly injected chunk ids', async () => {

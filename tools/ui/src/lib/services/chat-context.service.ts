@@ -12,6 +12,7 @@ import type {
 } from '$lib/types/chat-context';
 import type { DatabaseMessage } from '$lib/types/database';
 import { memoryDebug } from '$lib/utils/memory-debug';
+import { sha256 } from '$lib/utils/sha256';
 import { ChatService, type ChatMessageInput } from './chat.service';
 
 interface ValidatedProjection {
@@ -81,10 +82,7 @@ export class ChatContextService {
 				extra: message.extra
 			}))
 		);
-		const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(data));
-		return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join(
-			''
-		);
+		return await sha256(data);
 	}
 
 	private static async validateProjections(

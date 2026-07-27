@@ -152,7 +152,8 @@
 							messages={compactionStore.messages}
 							selectedIndex={compactionStore.selectedCandidateIndex}
 							totalTokenCount={compactionStore.beforeTokenCount}
-							protectedTurns={compactionStore.policy?.protectedTurns ?? 8}
+							protectedTurns={compactionStore.protectedTurnCount}
+							protectedTokens={compactionStore.protectedTokenCount}
 							onSelect={(index) => void compactionStore.selectCandidate(index)}
 						/>
 					</div>
@@ -176,16 +177,17 @@
 						{formatTokens(compactionStore.contextSize)}
 					</div>
 					<div>
-						<div class="text-muted-foreground">Current prompt</div>
+						<div class="text-muted-foreground">Prompt before compaction</div>
 						{formatTokens(compactionStore.beforeTokenCount)}
 					</div>
 					<div>
-						<div class="text-muted-foreground">Source</div>
+						<div class="text-muted-foreground">Original history selected</div>
 						{formatTokens(compactionStore.sourceTokenCount)}
 					</div>
 					<div>
-						<div class="text-muted-foreground">Protected tail</div>
-						{compactionStore.policy?.protectedTurns ?? 8} turns minimum
+						<div class="text-muted-foreground">Recent history kept</div>
+						{compactionStore.protectedTurnCount} turns /
+						{formatTokens(compactionStore.protectedTokenCount)} tokens
 					</div>
 				</div>
 
@@ -197,7 +199,8 @@
 							messages={compactionStore.messages}
 							selectedIndex={compactionStore.selectedCandidateIndex}
 							totalTokenCount={compactionStore.beforeTokenCount}
-							protectedTurns={compactionStore.policy?.protectedTurns ?? 8}
+							protectedTurns={compactionStore.protectedTurnCount}
+							protectedTokens={compactionStore.protectedTokenCount}
 							onSelect={(index) => void compactionStore.selectCandidate(index)}
 						/>
 					</div>
