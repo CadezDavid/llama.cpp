@@ -58,6 +58,7 @@
 		};
 	});
 	let hasLoadingAttachments = $derived(uploadedFiles.some((f) => f.isLoading));
+	let hasFailedAttachments = $derived(uploadedFiles.some((f) => !!f.loadError));
 	let message = $derived(initialMessage);
 	let previousIsLoading = $derived(isLoading);
 	let previousInitialMessage = $derived(initialMessage);
@@ -76,7 +77,12 @@
 	}
 
 	async function handleSubmit() {
-		if ((!message.trim() && uploadedFiles.length === 0) || disabled || hasLoadingAttachments)
+		if (
+			(!message.trim() && uploadedFiles.length === 0) ||
+			disabled ||
+			hasLoadingAttachments ||
+			hasFailedAttachments
+		)
 			return;
 
 		if (!chatFormRef?.checkModelSelected()) return;

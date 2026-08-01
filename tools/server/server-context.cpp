@@ -228,9 +228,14 @@ struct server_slot {
     slot_state state = SLOT_STATE_IDLE;
 
     server_prompt prompt;
+    bool cache_ram_store = true;
 
     bool prompt_save(server_prompt_cache & prompt_cache) const {
         if (prompt.tokens.size() == 0) {
+            return false;
+        }
+        if (!cache_ram_store) {
+            SLT_TRC(*this, "%s", "skipping transient prompt state for RAM cache\n");
             return false;
         }
 
@@ -259,6 +264,8 @@ struct server_slot {
         bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
+        } else {
+            cache_ram_store = true;
         }
 
         return res;
@@ -273,6 +280,7 @@ struct server_slot {
         }
 
         prompt.clear();
+        cache_ram_store = true;
     }
 
     std::vector<common_adapter_lora_info> lora;
@@ -1824,6 +1832,7 @@ private:
             slot.smpl.reset();
         }
 
+        slot.cache_ram_store = task.params.cache_ram_store;
         slot.task = std::make_unique<const server_task>(std::move(task));
 
         slot.state = slot.task->is_child()

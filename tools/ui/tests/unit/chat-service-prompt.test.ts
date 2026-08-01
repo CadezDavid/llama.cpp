@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { ContentPartType, MessageRole } from '$lib/enums';
+import { AttachmentType, ContentPartType, MessageRole, MessageType } from '$lib/enums';
 import { ChatService } from '$lib/services/chat.service';
 import type { ApiChatMessageData } from '$lib/types';
 import type { DatabaseMessage } from '$lib/types';
@@ -128,5 +128,37 @@ describe('ChatService prompt requests', () => {
 		] as DatabaseMessage[];
 
 		expect(ChatService.findLatestAssistantModel(messages)).toBe('current-model');
+	});
+
+	it('projects indexed attachments as a synopsis instead of source text', async () => {
+		const result = await ChatService.convertDbMessageToApiChatMessageData({
+			id: 'message-1',
+			convId: 'conversation-1',
+			type: MessageType.TEXT,
+			timestamp: 1,
+			role: MessageRole.USER,
+			content: 'Explain this',
+			parent: null,
+			children: [],
+			extra: [
+				{
+					type: AttachmentType.TEXT,
+					name: 'large.txt',
+					size: 100_000,
+					content: '',
+					processingMode: 'indexed',
+					attachmentId: 'attachment-1',
+					summary: 'A bounded synopsis.',
+					sourceTokenCount: 20_000
+				}
+			]
+		});
+
+		expect(result.content).toBeInstanceOf(Array);
+		const serialized = JSON.stringify(result.content);
+		expect(serialized).toContain('A bounded synopsis.');
+		expect(serialized).toContain('attachment_search');
+		expect(serialized).toContain('attachment-1');
+		expect(serialized).not.toContain('BEGIN FILE');
 	});
 });

@@ -1,6 +1,10 @@
 import type { ErrorDialogType } from '$lib/enums';
 import type { ApiChatCompletionToolCall, ApiChatMessageData } from './api';
-import type { DatabaseMessage, DatabaseMessageExtra } from './database';
+import type {
+	AttachmentProcessingDiagnostics,
+	DatabaseMessage,
+	DatabaseMessageExtra
+} from './database';
 
 export interface ChatUploadedFile {
 	id: string;
@@ -17,6 +21,39 @@ export interface ChatUploadedFile {
 	};
 	isLoading?: boolean;
 	loadError?: string;
+	attachmentProcessing?: AttachmentProcessingResult;
+}
+
+export type AttachmentProcessingStage =
+	| 'extracting'
+	| 'waiting-model'
+	| 'measuring'
+	| 'summarizing'
+	| 'indexing'
+	| 'ready'
+	| 'failed';
+
+export interface ExtractedAttachmentSegment {
+	text: string;
+	page?: number;
+	section?: string;
+}
+
+export interface ExtractedAttachment {
+	text: string;
+	segments: ExtractedAttachmentSegment[];
+	extractor: 'text' | 'pdfjs';
+}
+
+export interface AttachmentProcessingResult {
+	stage: AttachmentProcessingStage;
+	mode?: 'inline' | 'indexed';
+	attachmentId?: string;
+	extracted?: ExtractedAttachment;
+	sourceTokenCount?: number;
+	summary?: string;
+	error?: string;
+	diagnostics?: AttachmentProcessingDiagnostics;
 }
 
 export interface ChatAttachmentDisplayItem {

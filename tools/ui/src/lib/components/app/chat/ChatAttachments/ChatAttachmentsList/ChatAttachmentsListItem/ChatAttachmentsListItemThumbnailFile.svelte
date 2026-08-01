@@ -1,10 +1,11 @@
 <script lang="ts">
 	import { ICON_CLASS_DEFAULT } from '$lib/constants/css-classes';
-	import { X, Music, Video } from '@lucide/svelte';
+	import { X, Music, Video, Copy } from '@lucide/svelte';
 	import {
 		formatFileSize,
 		getFileTypeLabel,
 		getPreviewText,
+		copyToClipboard,
 		isPdfFile,
 		isAudioFile,
 		isVideoFile,
@@ -12,6 +13,7 @@
 	} from '$lib/utils';
 	import { ActionIcon } from '$lib/components/app';
 	import { AttachmentType } from '$lib/enums';
+	import type { AttachmentDiagnosticBatch } from '$lib/types';
 
 	interface Props {
 		attachment?: DatabaseMessageExtra;
@@ -75,6 +77,59 @@
 
 		return null;
 	});
+	let uploadStatus = $derived.by(() => {
+		if (uploadedFile?.loadError) return `Failed: ${uploadedFile.loadError}`;
+		const stage = uploadedFile?.attachmentProcessing?.stage;
+		if (!stage) return null;
+		if (stage === 'ready') {
+			return uploadedFile?.attachmentProcessing?.mode === 'indexed' ? 'Indexed' : 'Inline';
+		}
+		if (stage === 'waiting-model') return 'Waiting for model';
+		return stage.charAt(0).toUpperCase() + stage.slice(1);
+	});
+
+	async function copyDiagnostics(): Promise<void> {
+		const diagnostics = uploadedFile?.attachmentProcessing?.diagnostics;
+		if (!diagnostics) return;
+		const safeDiagnostics = {
+			id: diagnostics.id,
+			createdAt: new Date(diagnostics.createdAt).toISOString(),
+			updatedAt: new Date(diagnostics.updatedAt).toISOString(),
+			stage: diagnostics.stage,
+			generationModel: diagnostics.generationModel,
+			embeddingModel: diagnostics.embeddingModel,
+			generationContextSize: diagnostics.generationContextSize,
+			embeddingContextSize: diagnostics.embeddingContextSize,
+			sourceTokenCount: diagnostics.sourceTokenCount,
+			summaryPromptTokenCount: diagnostics.summaryPromptTokenCount,
+			chunkCount: diagnostics.chunkCount,
+			stageDurationsMs: diagnostics.stageDurationsMs,
+			batches: diagnostics.batches.map(
+				({
+					ordinal,
+					inputCount,
+					tokenCount,
+					durationMs,
+					status,
+					httpStatus,
+					error
+				}: AttachmentDiagnosticBatch) => ({
+					ordinal,
+					inputCount,
+					tokenCount,
+					durationMs,
+					status,
+					httpStatus,
+					error
+				})
+			),
+			failure: diagnostics.failure
+		};
+		await copyToClipboard(
+			JSON.stringify(safeDiagnostics, null, 2),
+			'Attachment diagnostics copied'
+		);
+	}
 </script>
 
 {#snippet textPreview(content: string)}
@@ -97,10 +152,18 @@
 	</div>
 {/snippet}
 
-{#snippet removeButton()}
+{#snippet actions()}
 	<div
-		class="absolute top-2 right-2 opacity-0 transition-opacity group-focus-within:opacity-100 group-hover:opacity-100"
+		class="absolute top-2 right-2 flex gap-1 opacity-0 transition-opacity group-focus-within:opacity-100 group-hover:opacity-100"
 	>
+		{#if uploadedFile?.attachmentProcessing?.stage === 'failed' && uploadedFile.attachmentProcessing.diagnostics}
+			<ActionIcon
+				icon={Copy}
+				tooltip="Copy safe diagnostics"
+				stopPropagationOnClick
+				onclick={() => void copyDiagnostics()}
+			/>
+		{/if}
 		<ActionIcon icon={X} tooltip="Remove" stopPropagationOnClick onclick={() => onRemove?.(id)} />
 	</div>
 {/snippet}
@@ -128,6 +191,8 @@
 {#if isTextWithContent || isPdfWithContent}
 	<button
 		aria-label={readonly ? `Preview ${name}` : undefined}
+		data-attachment-stage={uploadedFile?.attachmentProcessing?.stage}
+		data-attachment-diagnostics-id={uploadedFile?.attachmentProcessing?.diagnostics?.id}
 		class="rounded-lg border border-border bg-muted p-3 {className} cursor-pointer {readonly
 			? 'w-full max-w-2xl transition-shadow hover:shadow-md'
 			: `group relative text-left ${textContent ? 'max-h-24 max-w-72' : 'max-w-36'}`} overflow-hidden"
@@ -135,7 +200,7 @@
 		type="button"
 	>
 		{#if !readonly}
-			{@render removeButton()}
+			{@render actions()}
 		{/if}
 
 		<div class={[!readonly && 'pr-8', 'overflow-hidden']}>
@@ -144,7 +209,9 @@
 					<div class="flex min-w-0 flex-1 flex-col items-start text-left">
 						<span class="w-full truncate text-sm font-medium text-foreground">{name}</span>
 
-						{@render info(pdfProcessingMode || (size ? formatFileSize(size) : undefined))}
+						{@render info(
+							uploadStatus || pdfProcessingMode || (size ? formatFileSize(size) : undefined)
+						)}
 
 						{#if textContent}
 							{@render textPreview(textContent)}
@@ -153,6 +220,7 @@
 				</div>
 			{:else}
 				<span class="mb-3 block truncate text-sm font-medium text-foreground">{name}</span>
+				{@render info(uploadStatus ?? undefined)}
 
 				{#if textContent}
 					{@render textPreview(textContent)}
@@ -162,6 +230,8 @@
 	</button>
 {:else}
 	<button
+		data-attachment-stage={uploadedFile?.attachmentProcessing?.stage}
+		data-attachment-diagnostics-id={uploadedFile?.attachmentProcessing?.diagnostics?.id}
 		class="group flex items-center gap-3 rounded-lg border border-border bg-muted p-3 {className} relative"
 		{onclick}
 		type="button"
@@ -177,11 +247,11 @@
 				{name}
 			</span>
 
-			{@render info(pdfProcessingMode || (size ? formatFileSize(size) : undefined))}
+			{@render info(uploadStatus || pdfProcessingMode || (size ? formatFileSize(size) : undefined))}
 		</div>
 
 		{#if !readonly}
-			{@render removeButton()}
+			{@render actions()}
 		{/if}
 	</button>
 {/if}

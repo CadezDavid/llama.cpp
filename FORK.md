@@ -26,7 +26,8 @@ On top of that separation, the fork is adding:
 - optional long-term memory retrieval through Spomin;
 - automatic retrieval before inference, without requiring the model to call a
   tool;
-- prompt and token diagnostics for understanding context use and cache costs.
+- prompt and token diagnostics for understanding context use and cache costs;
+- upload-time summarization and semantic access for large text attachments.
 
 The detailed design is in
 [`llama_cpp_context_compaction_and_spomin_design.md`](llama_cpp_context_compaction_and_spomin_design.md).
@@ -48,7 +49,7 @@ by conversation export, import, and compatible branch forks.
 
 Compaction also writes its literal source messages into a local IndexedDB
 archive in the same transaction that activates the summary. Before each model
-request, the WebUI searches that archive with keywords and optional embeddings
+request, the WebUI searches that archive with embeddings
 while querying Spomin in parallel. It injects only the highest-scoring results
 that pass configured thresholds and token budgets. Repetition cooldowns avoid
 putting the same memory into consecutive requests unless the topic, score, or
@@ -73,6 +74,14 @@ safe complete-turn boundaries, the selected left portion is compacted, and the
 protected recent tail remains literal. Pointer, touch, and keyboard controls
 all select from the same validated candidates used by automatic compaction.
 
+Large text attachments are measured during upload. Attachments larger than 8%
+of usable model input are summarized with the selected generation model and
+indexed with Jina. The summarization request is transient: the existing
+conversation can be restored from the server RAM cache without retaining the
+attachment prompt. The generation model receives a synopsis and two conditional
+browser-local tools instead of the complete document. Retrieval is semantic-only
+and fails visibly.
+
 ## Branch guide
 
 The branches are deliberately separated so that upstream updates, TurboQuant,
@@ -81,28 +90,25 @@ distinguish.
 
 | Branch                        | Purpose                                                                                          |
 | ----------------------------- | ------------------------------------------------------------------------------------------------ |
-| `mainline`                    | Clean tracking branch for current upstream llama.cpp. Fork-specific features do not belong here. |
-| `turboquant-original`         | Original TurboQuant development line, kept as a reference without the fork's mainline merges.    |
-| `turboquant`                  | TurboQuant combined with newer llama.cpp changes and local TurboQuant-related fixes.             |
+| `main`                        | Complete local product containing all maintained features.                                      |
+| `upstream`                    | Clean tracking branch for current upstream llama.cpp.                                            |
+| `turboquant`                  | Exact TheTom TurboQuant development line.                                                        |
 | `feature/compaction`          | Memory foundation plus conversation compaction implementation and tests.                         |
 | `feature/spomin`              | Compaction stage plus Spomin configuration, storage integration, and explicit recall.            |
 | `feature/automatic-retrieval` | Spomin stage plus automatic conversation and long-term memory retrieval before inference.        |
-| `memory`                      | Complete memory product on the normal llama.cpp base.                                            |
-| `memory-turboquant`           | Complete memory product integrated with the maintained TurboQuant branch.                        |
+| `feature/memory`              | Complete memory product without TurboQuant, retained for isolated testing.                        |
+| `feat/attachment-handling`    | Large attachment implementation before integration into `main`.                                  |
 
 The `feature/*` branches are dependency-ordered intermediate builds, not
-separate competing products. The `memory` branch is the canonical landing
-branch for the complete non-TurboQuant memory stack.
+separate competing products. The `feature/memory` branch is the canonical
+landing branch for the complete non-TurboQuant memory stack.
 
 ## Which branch to use
 
-- Use `mainline` when you want an unmodified upstream-oriented llama.cpp base.
-- Use `turboquant-original` to inspect or compare against the original
-  TurboQuant work.
-- Use `turboquant` when you want TurboQuant with the fork's newer llama.cpp
-  baseline but without the memory feature stack.
-- Use `memory` for the complete memory product without TurboQuant.
-- Use `memory-turboquant` for the complete memory product with TurboQuant.
+- Use `main` for normal operation.
+- Use `upstream` for an unmodified upstream-oriented llama.cpp base.
+- Use `turboquant` to inspect or update from TheTom's TurboQuant work.
+- Use `feature/memory` for the complete memory product without TurboQuant.
 - Use a `feature/*` branch only when developing or testing that intermediate
   stage.
 
@@ -113,17 +119,14 @@ branches remain useful for focused testing and maintenance.
 
 Upstream and feature history should remain easy to distinguish:
 
-1. Update `mainline` from `ggml-org/llama.cpp`.
-2. Preserve `turboquant-original` as the original TurboQuant reference.
-3. Merge current mainline changes into `turboquant` when needed.
+1. Fast-forward `upstream` from `ggml-org/llama.cpp`.
+2. Fast-forward `turboquant` from TheTom's TurboQuant branch.
+3. Integrate selected upstream, TurboQuant, and completed feature work into
+   `main`.
 4. Use the matching `feature/*` branch when an intermediate stage needs
    isolated development or testing.
-5. Merge completed memory work into `memory`.
-6. Merge `memory` into `memory-turboquant` and resolve TurboQuant-specific
-   conflicts there.
-
-This structure keeps the two external baselines reproducible and prevents
-experimental memory work from becoming mixed into every branch.
+This structure keeps external baselines reproducible without growing the
+product branch name whenever another feature is added.
 
 ## Building and testing
 
@@ -153,7 +156,7 @@ Memory decisions happen in the browser as well as the server. Enable
 `Memory diagnostics` under the WebUI Memory settings, save the settings, and
 open the browser developer console. Structured `[Memory]` events cover
 compaction policy and activation, recalled-context selection and cooldowns,
-embedding fallback, Spomin requests, prompt-budget trimming, and final context
+embedding failures, Spomin requests, prompt-budget trimming, and final context
 insertion. These logs redact prompt text, memory text, retrieval queries,
 embeddings, summaries, and credentials.
 

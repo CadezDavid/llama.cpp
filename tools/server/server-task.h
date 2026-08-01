@@ -51,6 +51,7 @@ struct task_params {
     bool stream          = false;
     bool include_usage   = false;
     bool cache_prompt    = true; // remember the prompt to avoid reprocessing all prompt
+    bool cache_ram_store = true; // allow this prompt state to be saved to the RAM cache
     bool return_tokens   = false;
     bool return_progress = false;
 

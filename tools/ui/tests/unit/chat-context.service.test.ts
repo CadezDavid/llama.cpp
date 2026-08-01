@@ -135,6 +135,57 @@ describe('ChatContextService', () => {
 		).rejects.toThrow('tool exchange');
 	});
 
+	it('omits completed attachment tool exchanges from later user turns', async () => {
+		const transcript = [
+			message('1', MessageRole.USER, 'First question'),
+			message('2', MessageRole.ASSISTANT, '', {
+				toolCalls: JSON.stringify([
+					{
+						id: 'attachment-call',
+						type: 'function',
+						function: { name: 'attachment_search', arguments: '{}' }
+					}
+				])
+			}),
+			message('3', MessageRole.TOOL, 'Large retrieved passage', {
+				toolCallId: 'attachment-call'
+			}),
+			message('4', MessageRole.ASSISTANT, 'First answer'),
+			message('5', MessageRole.USER, 'Follow-up')
+		];
+
+		const result = await ChatContextService.prepare({ transcriptMessages: transcript });
+
+		expect(result.requestMessages.map((item) => item.content)).toEqual([
+			'First question',
+			'First answer',
+			'Follow-up'
+		]);
+	});
+
+	it('keeps an attachment tool exchange in the active agentic sequence', async () => {
+		const transcript = [
+			message('1', MessageRole.USER, 'Question'),
+			message('2', MessageRole.ASSISTANT, '', {
+				toolCalls: JSON.stringify([
+					{
+						id: 'attachment-call',
+						type: 'function',
+						function: { name: 'attachment_read', arguments: '{}' }
+					}
+				])
+			}),
+			message('3', MessageRole.TOOL, 'Current passage', {
+				toolCallId: 'attachment-call'
+			})
+		];
+
+		const result = await ChatContextService.prepare({ transcriptMessages: transcript });
+
+		expect(result.requestMessages).toHaveLength(3);
+		expect(result.requestMessages[2].content).toBe('Current passage');
+	});
+
 	it('injects untrusted context only into the request copy of the current user message', async () => {
 		const transcript = [
 			message('1', MessageRole.SYSTEM, 'System'),

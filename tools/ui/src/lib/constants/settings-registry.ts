@@ -29,6 +29,8 @@ import { SETTINGS_KEYS } from './settings-keys';
 import { ROUTES, SETTINGS_SECTION_SLUGS } from './routes';
 import { TITLE_GENERATION } from './title-generation';
 
+export const DEFAULT_EMBEDDING_MODEL = 'Jina Embeddings v5 Text Small Retrieval';
+
 export const SETTINGS_SECTION_TITLES = {
 	GENERAL: 'General',
 	DISPLAY: 'Display',
@@ -525,8 +527,8 @@ const SETTINGS_REGISTRY: Record<string, SettingsSectionEntry> = {
 			{
 				key: SETTINGS_KEYS.EMBEDDING_BASE_URL,
 				label: 'Embedding API URL',
-				help: 'OpenAI-compatible embedding endpoint used for local semantic recall.',
-				defaultValue: 'http://127.0.0.1:8081/v1',
+				help: 'OpenAI-compatible embedding endpoint used for semantic conversation recall.',
+				defaultValue: './v1',
 				type: SettingsFieldType.INPUT,
 				section: SETTINGS_SECTION_SLUGS.MEMORY
 			},
@@ -534,15 +536,15 @@ const SETTINGS_REGISTRY: Record<string, SettingsSectionEntry> = {
 				key: SETTINGS_KEYS.EMBEDDING_MODEL,
 				label: 'Embedding model',
 				help: 'Model name sent to the embedding endpoint.',
-				defaultValue: 'embeddinggemma-300M-Q8_0.gguf',
+				defaultValue: DEFAULT_EMBEDDING_MODEL,
 				type: SettingsFieldType.INPUT,
 				section: SETTINGS_SECTION_SLUGS.MEMORY
 			},
 			{
 				key: SETTINGS_KEYS.EMBEDDING_TIMEOUT_MS,
 				label: 'Embedding timeout (ms)',
-				help: 'Deadline for semantic recall. Lexical recall remains available on timeout.',
-				defaultValue: 1200,
+				help: 'Deadline for semantic recall. Failures are reported without a lexical fallback.',
+				defaultValue: 10000,
 				type: SettingsFieldType.INPUT,
 				section: SETTINGS_SECTION_SLUGS.MEMORY,
 				isPositiveInteger: true
@@ -578,7 +580,7 @@ const SETTINGS_REGISTRY: Record<string, SettingsSectionEntry> = {
 				key: SETTINGS_KEYS.SEMANTIC_RECALL_THRESHOLD,
 				label: 'Semantic recall threshold',
 				help: 'Minimum cosine similarity for a local semantic match.',
-				defaultValue: 0.62,
+				defaultValue: 0.58,
 				type: SettingsFieldType.INPUT,
 				section: SETTINGS_SECTION_SLUGS.MEMORY
 			}

@@ -17,6 +17,7 @@ import { ChatService } from '$lib/services/chat.service';
 import { ChatContextService } from '$lib/services/chat-context.service';
 import { CompactionService } from '$lib/services/compaction.service';
 import { RetrievalService, type RecallSnapshot } from '$lib/services/retrieval.service';
+import { AttachmentService } from '$lib/services/attachment.service';
 import { compactionStore } from '$lib/stores/compaction.svelte';
 import { streamIdentity } from '$lib/utils/stream-identity';
 import { getAuthHeaders } from '$lib/utils/api-headers';
@@ -43,6 +44,7 @@ import {
 import { classifyContinueIntent } from '$lib/utils/agentic';
 import {
 	MAX_INACTIVE_CONVERSATION_STATES,
+	DEFAULT_EMBEDDING_MODEL,
 	INACTIVE_CONVERSATION_STATE_MAX_AGE_MS,
 	SYSTEM_MESSAGE_PLACEHOLDER,
 	TITLE_GENERATION
@@ -228,12 +230,12 @@ class ChatStore {
 					spominTokenBudget: Number(currentConfig.spominTokenBudget) || 1000,
 					spominTimeoutMs: Number(currentConfig.spominTimeoutMs) || 2000,
 					embeddingBaseUrl: String(currentConfig.embeddingBaseUrl || 'http://127.0.0.1:8081/v1'),
-					embeddingModel: String(currentConfig.embeddingModel || 'embeddinggemma-300M-Q8_0.gguf'),
+					embeddingModel: String(currentConfig.embeddingModel || DEFAULT_EMBEDDING_MODEL),
 					embeddingTimeoutMs: Number(currentConfig.embeddingTimeoutMs) || 1200,
 					localResultLimit: Number(currentConfig.localRecallResultLimit) || 5,
 					localTokenBudget: Number(currentConfig.localRecallTokenBudget) || 1500,
 					totalTokenBudget: Number(currentConfig.totalRecallTokenBudget) || 2500,
-					semanticThreshold: Number(currentConfig.semanticRecallThreshold) || 0.62
+					semanticThreshold: Number(currentConfig.semanticRecallThreshold) || 0.58
 				}
 			});
 			const fitted = await this.fitRecallBlocks(
@@ -1329,6 +1331,23 @@ class ChatStore {
 				parentIdForUserMessage ?? '-1',
 				allExtras
 			);
+			try {
+				await AttachmentService.persistPendingForMessage(allExtras, currentConv.id, userMessage.id);
+			} catch (error) {
+				await DatabaseService.deleteMessage(userMessage.id);
+				const index = conversationsStore.findMessageIndex(userMessage.id);
+				if (index >= 0) conversationsStore.removeMessageAtIndex(index);
+				for (const extra of allExtras ?? []) {
+					if ('attachmentId' in extra) {
+						AttachmentService.discardPending(extra.attachmentId);
+					}
+				}
+				if (userMessage.parent) {
+					await DatabaseService.updateCurrentNode(currentConv.id, userMessage.parent);
+					await conversationsStore.updateCurrentNode(userMessage.parent);
+				}
+				throw error;
+			}
 			if (isNewConversation && content)
 				await conversationsStore.updateConversationName(
 					currentConv.id,
@@ -1391,7 +1410,13 @@ class ChatStore {
 		}
 
 		const perChatOverrides = conversationsStore.getAllMcpServerOverrides();
-		const promptTools = await agenticStore.preparePromptTools(perChatOverrides);
+		const indexedAttachments = AttachmentService.indexedAttachments(allMessages);
+		const internalAttachmentTools =
+			indexedAttachments.length > 0 ? AttachmentService.toolDefinitions : [];
+		const promptTools = await agenticStore.preparePromptTools(
+			perChatOverrides,
+			internalAttachmentTools
+		);
 		const apiOptions = {
 			...this.getApiOptions(),
 			...(effectiveModel ? { model: effectiveModel } : {}),
@@ -1775,7 +1800,10 @@ class ChatStore {
 				options: apiOptions,
 				callbacks: streamCallbacks,
 				signal: abortController.signal,
-				perChatOverrides
+				perChatOverrides,
+				internalTools: internalAttachmentTools,
+				executeInternalTool: (name, args, signal) =>
+					AttachmentService.executeTool(convId, name, args, signal)
 			});
 			if (agenticResult.handled) {
 				// Generate LLM based title for new conversations after agentic flow completes

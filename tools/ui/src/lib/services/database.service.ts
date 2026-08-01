@@ -5,6 +5,7 @@ import {
 	IDXDB_STORES,
 	IDXDB_STORES_V1,
 	IDXDB_STORES_V3,
+	IDXDB_STORES_V4,
 	STORAGE_APP_NAME
 } from '$lib/constants';
 import { MessageRole } from '$lib/enums';
@@ -17,6 +18,7 @@ import type {
 	DatabaseRetrievalTrace,
 	DatabaseRetrievalHitUsage
 } from '$lib/types';
+import type { DatabaseAttachment, DatabaseAttachmentChunk } from '$lib/types';
 import { ChatContextService } from './chat-context.service';
 import { memoryDebug } from '$lib/utils/memory-debug';
 
@@ -55,6 +57,8 @@ class LlamaUiDatabase extends Dexie {
 	[IDXDB_TABLES.archiveTerms]!: EntityTable<DatabaseArchiveTerm, 'id'>;
 	[IDXDB_TABLES.retrievalTraces]!: EntityTable<DatabaseRetrievalTrace, 'id'>;
 	[IDXDB_TABLES.retrievalHitUsage]!: EntityTable<DatabaseRetrievalHitUsage, 'id'>;
+	[IDXDB_TABLES.attachments]!: EntityTable<DatabaseAttachment, 'id'>;
+	[IDXDB_TABLES.attachmentChunks]!: EntityTable<DatabaseAttachmentChunk, 'id'>;
 
 	constructor() {
 		super(STORAGE_APP_NAME);
@@ -62,6 +66,7 @@ class LlamaUiDatabase extends Dexie {
 		this.version(1).stores(IDXDB_STORES_V1);
 		this.version(2).stores(IDXDB_STORES);
 		this.version(3).stores(IDXDB_STORES_V3);
+		this.version(4).stores(IDXDB_STORES_V4);
 	}
 }
 
@@ -230,6 +235,7 @@ export class DatabaseService {
 		id: string,
 		options?: { deleteWithForks?: boolean }
 	): Promise<void> {
+		const attachmentConversationIds = [id];
 		await db.transaction(
 			'rw',
 			[
@@ -240,7 +246,9 @@ export class DatabaseService {
 				db[IDXDB_TABLES.archiveChunks],
 				db[IDXDB_TABLES.archiveTerms],
 				db[IDXDB_TABLES.retrievalTraces],
-				db[IDXDB_TABLES.retrievalHitUsage]
+				db[IDXDB_TABLES.retrievalHitUsage],
+				db[IDXDB_TABLES.attachments],
+				db[IDXDB_TABLES.attachmentChunks]
 			],
 			async () => {
 				if (options?.deleteWithForks) {
@@ -261,6 +269,7 @@ export class DatabaseService {
 					}
 
 					for (const forkId of idsToDelete) {
+						attachmentConversationIds.push(forkId);
 						await db[IDXDB_TABLES.conversations].delete(forkId);
 						await db[IDXDB_TABLES.messages].where('convId').equals(forkId).delete();
 						await db[IDXDB_TABLES.compactions].where('conversationId').equals(forkId).delete();
@@ -293,6 +302,7 @@ export class DatabaseService {
 				await db[IDXDB_TABLES.retrievalHitUsage].where('conversationId').equals(id).delete();
 			}
 		);
+		await this.deleteAttachmentDataForConversations(attachmentConversationIds);
 	}
 
 	/**
@@ -366,7 +376,9 @@ export class DatabaseService {
 				db[IDXDB_TABLES.archiveChunks],
 				db[IDXDB_TABLES.archiveTerms],
 				db[IDXDB_TABLES.retrievalTraces],
-				db[IDXDB_TABLES.retrievalHitUsage]
+				db[IDXDB_TABLES.retrievalHitUsage],
+				db[IDXDB_TABLES.attachments],
+				db[IDXDB_TABLES.attachmentChunks]
 			],
 			async () => {
 				// Pre-load each to-delete conversation so the per-id reparent
@@ -406,6 +418,7 @@ export class DatabaseService {
 				await db[IDXDB_TABLES.retrievalHitUsage].where('conversationId').anyOf(cleanIds).delete();
 			}
 		);
+		await this.deleteAttachmentDataForConversations(cleanIds);
 	}
 
 	/**
@@ -478,6 +491,7 @@ export class DatabaseService {
 				}
 			}
 		);
+		await this.deleteAttachmentDataForMessages([messageId]);
 	}
 
 	/**
@@ -492,7 +506,7 @@ export class DatabaseService {
 		conversationId: string,
 		messageId: string
 	): Promise<string[]> {
-		return await db.transaction(
+		const deleted = await db.transaction(
 			'rw',
 			[
 				db[IDXDB_TABLES.messages],
@@ -573,6 +587,8 @@ export class DatabaseService {
 				return allToDelete;
 			}
 		);
+		await this.deleteAttachmentDataForMessages(deleted);
+		return deleted;
 	}
 
 	/**
@@ -602,6 +618,122 @@ export class DatabaseService {
 	 */
 	static async getConversationMessages(convId: string): Promise<DatabaseMessage[]> {
 		return await db[IDXDB_TABLES.messages].where('convId').equals(convId).sortBy('timestamp');
+	}
+
+	private static async deleteAttachmentDataForConversations(
+		conversationIds: string[]
+	): Promise<void> {
+		if (!conversationIds.length) return;
+		await db.transaction(
+			'rw',
+			[db[IDXDB_TABLES.attachments], db[IDXDB_TABLES.attachmentChunks]],
+			async () => {
+				const attachmentIds = await db[IDXDB_TABLES.attachments]
+					.where('conversationId')
+					.anyOf(conversationIds)
+					.primaryKeys();
+				if (attachmentIds.length) {
+					await db[IDXDB_TABLES.attachmentChunks]
+						.where('attachmentId')
+						.anyOf(attachmentIds)
+						.delete();
+					await db[IDXDB_TABLES.attachments].bulkDelete(attachmentIds);
+				}
+			}
+		);
+	}
+
+	private static async deleteAttachmentDataForMessages(messageIds: string[]): Promise<void> {
+		if (!messageIds.length) return;
+		await db.transaction(
+			'rw',
+			[db[IDXDB_TABLES.attachments], db[IDXDB_TABLES.attachmentChunks]],
+			async () => {
+				const attachmentIds = await db[IDXDB_TABLES.attachments]
+					.where('messageId')
+					.anyOf(messageIds)
+					.primaryKeys();
+				if (attachmentIds.length) {
+					await db[IDXDB_TABLES.attachmentChunks]
+						.where('attachmentId')
+						.anyOf(attachmentIds)
+						.delete();
+					await db[IDXDB_TABLES.attachments].bulkDelete(attachmentIds);
+				}
+			}
+		);
+	}
+
+	static async addAttachment(
+		attachment: DatabaseAttachment,
+		chunks: DatabaseAttachmentChunk[]
+	): Promise<void> {
+		await db.transaction(
+			'rw',
+			[db[IDXDB_TABLES.attachments], db[IDXDB_TABLES.attachmentChunks]],
+			async () => {
+				await db[IDXDB_TABLES.attachments].add(attachment);
+				if (chunks.length) await db[IDXDB_TABLES.attachmentChunks].bulkAdd(chunks);
+			}
+		);
+	}
+
+	static async getAttachment(id: string): Promise<DatabaseAttachment | undefined> {
+		return await db[IDXDB_TABLES.attachments].get(id);
+	}
+
+	static async getConversationAttachments(conversationId: string): Promise<DatabaseAttachment[]> {
+		return await db[IDXDB_TABLES.attachments]
+			.where('conversationId')
+			.equals(conversationId)
+			.toArray();
+	}
+
+	static async getAttachmentChunks(attachmentId: string): Promise<DatabaseAttachmentChunk[]> {
+		return await db[IDXDB_TABLES.attachmentChunks]
+			.where('attachmentId')
+			.equals(attachmentId)
+			.sortBy('ordinal');
+	}
+
+	static async getAttachmentChunksByIds(
+		attachmentId: string,
+		ids: string[]
+	): Promise<DatabaseAttachmentChunk[]> {
+		const chunks = await db[IDXDB_TABLES.attachmentChunks].bulkGet(ids);
+		return chunks.filter(
+			(chunk): chunk is DatabaseAttachmentChunk => !!chunk && chunk.attachmentId === attachmentId
+		);
+	}
+
+	static async updateAttachmentIndex(
+		attachmentId: string,
+		embeddingModel: string,
+		chunkingVersion: number,
+		vectors: Array<{ chunkId: string; embedding: number[] }>
+	): Promise<void> {
+		const dimensions = vectors[0]?.embedding.length ?? 0;
+		if (!dimensions) throw new Error('Cannot persist an empty attachment index');
+		await db.transaction(
+			'rw',
+			[db[IDXDB_TABLES.attachments], db[IDXDB_TABLES.attachmentChunks]],
+			async () => {
+				for (const vector of vectors) {
+					await db[IDXDB_TABLES.attachmentChunks].update(vector.chunkId, {
+						embedding: vector.embedding,
+						embeddingModel,
+						embeddingDimensions: dimensions,
+						embeddingStatus: 'ready'
+					});
+				}
+				await db[IDXDB_TABLES.attachments].update(attachmentId, {
+					embeddingModel,
+					embeddingDimensions: dimensions,
+					chunkingVersion,
+					status: 'ready'
+				});
+			}
+		);
 	}
 
 	/**
@@ -860,7 +992,9 @@ export class DatabaseService {
 			allProjectionEvents,
 			allArchiveChunks,
 			allRetrievalTraces,
-			allRetrievalUsage
+			allRetrievalUsage,
+			allAttachments,
+			allAttachmentChunks
 		] = await Promise.all([
 			db[IDXDB_TABLES.conversations].bulkGet(cleanIds),
 			db[IDXDB_TABLES.messages].where('convId').anyOf(cleanIds).toArray(),
@@ -868,7 +1002,9 @@ export class DatabaseService {
 			db[IDXDB_TABLES.compactionProjectionEvents].where('conversationId').anyOf(cleanIds).toArray(),
 			db[IDXDB_TABLES.archiveChunks].where('conversationId').anyOf(cleanIds).toArray(),
 			db[IDXDB_TABLES.retrievalTraces].where('conversationId').anyOf(cleanIds).toArray(),
-			db[IDXDB_TABLES.retrievalHitUsage].where('conversationId').anyOf(cleanIds).toArray()
+			db[IDXDB_TABLES.retrievalHitUsage].where('conversationId').anyOf(cleanIds).toArray(),
+			db[IDXDB_TABLES.attachments].where('conversationId').anyOf(cleanIds).toArray(),
+			db[IDXDB_TABLES.attachmentChunks].where('conversationId').anyOf(cleanIds).toArray()
 		]);
 
 		const messagesByConv = new Map<string, DatabaseMessage[]>();
@@ -907,6 +1043,23 @@ export class DatabaseService {
 			if (bucket) bucket.push(item);
 			else usageByConv.set(item.conversationId, [item]);
 		}
+		const attachmentsByConv = new Map<string, DatabaseAttachment[]>();
+		for (const item of allAttachments) {
+			const bucket = attachmentsByConv.get(item.conversationId);
+			if (bucket) bucket.push(item);
+			else attachmentsByConv.set(item.conversationId, [item]);
+		}
+		const attachmentChunksByConv = new Map<string, DatabaseAttachmentChunk[]>();
+		for (const item of allAttachmentChunks) {
+			const bucket = attachmentChunksByConv.get(item.conversationId);
+			const exported = {
+				...item,
+				embedding: undefined,
+				embeddingStatus: 'pending' as const
+			};
+			if (bucket) bucket.push(exported);
+			else attachmentChunksByConv.set(item.conversationId, [exported]);
+		}
 
 		for (let i = 0; i < cleanIds.length; i++) {
 			const conv = convs[i];
@@ -921,7 +1074,9 @@ export class DatabaseService {
 				compactionProjectionEvents: eventsByConv.get(conv.id) ?? [],
 				archiveChunks: archivesByConv.get(conv.id) ?? [],
 				retrievalTraces: tracesByConv.get(conv.id) ?? [],
-				retrievalHitUsage: usageByConv.get(conv.id) ?? []
+				retrievalHitUsage: usageByConv.get(conv.id) ?? [],
+				attachments: attachmentsByConv.get(conv.id) ?? [],
+				attachmentChunks: attachmentChunksByConv.get(conv.id) ?? []
 			});
 		}
 		return result;
@@ -1057,7 +1212,9 @@ export class DatabaseService {
 				db[IDXDB_TABLES.archiveChunks],
 				db[IDXDB_TABLES.archiveTerms],
 				db[IDXDB_TABLES.retrievalTraces],
-				db[IDXDB_TABLES.retrievalHitUsage]
+				db[IDXDB_TABLES.retrievalHitUsage],
+				db[IDXDB_TABLES.attachments],
+				db[IDXDB_TABLES.attachmentChunks]
 			],
 			async () => {
 				for (const item of data) {
@@ -1068,7 +1225,9 @@ export class DatabaseService {
 						compactionProjectionEvents,
 						archiveChunks,
 						retrievalTraces,
-						retrievalHitUsage
+						retrievalHitUsage,
+						attachments,
+						attachmentChunks
 					} = item;
 
 					const existing = await db[IDXDB_TABLES.conversations].get(conv.id);
@@ -1094,6 +1253,20 @@ export class DatabaseService {
 					}
 					if (retrievalHitUsage?.length) {
 						await db[IDXDB_TABLES.retrievalHitUsage].bulkPut(retrievalHitUsage);
+					}
+					if (attachments?.length) {
+						await db[IDXDB_TABLES.attachments].bulkPut(
+							attachments.map((attachment) => ({ ...attachment, status: 'stale' }))
+						);
+					}
+					if (attachmentChunks?.length) {
+						await db[IDXDB_TABLES.attachmentChunks].bulkPut(
+							attachmentChunks.map((chunk) => ({
+								...chunk,
+								embedding: undefined,
+								embeddingStatus: 'pending'
+							}))
+						);
 					}
 
 					importedCount++;
@@ -1135,7 +1308,9 @@ export class DatabaseService {
 				db[IDXDB_TABLES.compactionProjectionEvents],
 				db[IDXDB_TABLES.archiveChunks],
 				db[IDXDB_TABLES.archiveTerms],
-				db[IDXDB_TABLES.retrievalTraces]
+				db[IDXDB_TABLES.retrievalTraces],
+				db[IDXDB_TABLES.attachments],
+				db[IDXDB_TABLES.attachmentChunks]
 			],
 			async () => {
 				const sourceConv = await db[IDXDB_TABLES.conversations].get(sourceConvId);
@@ -1162,6 +1337,16 @@ export class DatabaseService {
 				for (const msg of pathMessages) {
 					idMap.set(msg.id, uuid());
 				}
+				const sourceAttachments = options.includeAttachments
+					? await db[IDXDB_TABLES.attachments]
+							.where('conversationId')
+							.equals(sourceConvId)
+							.filter((attachment) => idMap.has(attachment.messageId))
+							.toArray()
+					: [];
+				const attachmentIdMap = new Map(
+					sourceAttachments.map((attachment) => [attachment.id, uuid()])
+				);
 
 				const newConvId = uuid();
 				const clonedMessages: DatabaseMessage[] = pathMessages.map((msg) => {
@@ -1177,7 +1362,21 @@ export class DatabaseService {
 						convId: newConvId,
 						parent: newParent,
 						children: newChildren,
-						extra: options.includeAttachments ? msg.extra : undefined
+						extra: options.includeAttachments
+							? msg.extra?.map((extra: DatabaseMessageExtra) => {
+									if (
+										(extra.type === 'TEXT' || extra.type === 'PDF') &&
+										extra.attachmentId &&
+										attachmentIdMap.has(extra.attachmentId)
+									) {
+										return {
+											...extra,
+											attachmentId: attachmentIdMap.get(extra.attachmentId)
+										};
+									}
+									return extra;
+								})
+							: undefined
 					};
 				});
 
@@ -1201,6 +1400,29 @@ export class DatabaseService {
 
 				for (const msg of clonedMessages) {
 					await db[IDXDB_TABLES.messages].add(msg);
+				}
+				for (const attachment of sourceAttachments) {
+					const newAttachmentId = attachmentIdMap.get(attachment.id)!;
+					await db[IDXDB_TABLES.attachments].add({
+						...attachment,
+						id: newAttachmentId,
+						conversationId: newConvId,
+						messageId: idMap.get(attachment.messageId)!
+					});
+					const chunks = await db[IDXDB_TABLES.attachmentChunks]
+						.where('attachmentId')
+						.equals(attachment.id)
+						.toArray();
+					if (chunks.length) {
+						await db[IDXDB_TABLES.attachmentChunks].bulkAdd(
+							chunks.map((chunk) => ({
+								...chunk,
+								id: uuid(),
+								attachmentId: newAttachmentId,
+								conversationId: newConvId
+							}))
+						);
+					}
 				}
 
 				const sourceCompactions = await db[IDXDB_TABLES.compactions]

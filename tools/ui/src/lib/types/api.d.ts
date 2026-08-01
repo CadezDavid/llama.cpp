@@ -94,6 +94,8 @@ export interface ApiModelDataEntry {
 	path: string;
 	/** Current status of the model */
 	status: ApiModelStatus;
+	/** Router scheduling group, such as generation or auxiliary */
+	group?: string;
 	/** Alternative names that resolve to this model */
 	aliases?: string[];
 	/** Informational tags for this model */
@@ -264,6 +266,7 @@ export interface ApiChatCompletionRequest {
 	}>;
 	stream?: boolean;
 	model?: string;
+	cache_ram_store?: boolean;
 	return_progress?: boolean;
 	sse_ping_interval?: number;
 	tools?: ApiChatCompletionTool[];

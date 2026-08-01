@@ -7,7 +7,9 @@ import { modelsStore } from '$lib/stores/models.svelte';
 import { settingsStore } from '$lib/stores/settings.svelte';
 import { toast } from 'svelte-sonner';
 import { getFileTypeCategory } from '$lib/utils';
-import { convertPDFToText } from './pdf-processing';
+import { extractPDFDocument } from './pdf-processing';
+import { AttachmentProcessingError, AttachmentService } from '$lib/services/attachment.service';
+import type { ExtractedAttachment } from '$lib/types';
 
 /**
  * Read a file as a data URL (base64 encoded)
@@ -51,19 +53,24 @@ function readFileAsUTF8(file: File): Promise<string> {
  */
 export async function processFilesToChatUploaded(
 	files: File[],
-	activeModelId?: string
+	activeModelId?: string,
+	onUpdate?: (file: ChatUploadedFile) => void
 ): Promise<ChatUploadedFile[]> {
 	const results: ChatUploadedFile[] = [];
 
 	for (const file of files) {
 		const id = Date.now().toString() + Math.random().toString(36).substr(2, 9);
+		const diagnostics = AttachmentService.createDiagnostics();
 		const base: ChatUploadedFile = {
 			id,
 			name: file.name,
 			size: file.size,
 			type: file.type,
-			file
+			file,
+			isLoading: true,
+			attachmentProcessing: { stage: 'extracting', diagnostics }
 		};
+		onUpdate?.(base);
 
 		try {
 			if (getFileTypeCategory(file.type) === FileTypeCategory.IMAGE) {
@@ -86,22 +93,16 @@ export async function processFilesToChatUploaded(
 					try {
 						preview = await heicFileToJpegDataURL(file);
 					} catch (err) {
-						console.error('Failed to convert HEIC to PNG:', err);
-						continue;
+						throw new Error(
+							`Failed to convert HEIC image: ${err instanceof Error ? err.message : String(err)}`
+						);
 					}
 				}
 
-				results.push({ ...base, preview });
+				const ready = { ...base, preview, isLoading: false, attachmentProcessing: undefined };
+				results.push(ready);
+				onUpdate?.(ready);
 			} else if (getFileTypeCategory(file.type) === FileTypeCategory.PDF) {
-				// Extract text content from PDF for preview
-				try {
-					const textContent = await convertPDFToText(file);
-					results.push({ ...base, textContent });
-				} catch (err) {
-					console.warn('Failed to extract text from PDF, adding without content:', err);
-					results.push(base);
-				}
-
 				// Show suggestion toast if vision model is available but PDF as image is disabled
 				const hasVisionSupport = activeModelId
 					? modelsStore.modelSupportsVision(activeModelId)
@@ -121,27 +122,147 @@ export async function processFilesToChatUploaded(
 						}
 					});
 				}
+				if (hasVisionSupport && currentConfig.pdfAsImage) {
+					const ready = {
+						...base,
+						isLoading: false,
+						attachmentProcessing: undefined
+					};
+					results.push(ready);
+					onUpdate?.(ready);
+					continue;
+				}
+				const extracted = await extractPDFDocument(file);
+				if (!activeModelId) {
+					const waitingDiagnostics = AttachmentService.setDiagnosticStage(
+						diagnostics,
+						'waiting-model'
+					);
+					const pending = {
+						...base,
+						textContent: extracted.text,
+						attachmentProcessing: {
+							stage: 'waiting-model' as const,
+							extracted,
+							diagnostics: waitingDiagnostics
+						},
+						isLoading: false
+					};
+					results.push(pending);
+					onUpdate?.(pending);
+					continue;
+				}
+				const processing = await AttachmentService.processExtracted(
+					base,
+					extracted,
+					activeModelId,
+					undefined,
+					(stage, stageDiagnostics) =>
+						onUpdate?.({
+							...base,
+							textContent: extracted.text,
+							attachmentProcessing: {
+								stage,
+								extracted,
+								diagnostics: stageDiagnostics
+							},
+							isLoading: true
+						}),
+					diagnostics
+				);
+				const ready = {
+					...base,
+					textContent: extracted.text,
+					attachmentProcessing: processing,
+					isLoading: false
+				};
+				results.push(ready);
+				onUpdate?.(ready);
 			} else if (getFileTypeCategory(file.type) === FileTypeCategory.AUDIO) {
 				// Generate preview URL for audio files
 				const preview = await readFileAsDataURL(file);
-				results.push({ ...base, preview });
+				const ready = { ...base, preview, isLoading: false, attachmentProcessing: undefined };
+				results.push(ready);
+				onUpdate?.(ready);
 			} else if (getFileTypeCategory(file.type) === FileTypeCategory.VIDEO) {
 				// Generate preview URL for video files
 				const preview = await readFileAsDataURL(file);
-				results.push({ ...base, preview });
+				const ready = { ...base, preview, isLoading: false, attachmentProcessing: undefined };
+				results.push(ready);
+				onUpdate?.(ready);
 			} else {
 				// Fallback: treat unknown files as text
-				try {
-					const textContent = await readFileAsUTF8(file);
-					results.push({ ...base, textContent });
-				} catch (err) {
-					console.warn('Failed to read file as text, adding without content:', err);
-					results.push(base);
+				const textContent = await readFileAsUTF8(file);
+				if (!textContent.trim()) throw new Error('Attachment is empty');
+				const extracted: ExtractedAttachment = {
+					text: textContent,
+					extractor: 'text',
+					segments: [{ text: textContent }]
+				};
+				if (!activeModelId) {
+					const waitingDiagnostics = AttachmentService.setDiagnosticStage(
+						diagnostics,
+						'waiting-model'
+					);
+					const pending = {
+						...base,
+						textContent,
+						attachmentProcessing: {
+							stage: 'waiting-model' as const,
+							extracted,
+							diagnostics: waitingDiagnostics
+						},
+						isLoading: false
+					};
+					results.push(pending);
+					onUpdate?.(pending);
+					continue;
 				}
+				const processing = await AttachmentService.processExtracted(
+					base,
+					extracted,
+					activeModelId,
+					undefined,
+					(stage, stageDiagnostics) =>
+						onUpdate?.({
+							...base,
+							textContent,
+							attachmentProcessing: {
+								stage,
+								extracted,
+								diagnostics: stageDiagnostics
+							},
+							isLoading: true
+						}),
+					diagnostics
+				);
+				const ready = {
+					...base,
+					textContent,
+					attachmentProcessing: processing,
+					isLoading: false
+				};
+				results.push(ready);
+				onUpdate?.(ready);
 			}
 		} catch (error) {
 			console.error('Error processing file', file.name, error);
-			results.push(base);
+			const message = error instanceof Error ? error.message : String(error);
+			const failed = {
+				...base,
+				isLoading: false,
+				loadError: message,
+				attachmentProcessing: {
+					stage: 'failed' as const,
+					error: message,
+					diagnostics:
+						error instanceof AttachmentProcessingError
+							? error.diagnostics
+							: AttachmentService.failDiagnostics(diagnostics, message)
+				}
+			};
+			results.push(failed);
+			onUpdate?.(failed);
 		}
 	}
 

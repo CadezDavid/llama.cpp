@@ -37,6 +37,7 @@ import type { SettingsExportType } from '$lib/types';
 import { setMode } from 'mode-watcher';
 import {
 	CONFIG_LOCALSTORAGE_KEY,
+	DEFAULT_EMBEDDING_MODEL,
 	SETTING_CONFIG_DEFAULT,
 	SETTINGS_KEYS,
 	USER_OVERRIDES_LOCALSTORAGE_KEY
@@ -50,6 +51,8 @@ import {
 	getConfigValue,
 	setConfigValue
 } from '$lib/utils';
+
+const LEGACY_EMBEDDING_MODEL = 'embeddinggemma-300M-Q8_0.gguf';
 
 class SettingsStore {
 	/**
@@ -105,6 +108,13 @@ class SettingsStore {
 		this.config[SETTINGS_KEYS.COMPACTION_PROTECTED_TURNS] = protectedTurns;
 	}
 
+	private migrateLegacyEmbeddingModel(): boolean {
+		if (this.config[SETTINGS_KEYS.EMBEDDING_MODEL] !== LEGACY_EMBEDDING_MODEL) return false;
+		this.config[SETTINGS_KEYS.EMBEDDING_MODEL] = DEFAULT_EMBEDDING_MODEL;
+		this.userOverrides.delete(SETTINGS_KEYS.EMBEDDING_MODEL);
+		return true;
+	}
+
 	constructor() {
 		if (browser) {
 			this.initialize();
@@ -154,6 +164,9 @@ class SettingsStore {
 			if (Number(this.config[SETTINGS_KEYS.SPOMIN_TIMEOUT_MS]) === 750) {
 				this.config[SETTINGS_KEYS.SPOMIN_TIMEOUT_MS] = 2000;
 			}
+			if (Number(this.config[SETTINGS_KEYS.SEMANTIC_RECALL_THRESHOLD]) === 0.62) {
+				this.config[SETTINGS_KEYS.SEMANTIC_RECALL_THRESHOLD] = 0.58;
+			}
 
 			// Default sendOnEnter to false on mobile when the user has no saved preference
 			if (!(SETTINGS_KEYS.SEND_ON_ENTER in savedVal)) {
@@ -167,6 +180,7 @@ class SettingsStore {
 				localStorage.getItem(USER_OVERRIDES_LOCALSTORAGE_KEY) || '[]'
 			);
 			this.userOverrides = new Set(savedOverrides);
+			if (this.migrateLegacyEmbeddingModel()) this.saveConfig();
 		} catch (error) {
 			console.warn('Failed to parse config from localStorage, using defaults:', error);
 			this.config = { ...SETTING_CONFIG_DEFAULT };
@@ -556,6 +570,7 @@ class SettingsStore {
 
 		// Restore user overrides (derived state — may be stale if server defaults differ)
 		this.userOverrides = new Set(data.userOverrides ?? []);
+		this.migrateLegacyEmbeddingModel();
 
 		// Persist to localStorage
 		this.saveConfig();

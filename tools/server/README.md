@@ -522,6 +522,8 @@ These words will not be included in the completion, so make sure to add them to 
 
 `cache_prompt`: Re-use KV cache from a previous request if possible. This way the common prefix does not have to be re-processed, only the suffix that differs between the requests. Because (depending on the backend) the logits are **not** guaranteed to be bit-for-bit identical for different batch sizes (prompt processing vs. token generation) enabling this option can cause nondeterministic results. Default: `true`
 
+`cache_ram_store`: Allow the prompt state produced by this request to be saved to the server RAM cache when its slot is reused. Set this to `false` for transient work whose state should be discarded instead of competing with reusable conversations in `--cache-ram`. This does not prevent an existing prompt from being saved before the request starts. Default: `true`
+
 `return_tokens`: Return the raw generated token ids in the `tokens` field. Otherwise `tokens` remains empty. Default: `false`
 
 `samplers`: The order the samplers should be applied in. An array of strings representing sampler type names. If a sampler is not set, it will not be used. If a sampler is specified more than once, it will be applied multiple times. Default: `["dry", "top_k", "typ_p", "top_p", "min_p", "xtc", "temperature"]` - these are all the available values.

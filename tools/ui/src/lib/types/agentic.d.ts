@@ -8,6 +8,7 @@ import type {
 } from './api';
 import type { ChatMessageTimings, ChatMessagePromptProgress } from './chat';
 import type { DatabaseMessage, DatabaseMessageExtra, McpServerOverride } from './database';
+import type { OpenAIToolDefinition } from './mcp';
 
 /**
  * Agentic orchestration configuration.
@@ -155,6 +156,12 @@ export interface AgenticFlowParams {
 	callbacks: AgenticFlowCallbacks;
 	signal?: AbortSignal;
 	perChatOverrides?: McpServerOverride[];
+	internalTools?: OpenAIToolDefinition[];
+	executeInternalTool?: (
+		name: string,
+		args: Record<string, unknown>,
+		signal?: AbortSignal
+	) => Promise<string>;
 }
 
 /**

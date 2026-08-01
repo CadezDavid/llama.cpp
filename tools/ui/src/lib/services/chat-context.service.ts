@@ -34,9 +34,8 @@ export class ChatContextService {
 			input.transcriptMessages,
 			input.projections ?? []
 		);
-		const projectedInputs = ChatContextService.applyProjections(
-			input.transcriptMessages,
-			projections
+		const projectedInputs = ChatContextService.removeOldAttachmentToolExchanges(
+			ChatContextService.applyProjections(input.transcriptMessages, projections)
 		);
 		const stableMessages = await ChatService.prepareMessages(projectedInputs, {
 			model: input.model,
@@ -200,6 +199,56 @@ export class ChatContextService {
 			}
 			result.push(messages[messageIndex]);
 			messageIndex++;
+		}
+		return result;
+	}
+
+	private static removeOldAttachmentToolExchanges(
+		messages: ChatMessageInput[]
+	): ChatMessageInput[] {
+		const attachmentTools = new Set(['attachment_search', 'attachment_read']);
+		const result: ChatMessageInput[] = [];
+		for (let index = 0; index < messages.length; index++) {
+			const message = messages[index];
+			if (
+				'role' in message &&
+				message.role === MessageRole.ASSISTANT &&
+				'toolCalls' in message &&
+				typeof message.toolCalls === 'string' &&
+				message.toolCalls
+			) {
+				try {
+					const calls = JSON.parse(message.toolCalls) as ApiChatCompletionToolCall[];
+					const ids = new Set(calls.map((call) => call.id));
+					const onlyAttachmentTools =
+						calls.length > 0 &&
+						calls.every((call) => attachmentTools.has(call.function?.name ?? ''));
+					let end = index + 1;
+					while (end < messages.length) {
+						const candidate = messages[end];
+						if (
+							!('role' in candidate) ||
+							candidate.role !== MessageRole.TOOL ||
+							!('toolCallId' in candidate) ||
+							typeof candidate.toolCallId !== 'string' ||
+							!ids.has(candidate.toolCallId)
+						) {
+							break;
+						}
+						end++;
+					}
+					const hasLaterUser = messages
+						.slice(end)
+						.some((candidate) => 'role' in candidate && candidate.role === MessageRole.USER);
+					if (onlyAttachmentTools && end > index + 1 && hasLaterUser) {
+						index = end - 1;
+						continue;
+					}
+				} catch {
+					// Malformed historical tool calls remain visible to the normal validator.
+				}
+			}
+			result.push(message);
 		}
 		return result;
 	}

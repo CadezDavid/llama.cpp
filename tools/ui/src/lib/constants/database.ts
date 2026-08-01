@@ -19,7 +19,9 @@ export const IDXDB_TABLES = {
 	archiveChunks: 'archiveChunks',
 	archiveTerms: 'archiveTerms',
 	retrievalTraces: 'retrievalTraces',
-	retrievalHitUsage: 'retrievalHitUsage'
+	retrievalHitUsage: 'retrievalHitUsage',
+	attachments: 'attachments',
+	attachmentChunks: 'attachmentChunks'
 } as const;
 
 /** IndexedDB store schemas */
@@ -32,7 +34,9 @@ export const IDXDB_STORE_SCHEMAS = {
 	archiveChunks: 'id, conversationId, compactionId, embeddingStatus, createdAt',
 	archiveTerms: 'id, conversationId, chunkId, term, [conversationId+term]',
 	retrievalTraces: 'id, conversationId, anchorMessageId, createdAt',
-	retrievalHitUsage: 'id, conversationId, hitId, updatedAt'
+	retrievalHitUsage: 'id, conversationId, hitId, updatedAt',
+	attachments: 'id, conversationId, messageId, status, createdAt',
+	attachmentChunks: 'id, attachmentId, conversationId, ordinal, embeddingStatus'
 } as const;
 
 export const IDXDB_STORES_V1 = {
@@ -54,4 +58,10 @@ export const IDXDB_STORES_V3 = {
 	[IDXDB_TABLES.archiveTerms]: IDXDB_STORE_SCHEMAS.archiveTerms,
 	[IDXDB_TABLES.retrievalTraces]: IDXDB_STORE_SCHEMAS.retrievalTraces,
 	[IDXDB_TABLES.retrievalHitUsage]: IDXDB_STORE_SCHEMAS.retrievalHitUsage
+} as const;
+
+export const IDXDB_STORES_V4 = {
+	...IDXDB_STORES_V3,
+	[IDXDB_TABLES.attachments]: IDXDB_STORE_SCHEMAS.attachments,
+	[IDXDB_TABLES.attachmentChunks]: IDXDB_STORE_SCHEMAS.attachmentChunks
 } as const;

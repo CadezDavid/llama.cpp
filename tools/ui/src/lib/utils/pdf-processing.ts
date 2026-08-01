@@ -8,8 +8,10 @@ import { MimeTypeApplication, MimeTypeImage } from '$lib/enums';
 import * as pdfjs from 'pdfjs-dist';
 
 type TextContent = {
-	items: Array<{ str: string }>;
+	items: Array<{ str: string; hasEOL?: boolean }>;
 };
+
+import type { ExtractedAttachment } from '$lib/types';
 
 if (browser) {
 	// Import worker as text and create blob URL for inline bundling
@@ -51,6 +53,10 @@ async function getFileAsBuffer(file: File): Promise<ArrayBuffer> {
  * @returns Promise resolving to the extracted text content
  */
 export async function convertPDFToText(file: File): Promise<string> {
+	return (await extractPDFDocument(file)).text;
+}
+
+export async function extractPDFDocument(file: File): Promise<ExtractedAttachment> {
 	if (!browser) {
 		throw new Error('PDF processing is only available in the browser');
 	}
@@ -68,11 +74,25 @@ export async function convertPDFToText(file: File): Promise<string> {
 		}
 
 		const textContents = await Promise.all(textContentPromises);
-		const textItems = textContents.flatMap((textContent: TextContent) =>
-			textContent.items.map((item) => item.str ?? '')
-		);
-
-		return textItems.join('\n');
+		const segments = textContents.map((textContent: TextContent, pageIndex) => {
+			let text = '';
+			for (const item of textContent.items) {
+				const value = item.str ?? '';
+				if (!value) continue;
+				text += value;
+				text += item.hasEOL ? '\n' : ' ';
+			}
+			return { page: pageIndex + 1, text: text.trim() };
+		});
+		const nonEmpty = segments.filter((segment) => segment.text);
+		if (nonEmpty.length === 0) {
+			throw new Error('PDF contains no extractable text');
+		}
+		return {
+			extractor: 'pdfjs',
+			segments: nonEmpty,
+			text: nonEmpty.map((segment) => `[Page ${segment.page}]\n${segment.text}`).join('\n\n')
+		};
 	} catch (error) {
 		console.error('Error converting PDF to text:', error);
 		throw new Error(

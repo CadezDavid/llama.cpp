@@ -1,4 +1,4 @@
-import { convertPDFToImage, convertPDFToText } from './pdf-processing';
+import { convertPDFToImage } from './pdf-processing';
 import { isSvgMimeType, svgBase64UrlToPngDataURL } from './svg-to-png';
 import { isWebpMimeType, webpBase64UrlToPngDataURL } from './webp-to-png';
 import { FileTypeCategory, AttachmentType, SpecialFileType } from '$lib/enums';
@@ -35,6 +35,9 @@ export async function parseFilesToMessageExtras(
 	const emptyFiles: string[] = [];
 
 	for (const file of files) {
+		if (file.loadError || file.attachmentProcessing?.stage === 'failed') {
+			throw new Error(`Attachment "${file.name}" failed: ${file.loadError ?? 'processing failed'}`);
+		}
 		if (file.type === SpecialFileType.MCP_PROMPT && file.mcpPrompt) {
 			extras.push({
 				type: AttachmentType.MCP_PROMPT,
@@ -137,47 +140,34 @@ export async function parseFilesToMessageExtras(
 
 				if (shouldProcessAsImages) {
 					// Process PDF as images (only for vision models)
-					try {
-						const images = await convertPDFToImage(file.file);
+					const images = await convertPDFToImage(file.file);
 
-						// Show success toast for PDF image processing
-						toast.success(
-							`PDF "${file.name}" processed as ${images.length} images for vision model.`,
-							{
-								duration: 3000
-							}
-						);
+					// Show success toast for PDF image processing
+					toast.success(
+						`PDF "${file.name}" processed as ${images.length} images for vision model.`,
+						{
+							duration: 3000
+						}
+					);
 
-						extras.push({
-							type: AttachmentType.PDF,
-							name: file.name,
-							size: file.size,
-							content: `PDF file with ${images.length} pages`,
-							images: images,
-							processedAsImages: true,
-							base64Data: base64Data
-						});
-					} catch (imageError) {
-						console.warn(
-							`Failed to process PDF ${file.name} as images, falling back to text:`,
-							imageError
-						);
-
-						// Fallback to text processing
-						const content = await convertPDFToText(file.file);
-
-						extras.push({
-							type: AttachmentType.PDF,
-							name: file.name,
-							size: file.size,
-							content: content,
-							processedAsImages: false,
-							base64Data: base64Data
-						});
-					}
+					extras.push({
+						type: AttachmentType.PDF,
+						name: file.name,
+						size: file.size,
+						content: `PDF file with ${images.length} pages`,
+						images: images,
+						processedAsImages: true,
+						base64Data: base64Data,
+						processingMode: 'vision'
+					});
 				} else {
 					// Process PDF as text (default or forced for non-vision models)
-					const content = await convertPDFToText(file.file);
+					const processing = file.attachmentProcessing;
+					if (!processing || processing.stage !== 'ready' || !processing.extracted) {
+						throw new Error(`PDF "${file.name}" has not finished processing`);
+					}
+					const indexed = processing.mode === 'indexed';
+					const content = indexed ? '' : processing.extracted.text;
 
 					// Show success toast for PDF text processing
 					toast.success(`PDF "${file.name}" processed as text content.`, {
@@ -190,15 +180,21 @@ export async function parseFilesToMessageExtras(
 						size: file.size,
 						content: content,
 						processedAsImages: false,
-						base64Data: base64Data
+						base64Data: base64Data,
+						processingMode: indexed ? 'indexed' : 'inline',
+						attachmentId: processing.attachmentId,
+						summary: processing.summary,
+						sourceTokenCount: processing.sourceTokenCount
 					});
 				}
 			} catch (error) {
 				console.error(`Failed to process PDF file ${file.name}:`, error);
+				throw error;
 			}
 		} else {
 			try {
-				const content = await readFileAsText(file.file);
+				const processing = file.attachmentProcessing;
+				const content = processing?.extracted?.text ?? (await readFileAsText(file.file));
 
 				// Check if file is empty
 				if (content.trim() === '') {
@@ -209,13 +205,18 @@ export async function parseFilesToMessageExtras(
 						type: AttachmentType.TEXT,
 						name: file.name,
 						size: file.size,
-						content: content
+						content: processing?.mode === 'indexed' ? '' : content,
+						processingMode: processing?.mode,
+						attachmentId: processing?.attachmentId,
+						summary: processing?.summary,
+						sourceTokenCount: processing?.sourceTokenCount
 					});
 				} else {
 					console.warn(`File ${file.name} appears to be binary and will be skipped`);
 				}
 			} catch (error) {
 				console.error(`Failed to read file ${file.name}:`, error);
+				throw error;
 			}
 		}
 	}

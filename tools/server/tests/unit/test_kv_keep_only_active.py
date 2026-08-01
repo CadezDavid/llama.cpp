@@ -113,3 +113,38 @@ def test_disabled_with_flag():
     })
     assert res.status_code == 200
     assert "__TEST_TAG_CACHE_IDLE_SLOT__" not in log.drain()
+
+
+def test_transient_prompt_does_not_replace_ram_cached_prompt():
+    global server
+    server.n_slots = 1
+    server.start()
+    log = LogReader(server.log_path)
+    log.drain()
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": LONG_PROMPT,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    original_prompt_n = res.body["timings"]["prompt_n"]
+    log.drain()
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "Summarize this temporary attachment.",
+        "cache_prompt": True,
+        "cache_ram_store": False,
+    })
+    assert res.status_code == 200
+    assert "saving prompt with length" in log.drain()
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": LONG_PROMPT + " The knight finally reached the castle gates.",
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    logs = log.drain()
+    assert "skipping transient prompt state for RAM cache" in logs
+    assert "found better prompt" in logs
+    assert res.body["timings"]["cache_n"] > 0
+    assert res.body["timings"]["prompt_n"] < original_prompt_n

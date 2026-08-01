@@ -9,6 +9,9 @@
 
 import { processFilesToChatUploaded } from '$lib/utils/browser-only';
 import { isFileTypeSupported, filterFilesByModalities } from '$lib/utils';
+import { AttachmentProcessingError, AttachmentService } from '$lib/services/attachment.service';
+import { modelsStore } from '$lib/stores/models.svelte';
+import { isRouterMode } from '$lib/stores/server.svelte';
 
 interface UseChatScreenFileUploadOptions {
 	capabilities: () => { hasVision: boolean; hasAudio: boolean; hasVideo: boolean };
@@ -30,6 +33,91 @@ export function useChatScreenFileUpload(options: UseChatScreenFileUploadOptions)
 		modalityUnsupported: [],
 		modalityReasons: {},
 		supportedTypes: []
+	});
+	let classifiedModelId = $state<string | null | undefined>(options.activeModelId());
+
+	$effect(() => {
+		const modelId = options.activeModelId();
+		if (!modelId) return;
+		if (isRouterMode() && !modelsStore.isModelLoaded(modelId)) return;
+		const modelChanged = modelId !== classifiedModelId;
+		classifiedModelId = modelId;
+		for (const file of uploadedFiles) {
+			const processing = file.attachmentProcessing;
+			const shouldProcess =
+				processing?.stage === 'waiting-model' ||
+				(modelChanged && processing?.stage === 'ready' && processing.mode === 'inline');
+			if (!shouldProcess || !processing.extracted) {
+				continue;
+			}
+			uploadedFiles = uploadedFiles.map((candidate) =>
+				candidate.id === file.id
+					? {
+							...candidate,
+							isLoading: true,
+							loadError: undefined,
+							attachmentProcessing: {
+								...processing,
+								stage: 'measuring'
+							}
+						}
+					: candidate
+			);
+			AttachmentService.processExtracted(
+				file,
+				processing.extracted,
+				modelId,
+				undefined,
+				(stage, diagnostics) => {
+					uploadedFiles = uploadedFiles.map((candidate) =>
+						candidate.id === file.id
+							? {
+									...candidate,
+									attachmentProcessing: {
+										...processing,
+										stage,
+										diagnostics
+									}
+								}
+							: candidate
+					);
+				},
+				processing.diagnostics
+			)
+				.then((updated) => {
+					if (!uploadedFiles.some((candidate) => candidate.id === file.id)) {
+						AttachmentService.discardPending(updated?.attachmentId);
+						return;
+					}
+					uploadedFiles = uploadedFiles.map((candidate) =>
+						candidate.id === file.id
+							? { ...candidate, isLoading: false, attachmentProcessing: updated }
+							: candidate
+					);
+				})
+				.catch((error: unknown) => {
+					const message = error instanceof Error ? error.message : String(error);
+					uploadedFiles = uploadedFiles.map((candidate) =>
+						candidate.id === file.id
+							? {
+									...candidate,
+									isLoading: false,
+									loadError: message,
+									attachmentProcessing: {
+										stage: 'failed',
+										error: message,
+										diagnostics:
+											error instanceof AttachmentProcessingError
+												? error.diagnostics
+												: processing.diagnostics
+													? AttachmentService.failDiagnostics(processing.diagnostics, message)
+													: undefined
+									}
+								}
+							: candidate
+					);
+				});
+		}
 	});
 
 	async function processFiles(files: File[]) {
@@ -68,11 +156,18 @@ export function useChatScreenFileUpload(options: UseChatScreenFileUploadOptions)
 		}
 
 		if (supportedFiles.length > 0) {
-			const processed = await processFilesToChatUploaded(
-				supportedFiles,
-				options.activeModelId() ?? undefined
-			);
-			uploadedFiles = [...uploadedFiles, ...processed];
+			const modelId = options.activeModelId();
+			const readyModelId =
+				modelId && (!isRouterMode() || modelsStore.isModelLoaded(modelId)) ? modelId : undefined;
+			await processFilesToChatUploaded(supportedFiles, readyModelId, (updated) => {
+				const index = uploadedFiles.findIndex((candidate) => candidate.id === updated.id);
+				uploadedFiles =
+					index === -1
+						? [...uploadedFiles, updated]
+						: uploadedFiles.map((candidate, candidateIndex) =>
+								candidateIndex === index ? updated : candidate
+							);
+			});
 		}
 	}
 
@@ -81,6 +176,10 @@ export function useChatScreenFileUpload(options: UseChatScreenFileUploadOptions)
 	}
 
 	function handleFileRemove(fileId: string) {
+		const file = uploadedFiles.find((candidate) => candidate.id === fileId);
+		if (file) {
+			AttachmentService.discardPending(file.attachmentProcessing?.attachmentId);
+		}
 		uploadedFiles = uploadedFiles.filter((f) => f.id !== fileId);
 	}
 
@@ -97,7 +196,9 @@ export function useChatScreenFileUpload(options: UseChatScreenFileUploadOptions)
 		set showFileErrorDialog(value) {
 			showFileErrorDialog = value;
 		},
-		fileErrorData,
+		get fileErrorData() {
+			return fileErrorData;
+		},
 		handleFileUpload,
 		handleFileRemove
 	};

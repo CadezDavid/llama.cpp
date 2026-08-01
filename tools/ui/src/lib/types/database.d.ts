@@ -67,6 +67,10 @@ export interface DatabaseMessageExtraPdfFile {
 	content: string;
 	images?: string[];
 	processedAsImages: boolean;
+	processingMode?: 'inline' | 'indexed' | 'vision';
+	attachmentId?: string;
+	summary?: string;
+	sourceTokenCount?: number;
 }
 
 export interface DatabaseMessageExtraTextFile {
@@ -74,6 +78,87 @@ export interface DatabaseMessageExtraTextFile {
 	name: string;
 	size?: number;
 	content: string;
+	processingMode?: 'inline' | 'indexed';
+	attachmentId?: string;
+	summary?: string;
+	sourceTokenCount?: number;
+}
+
+export type AttachmentDiagnosticStage =
+	| 'extracting'
+	| 'waiting-model'
+	| 'measuring'
+	| 'summarizing'
+	| 'indexing'
+	| 'ready'
+	| 'failed';
+
+export interface AttachmentDiagnosticBatch {
+	ordinal: number;
+	inputCount: number;
+	tokenCount: number;
+	durationMs: number;
+	status: 'ready' | 'failed';
+	httpStatus?: number;
+	error?: string;
+}
+
+export interface AttachmentProcessingDiagnostics {
+	id: string;
+	createdAt: number;
+	updatedAt: number;
+	stage: AttachmentDiagnosticStage;
+	stageStartedAt: number;
+	generationModel?: string;
+	embeddingModel?: string;
+	generationContextSize?: number;
+	embeddingContextSize?: number;
+	sourceTokenCount?: number;
+	summaryPromptTokenCount?: number;
+	chunkCount?: number;
+	stageDurationsMs: Partial<Record<AttachmentDiagnosticStage, number>>;
+	batches: AttachmentDiagnosticBatch[];
+	failure?: {
+		stage: AttachmentDiagnosticStage;
+		message: string;
+		httpStatus?: number;
+	};
+}
+
+export interface DatabaseAttachment {
+	id: string;
+	conversationId: string;
+	messageId: string;
+	name: string;
+	mimeType: string;
+	size: number;
+	extractor: 'text' | 'pdfjs';
+	extractedText: string;
+	summary: string;
+	sourceTokenCount: number;
+	tokenizerModel: string;
+	summarizerModel: string;
+	embeddingModel: string;
+	embeddingDimensions: number;
+	chunkingVersion: number;
+	status: 'ready' | 'stale';
+	createdAt: number;
+	diagnostics?: AttachmentProcessingDiagnostics;
+}
+
+export interface DatabaseAttachmentChunk {
+	id: string;
+	attachmentId: string;
+	conversationId: string;
+	ordinal: number;
+	text: string;
+	pageStart?: number;
+	pageEnd?: number;
+	section?: string;
+	embedding?: number[];
+	embeddingModel: string;
+	embeddingDimensions: number;
+	embeddingStatus: 'ready' | 'pending';
 }
 
 export interface DatabaseMessageExtraMcpPrompt {
@@ -140,6 +225,8 @@ export type ExportedConversation = {
 	archiveChunks?: DatabaseArchiveChunk[];
 	retrievalTraces?: DatabaseRetrievalTrace[];
 	retrievalHitUsage?: DatabaseRetrievalHitUsage[];
+	attachments?: DatabaseAttachment[];
+	attachmentChunks?: DatabaseAttachmentChunk[];
 };
 
 export type ExportedConversations = ExportedConversation | ExportedConversation[];

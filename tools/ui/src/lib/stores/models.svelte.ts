@@ -80,7 +80,7 @@ class ModelsStore {
 		ttlMs: MODEL_PROPS_CACHE_TTL_MS,
 		maxEntries: MODEL_PROPS_CACHE_MAX_ENTRIES
 	});
-	private modelPropsFetching = $state<Set<string>>(new Set());
+	private modelPropsInflight = new SvelteMap<string, Promise<ApiLlamaCppServerProps | null>>();
 
 	/**
 	 * Version counter for props cache — used to trigger reactivity when props are updated.
@@ -198,7 +198,7 @@ class ModelsStore {
 	}
 
 	isModelPropsFetching(modelId: string): boolean {
-		return this.modelPropsFetching.has(modelId);
+		return this.modelPropsInflight.has(modelId);
 	}
 
 	/**
@@ -381,26 +381,31 @@ class ModelsStore {
 	private buildModelOptions(
 		response: ApiModelListResponse | ApiRouterModelsListResponse
 	): ModelOption[] {
-		return response.data.map((item: ApiModelDataEntry, index: number) => {
-			const details = response.models?.[index];
-			const rawCapabilities = Array.isArray(details?.capabilities) ? details?.capabilities : [];
-			const displayNameSource =
-				details?.name && details.name.trim().length > 0 ? details.name : item.id;
-			const modelId = details?.model || item.id;
+		const entries: Array<{ item: ApiModelDataEntry; index: number }> = response.data.map(
+			(item: ApiModelDataEntry, index: number) => ({ item, index })
+		);
+		return entries
+			.filter(({ item }) => item.group !== 'auxiliary')
+			.map(({ item, index }) => {
+				const details = response.models?.[index];
+				const rawCapabilities = Array.isArray(details?.capabilities) ? details?.capabilities : [];
+				const displayNameSource =
+					details?.name && details.name.trim().length > 0 ? details.name : item.id;
+				const modelId = details?.model || item.id;
 
-			return {
-				id: item.id,
-				name: this.toDisplayName(displayNameSource),
-				model: modelId,
-				description: details?.description,
-				capabilities: rawCapabilities.filter((value: unknown): value is string => Boolean(value)),
-				details: details?.details,
-				meta: item.meta ?? null,
-				parsedId: ModelsService.parseModelId(modelId),
-				aliases: item.aliases ?? [],
-				tags: item.tags ?? []
-			};
-		});
+				return {
+					id: item.id,
+					name: this.toDisplayName(displayNameSource),
+					model: modelId,
+					description: details?.description,
+					capabilities: rawCapabilities.filter((value: unknown): value is string => Boolean(value)),
+					details: details?.details,
+					meta: item.meta ?? null,
+					parsedId: ModelsService.parseModelId(modelId),
+					aliases: item.aliases ?? [],
+					tags: item.tags ?? []
+				};
+			});
 	}
 
 	/**
@@ -444,21 +449,24 @@ class ModelsStore {
 			return null;
 		}
 
-		if (this.modelPropsFetching.has(modelId)) return null;
+		const inflight = this.modelPropsInflight.get(modelId);
+		if (inflight) return inflight;
 
-		this.modelPropsFetching.add(modelId);
-
-		try {
-			const props = await PropsService.fetchForModel(modelId);
-			this.modelPropsCache.set(modelId, props);
-			this.propsCacheVersion++;
-			return props;
-		} catch (error) {
-			console.warn(`Failed to fetch props for model ${modelId}:`, error);
-			return null;
-		} finally {
-			this.modelPropsFetching.delete(modelId);
-		}
+		const request = (async () => {
+			try {
+				const props = await PropsService.fetchForModel(modelId);
+				this.modelPropsCache.set(modelId, props);
+				this.propsCacheVersion++;
+				return props;
+			} catch (error) {
+				console.warn(`Failed to fetch props for model ${modelId}:`, error);
+				return null;
+			} finally {
+				this.modelPropsInflight.delete(modelId);
+			}
+		})();
+		this.modelPropsInflight.set(modelId, request);
+		return request;
 	}
 
 	/** Fetch modalities for all loaded models from /props endpoint. */
@@ -1014,7 +1022,7 @@ class ModelsStore {
 		this.modelUsage.clear();
 		this.modelLoadingStates.clear();
 		this.modelPropsCache.clear();
-		this.modelPropsFetching.clear();
+		this.modelPropsInflight.clear();
 	}
 
 	/**

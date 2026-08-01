@@ -70,7 +70,11 @@ export type {
 	LiveProcessingStats,
 	LiveGenerationStats,
 	AttachmentDisplayItemsOptions,
-	FileProcessingResult
+	FileProcessingResult,
+	AttachmentProcessingStage,
+	ExtractedAttachmentSegment,
+	ExtractedAttachment,
+	AttachmentProcessingResult
 } from './chat.d';
 
 export type {
@@ -112,6 +116,11 @@ export type {
 	DatabaseMessageExtraTextFile,
 	DatabaseMessageExtra,
 	DatabaseMessage,
+	DatabaseAttachment,
+	DatabaseAttachmentChunk,
+	AttachmentDiagnosticStage,
+	AttachmentDiagnosticBatch,
+	AttachmentProcessingDiagnostics,
 	ExportedConversation,
 	ExportedConversations
 } from './database';

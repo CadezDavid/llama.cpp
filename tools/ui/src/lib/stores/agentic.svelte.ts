@@ -283,13 +283,18 @@ class AgenticStore {
 		return msg;
 	}
 
-	getConfig(settings: SettingsConfigType, perChatOverrides?: McpServerOverride[]): AgenticConfig {
+	getConfig(
+		settings: SettingsConfigType,
+		perChatOverrides?: McpServerOverride[],
+		internalToolCount = 0
+	): AgenticConfig {
 		const maxTurns = Number(settings.agenticMaxTurns) || DEFAULT_AGENTIC_CONFIG.maxTurns;
 		const hasTools =
 			mcpStore.hasEnabledServers(perChatOverrides) ||
 			toolsStore.builtinTools.length > 0 ||
 			toolsStore.frontendTools.length > 0 ||
-			toolsStore.customTools.length > 0;
+			toolsStore.customTools.length > 0 ||
+			internalToolCount > 0;
 		return {
 			enabled: hasTools && DEFAULT_AGENTIC_CONFIG.enabled,
 			maxTurns
@@ -297,9 +302,10 @@ class AgenticStore {
 	}
 
 	async preparePromptTools(
-		perChatOverrides?: McpServerOverride[]
+		perChatOverrides?: McpServerOverride[],
+		internalTools: ReturnType<typeof toolsStore.getEnabledToolsForLLM> = []
 	): Promise<ReturnType<typeof toolsStore.getEnabledToolsForLLM>> {
-		if (!this.getConfig(config(), perChatOverrides).enabled) return [];
+		if (!this.getConfig(config(), perChatOverrides, internalTools.length).enabled) return [];
 		if (toolsStore.builtinTools.length === 0 && !toolsStore.loading) {
 			await toolsStore.fetchBuiltinTools();
 		}
@@ -307,7 +313,9 @@ class AgenticStore {
 			const initialized = await mcpStore.ensureInitialized(perChatOverrides);
 			if (!initialized) console.log('[AgenticStore] MCP not initialized');
 		}
-		return toolsStore.getEnabledToolsForLLM();
+		const regular = toolsStore.getEnabledToolsForLLM();
+		const names = new Set(regular.map((tool) => tool.function.name));
+		return [...regular, ...internalTools.filter((tool) => !names.has(tool.function.name))];
 	}
 
 	private parseToolArguments(args: string | Record<string, unknown>): Record<string, unknown> {
@@ -401,7 +409,16 @@ class AgenticStore {
 	}
 
 	async runAgenticFlow(params: AgenticFlowParams): Promise<AgenticFlowResult> {
-		const { conversationId, messages, options = {}, callbacks, signal, perChatOverrides } = params;
+		const {
+			conversationId,
+			messages,
+			options = {},
+			callbacks,
+			signal,
+			perChatOverrides,
+			internalTools = [],
+			executeInternalTool
+		} = params;
 
 		// Clear any pending permissions/continue requests for this conversation when starting a new flow
 		this._pendingPermissions.set(conversationId, null);
@@ -410,11 +427,11 @@ class AgenticStore {
 		this._continueResolvers.delete(conversationId);
 		this._steeringMessages.delete(conversationId);
 
-		const agenticConfig = this.getConfig(config(), perChatOverrides);
+		const agenticConfig = this.getConfig(config(), perChatOverrides, internalTools.length);
 		if (!agenticConfig.enabled) return { handled: false };
 
 		const hasMcpServers = mcpStore.hasEnabledServers(perChatOverrides);
-		const tools = await this.preparePromptTools(perChatOverrides);
+		const tools = await this.preparePromptTools(perChatOverrides, internalTools);
 		if (tools.length === 0) {
 			return { handled: false };
 		}
@@ -438,7 +455,9 @@ class AgenticStore {
 				tools,
 				agenticConfig,
 				callbacks,
-				signal
+				signal,
+				internalToolNames: new Set(internalTools.map((tool) => tool.function.name)),
+				executeInternalTool
 			});
 			return { handled: true };
 		} catch (error) {
@@ -467,8 +486,24 @@ class AgenticStore {
 		agenticConfig: AgenticConfig;
 		callbacks: AgenticFlowCallbacks;
 		signal?: AbortSignal;
+		internalToolNames: Set<string>;
+		executeInternalTool?: (
+			name: string,
+			args: Record<string, unknown>,
+			signal?: AbortSignal
+		) => Promise<string>;
 	}): Promise<void> {
-		const { conversationId, messages, options, tools, agenticConfig, callbacks, signal } = params;
+		const {
+			conversationId,
+			messages,
+			options,
+			tools,
+			agenticConfig,
+			callbacks,
+			signal,
+			internalToolNames,
+			executeInternalTool
+		} = params;
 		const {
 			onChunk,
 			onReasoningChunk,
@@ -762,15 +797,13 @@ class AgenticStore {
 				}
 
 				const toolName = toolCall.function.name;
-				const serverLabel = toolsStore.getToolServerLabel(toolName);
+				const isInternal = internalToolNames.has(toolName);
+				const serverLabel = isInternal ? 'Attachments' : toolsStore.getToolServerLabel(toolName);
 
 				// Ask for permission before executing the tool
-				const permission = await this.requestPermission(
-					conversationId,
-					toolName,
-					serverLabel,
-					signal
-				);
+				const permission = isInternal
+					? ToolPermissionDecision.ONCE
+					: await this.requestPermission(conversationId, toolName, serverLabel, signal);
 
 				// Yield to allow Svelte to flush the UI update (hide permission dialog)
 				await new Promise((r) => setTimeout(r, 0));
@@ -797,7 +830,13 @@ class AgenticStore {
 					toolSuccess = false;
 				} else {
 					try {
-						if (
+						if (isInternal) {
+							if (!executeInternalTool) {
+								throw new Error(`No executor is registered for internal tool "${toolName}"`);
+							}
+							const args = this.parseToolArguments(toolCall.function.arguments);
+							result = await executeInternalTool(toolName, args, signal);
+						} else if (
 							toolSource === ToolSource.BUILTIN &&
 							toolName === BuiltInTool.EXEC_SHELL_COMMAND &&
 							createToolResultMessage &&

@@ -10,7 +10,8 @@ export const API_CHAT = {
 	COMPLETIONS: './v1/chat/completions',
 	CONTROL: './v1/chat/completions/control',
 	APPLY_TEMPLATE: './apply-template',
-	TOKENIZE: './tokenize'
+	TOKENIZE: './tokenize',
+	EMBEDDINGS: '/v1/embeddings'
 };
 
 // slot introspection, requires the --slots flag on the server
