@@ -116,6 +116,26 @@ LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uin
 
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
+enum llama_vegas_runtime_mode {
+    LLAMA_VEGAS_MODE_DISABLED = 0,
+    LLAMA_VEGAS_MODE_DRAFT    = 1,
+    LLAMA_VEGAS_MODE_VERIFY   = 2,
+};
+
+LLAMA_API bool llama_vegas_enable(
+        struct llama_context * ctx,
+                       float sparse_ratio,
+                     int32_t min_tokens,
+                     int32_t max_tokens,
+                     int32_t max_draft_tokens);
+
+LLAMA_API void llama_vegas_set_mode(
+        struct llama_context * ctx,
+                     int32_t mode,
+                     int32_t prefix_len);
+
+LLAMA_API bool llama_vegas_collect_indices(struct llama_context * ctx);
+
 //
 // model/context data extraction
 //

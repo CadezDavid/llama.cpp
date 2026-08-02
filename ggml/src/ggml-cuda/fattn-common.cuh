@@ -1331,6 +1331,7 @@ void launch_fattn(
 
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
+    const ggml_tensor * vegas = dst->src[5];
 
     ggml_tensor * KQV = dst;
 
@@ -1342,6 +1343,14 @@ void launch_fattn(
     GGML_ASSERT(V->nb[0] == ggml_element_size(V));
 
     GGML_ASSERT(!mask || mask->type == GGML_TYPE_F16);
+    GGML_ASSERT(!vegas || (vegas->type == GGML_TYPE_I32 && ggml_is_contiguous(vegas)));
+
+    const int vegas_top_k = vegas ? ggml_get_op_params_i32(dst, 4) : 0;
+    const int n_kv = vegas ? ggml_get_op_params_i32(dst, 5) : K->ne[1];
+
+    GGML_ASSERT(!vegas || (Q->ne[1] == 1 && Q->ne[3] == 1));
+    GGML_ASSERT(!vegas || (vegas_top_k + 2 == vegas->ne[0] && vegas_top_k > 0));
+    GGML_ASSERT(!vegas || (n_kv >= vegas_top_k && n_kv <= K->ne[1]));
 
     ggml_cuda_pool & pool = ctx.pool();
     cudaStream_t main_stream = ctx.stream();
@@ -1464,7 +1473,7 @@ void launch_fattn(
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths.
-    if (mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1)) {
+    if (!vegas && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1)) {
         const int64_t s31 = mask->nb[1] / sizeof(half2);
         const int64_t s33 = mask->nb[3] / sizeof(half2);
 
@@ -1487,7 +1496,7 @@ void launch_fattn(
     GGML_ASSERT(max_blocks_per_sm > 0);
     int parallel_blocks = max_blocks_per_sm;
 
-    const int ntiles_KV = (K->ne[1] + nbatch_fa - 1) / nbatch_fa; // Max. number of parallel blocks limited by KV cache length.
+    const int ntiles_KV = (n_kv + nbatch_fa - 1) / nbatch_fa; // Max. number of parallel blocks limited by KV cache length.
 
     dim3 blocks_num;
     if (stream_k) {
@@ -1583,16 +1592,20 @@ void launch_fattn(
         (const char *) Q->data,
         K_data,
         V_data,
-        mask ? ((const char *) mask->data) : nullptr,
+        vegas ? ((const char *) vegas->data) : (mask ? ((const char *) mask->data) : nullptr),
         sinks ? ((const char *) sinks->data) : nullptr,
         KV_max.ptr,
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,
         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
-        K->ne[0], K->ne[1], K->ne[2], K->ne[3], nb11, nb12, nb13,
+        K->ne[0], n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,
-        mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
-        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0
+        vegas ? vegas_top_k : (mask ? mask->ne[1] : 0),
+        vegas ? 0 : (mask ? mask->ne[2] : 0),
+        vegas ? -1 : (mask ? mask->ne[3] : 0),
+        vegas ? 0 : (mask ? mask->nb[1] : 0),
+        vegas ? 0 : (mask ? mask->nb[2] : 0),
+        vegas ? 0 : (mask ? mask->nb[3] : 0)
     );
     CUDA_CHECK(cudaGetLastError());
 

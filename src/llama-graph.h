@@ -4,6 +4,7 @@
 #include "llama-batch.h"
 #include "llama-hparams.h"
 #include "llama-adapter.h"
+#include "llama-vegas.h"
 
 #include <cstdint>
 #include <vector>
@@ -164,6 +165,20 @@ public:
     ggml_tensor * pos = nullptr; // I32 [n_batch]
 
     const uint32_t n_pos_per_embd = 1;
+};
+
+class llm_graph_input_vegas_indices : public llm_graph_input_i {
+public:
+    llm_graph_input_vegas_indices(const llama_vegas_state & vegas, int32_t il) : vegas(vegas), il(il) {}
+    virtual ~llm_graph_input_vegas_indices() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * indices = nullptr;
+
+    const llama_vegas_state & vegas;
+    const int32_t il;
 };
 
 // temperature tuning, used by llama4
@@ -687,6 +702,12 @@ struct llm_graph_params {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+    const llama_vegas_state      * vegas;
+
+    llama_vegas_mode vegas_mode;
+    int32_t vegas_prefix_len;
+    int32_t vegas_top_k;
+    int32_t vegas_max_recent_tokens;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -750,6 +771,20 @@ struct llm_graph_params {
         }
 
         if (!samplers_equal(samplers, other.samplers)) {
+            return false;
+        }
+
+        if (vegas_mode != other.vegas_mode) {
+            return false;
+        }
+
+        if (vegas_mode != llama_vegas_mode::disabled &&
+                (vegas_top_k != other.vegas_top_k ||
+                 vegas_max_recent_tokens != other.vegas_max_recent_tokens)) {
+            return false;
+        }
+
+        if (vegas_mode == llama_vegas_mode::verify && vegas_prefix_len != other.vegas_prefix_len) {
             return false;
         }
 
@@ -828,6 +863,9 @@ public:
 
     const std::vector<llm_graph_fused_node> & get_fused_nodes() const { return fused_nodes; }
 
+    void set_vegas_indices(int32_t il, ggml_tensor * indices);
+    const std::vector<ggml_tensor *> & get_vegas_indices() const { return t_vegas_indices; }
+
     void set_params(const llm_graph_params & params);
 
     // important graph nodes
@@ -839,6 +877,7 @@ public:
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
 
     std::vector<ggml_tensor *> t_layer_inp;
+    std::vector<ggml_tensor *> t_vegas_indices;
 
     std::map<llama_seq_id, ggml_tensor *> t_sampled_logits;
     std::map<llama_seq_id, ggml_tensor *> t_candidates;
@@ -927,6 +966,7 @@ struct llm_graph_context {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+    const llama_vegas_state      * vegas;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 

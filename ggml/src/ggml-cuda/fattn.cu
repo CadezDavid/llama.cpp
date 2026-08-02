@@ -418,9 +418,14 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
 #else
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_F16)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_Q4_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q4_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_BF16)
 #endif // GGML_CUDA_FA_ALL_QUANTS
+
+    FATTN_VEC_CASE(512, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0)
 
     // TurboQuant3 KV cache types (always enabled)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0)
@@ -454,6 +459,7 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     // Mixed turbo4/q8_0 KV cache types
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO4_0, GGML_TYPE_Q8_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0,     GGML_TYPE_TURBO4_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0)
 
     // Mixed f16/turbo4 KV cache types
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,      GGML_TYPE_TURBO4_0)
@@ -592,15 +598,18 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
 #ifndef GGML_CUDA_FA_ALL_QUANTS
     if (K->type != V->type) {
-        // Allow mixed KV types for combinations that have FA template instances compiled in:
-        // - turbo2/3/4 + q8_0 (turbo cache work)
-        // - f16/bf16 + q8_0 (common K=f16, V=q8_0 setup)
-        auto is_kv_compat = [](ggml_type t) {
-            return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0
-                || t == GGML_TYPE_Q8_0 || t == GGML_TYPE_F16 || t == GGML_TYPE_BF16;
-        };
-        if (!is_kv_compat(K->type) || !is_kv_compat(V->type)) {
-            return BEST_FATTN_KERNEL_NONE;
+        const bool q8_q4 = K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q4_0;
+        if (!q8_q4) {
+            // Allow mixed KV types for combinations that have FA template instances compiled in:
+            // - turbo2/3/4 + q8_0 (turbo cache work)
+            // - f16/bf16 + q8_0 (common K=f16, V=q8_0 setup)
+            auto is_kv_compat = [](ggml_type t) {
+                return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0
+                    || t == GGML_TYPE_Q8_0 || t == GGML_TYPE_F16 || t == GGML_TYPE_BF16;
+            };
+            if (!is_kv_compat(K->type) || !is_kv_compat(V->type)) {
+                return BEST_FATTN_KERNEL_NONE;
+            }
         }
     }
 #endif // GGML_CUDA_FA_ALL_QUANTS
@@ -766,6 +775,12 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+
+    if (dst->src[5] != nullptr) {
+        GGML_ASSERT(dst->src[0]->ne[1] == 1 && dst->src[0]->ne[3] == 1);
+        ggml_cuda_flash_attn_ext_vec(ctx, dst);
+        return;
+    }
 
     // Fused turbo MMA decode gate (DEFAULT ON — see ggml_cuda_turbo_mma_fused; GGML_TURBO_MMA_FUSED=0 disables).
     // Routes turbo4-K==turbo4-V, D in {128,256}, decode (Q->ne[1] <= 4) onto the GQA-packed

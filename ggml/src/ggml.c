@@ -5521,6 +5521,23 @@ void ggml_flash_attn_ext_add_sinks(
     a->src[4] = sinks;
 }
 
+void ggml_flash_attn_ext_set_vegas(
+        struct ggml_tensor * a,
+        struct ggml_tensor * indices,
+        int32_t              top_k,
+        int32_t              sparse_len) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(a->src[5] == NULL);
+    GGML_ASSERT(indices != NULL && indices->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(indices));
+    GGML_ASSERT(indices->ne[0] == top_k + 2);
+    GGML_ASSERT(top_k > 0 && sparse_len >= top_k);
+
+    a->src[5] = indices;
+    ggml_set_op_params_i32(a, 4, top_k);
+    ggml_set_op_params_i32(a, 5, sparse_len);
+}
+
 // ggml_flash_attn_back
 
 struct ggml_tensor * ggml_flash_attn_back(

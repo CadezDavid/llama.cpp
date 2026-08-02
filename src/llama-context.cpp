@@ -1,5 +1,7 @@
 #include "llama-context.h"
 
+#include <algorithm>
+
 #include "ggml.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
@@ -109,6 +111,8 @@ llama_context::llama_context(
 
     cparams.n_threads               = params.n_threads;
     cparams.n_threads_batch         = params.n_threads_batch;
+    cparams.type_k                  = params.type_k;
+    cparams.type_v                  = params.type_v;
     cparams.yarn_ext_factor         = params.yarn_ext_factor  >= 0.0f ? params.yarn_ext_factor  : hparams.yarn_ext_factor;
     cparams.yarn_attn_factor        = params.yarn_attn_factor >= 0.0f ? params.yarn_attn_factor : hparams.yarn_attn_factor;
     cparams.yarn_beta_fast          = params.yarn_beta_fast   >= 0.0f ? params.yarn_beta_fast   : hparams.yarn_beta_fast;
@@ -1197,6 +1201,113 @@ void llama_context::set_warmup(bool value) {
 
     // warmups are usually with small batches, so no need to reserve
     //sched_need_reserve = true;
+}
+
+bool llama_context::vegas_enable(
+        float sparse_ratio,
+        int32_t min_tokens,
+        int32_t max_tokens,
+        int32_t max_draft_tokens) {
+    if (!(sparse_ratio > 0.0f && sparse_ratio <= 1.0f) ||
+            min_tokens < 1 || max_tokens < 0 || max_draft_tokens < 1) {
+        return false;
+    }
+
+    if (!cparams.flash_attn || !cparams.causal_attn || cparams.n_seq_max != 1) {
+        LLAMA_LOG_ERROR("%s: Vegas requires flash attention, causal attention, and one sequence\n", __func__);
+        return false;
+    }
+
+    if (model.n_gpu_layers() <= model.hparams.n_layer_all) {
+        LLAMA_LOG_ERROR("%s: Vegas requires all model layers on one CUDA device\n", __func__);
+        return false;
+    }
+
+    const auto dev = model.dev_layer(0);
+    const auto reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    if (reg == nullptr || std::strcmp(ggml_backend_reg_name(reg), "CUDA") != 0) {
+        LLAMA_LOG_ERROR("%s: Vegas is CUDA-only\n", __func__);
+        return false;
+    }
+
+    if (model.hparams.use_alibi || model.hparams.f_max_alibi_bias != 0.0f) {
+        LLAMA_LOG_ERROR("%s: Vegas does not support ALiBi\n", __func__);
+        return false;
+    }
+
+    const bool supported_cache =
+        (cparams.type_k == GGML_TYPE_Q8_0 && cparams.type_v == GGML_TYPE_TURBO4_0) ||
+        (cparams.type_k == GGML_TYPE_Q8_0 && cparams.type_v == GGML_TYPE_Q4_0) ||
+        (cparams.type_k == GGML_TYPE_Q4_0 && cparams.type_v == GGML_TYPE_Q4_0) ||
+        (cparams.type_k == GGML_TYPE_Q8_0 && cparams.type_v == GGML_TYPE_Q8_0);
+    if (!supported_cache) {
+        LLAMA_LOG_ERROR("%s: Vegas requires q8_0/turbo4, q8_0/q4_0, q4_0/q4_0, or q8_0/q8_0 KV cache\n", __func__);
+        return false;
+    }
+
+    vegas.mode         = llama_vegas_mode::disabled;
+    vegas.sparse_ratio = sparse_ratio;
+    vegas.min_tokens   = min_tokens;
+    vegas.max_tokens   = max_tokens;
+    vegas.prefix_len   = 0;
+    vegas.top_k        = 0;
+    vegas.max_recent_tokens = 2 * max_draft_tokens;
+    vegas.indices.clear();
+    vegas.indices.resize(model.hparams.n_layer());
+
+    sched_need_reserve = true;
+
+    return true;
+}
+
+void llama_context::vegas_set_mode(llama_vegas_mode mode, int32_t prefix_len) {
+    GGML_ASSERT(prefix_len >= 0);
+
+    vegas.mode       = mode;
+    vegas.prefix_len = prefix_len;
+    vegas.top_k      = 0;
+
+    if (mode != llama_vegas_mode::disabled && prefix_len > 0) {
+        const int32_t ratio_tokens = (int32_t) std::ceil(prefix_len * vegas.sparse_ratio);
+        vegas.top_k = std::min(prefix_len, std::max(vegas.min_tokens, ratio_tokens));
+        if (vegas.max_tokens > 0) {
+            vegas.top_k = std::min(vegas.top_k, vegas.max_tokens);
+        }
+    }
+}
+
+bool llama_context::vegas_collect_indices() {
+    if (vegas.mode != llama_vegas_mode::verify || vegas.top_k <= 0) {
+        return false;
+    }
+
+    synchronize();
+
+    const auto & outputs = gf_res_prev->get_vegas_indices();
+    if (outputs.empty()) {
+        return false;
+    }
+
+    bool found = false;
+    for (size_t il = 0; il < outputs.size(); ++il) {
+        const auto * tensor = outputs[il];
+        if (tensor == nullptr) {
+            continue;
+        }
+
+        if (tensor->type != GGML_TYPE_I32 || ggml_nelements(tensor) != vegas.top_k) {
+            LLAMA_LOG_ERROR("%s: invalid Vegas indices at layer %zu\n", __func__, il);
+            return false;
+        }
+
+        auto & indices = vegas.indices[il];
+        indices.resize(vegas.top_k);
+        ggml_backend_tensor_get(tensor, indices.data(), 0, ggml_nbytes(tensor));
+        std::sort(indices.begin(), indices.end());
+        found = true;
+    }
+
+    return found;
 }
 
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
@@ -2427,6 +2538,11 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
+        /*.vegas       =*/ &vegas,
+        /*.vegas_mode  =*/ vegas.mode,
+        /*.vegas_prefix_len =*/ vegas.prefix_len,
+        /*.vegas_top_k =*/ vegas.top_k,
+        /*.vegas_max_recent_tokens =*/ vegas.max_recent_tokens,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
@@ -4174,4 +4290,22 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {
     return ctx->get_cparams().ctx_other;
+}
+
+bool llama_vegas_enable(
+        llama_context * ctx,
+                 float sparse_ratio,
+               int32_t min_tokens,
+               int32_t max_tokens,
+               int32_t max_draft_tokens) {
+    return ctx->vegas_enable(sparse_ratio, min_tokens, max_tokens, max_draft_tokens);
+}
+
+void llama_vegas_set_mode(llama_context * ctx, int32_t mode, int32_t prefix_len) {
+    GGML_ASSERT(mode >= (int32_t) llama_vegas_mode::disabled && mode <= (int32_t) llama_vegas_mode::verify);
+    ctx->vegas_set_mode((llama_vegas_mode) mode, prefix_len);
+}
+
+bool llama_vegas_collect_indices(llama_context * ctx) {
+    return ctx->vegas_collect_indices();
 }

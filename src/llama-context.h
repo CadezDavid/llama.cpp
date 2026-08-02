@@ -7,6 +7,7 @@
 #include "llama-adapter.h"
 #include "llama-impl.h"
 #include "llama-memory.h"
+#include "llama-vegas.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -118,6 +119,10 @@ struct llama_context {
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
+
+    bool vegas_enable(float sparse_ratio, int32_t min_tokens, int32_t max_tokens, int32_t max_draft_tokens);
+    void vegas_set_mode(llama_vegas_mode mode, int32_t prefix_len);
+    bool vegas_collect_indices();
 
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
@@ -287,6 +292,8 @@ private:
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
     llama_memory_ptr memory;
+
+    llama_vegas_state vegas;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};

@@ -2443,6 +2443,12 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
 
+    GGML_API void ggml_flash_attn_ext_set_vegas(
+            struct ggml_tensor * a,
+            struct ggml_tensor * indices,
+            int32_t              top_k,
+            int32_t              sparse_len);
+
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
            struct ggml_context * ctx,

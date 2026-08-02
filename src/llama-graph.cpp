@@ -151,6 +151,25 @@ bool llm_graph_input_pos::can_reuse(const llm_graph_params & params) {
     return res;
 }
 
+void llm_graph_input_vegas_indices::set_input(const llama_ubatch * ubatch) {
+    GGML_ASSERT(il >= 0 && (size_t) il < vegas.indices.size());
+    GGML_ASSERT(indices->type == GGML_TYPE_I32);
+    GGML_ASSERT(ubatch->pos != nullptr && ubatch->n_tokens == 1);
+    GGML_ASSERT((size_t) ggml_nelements(indices) == vegas.indices[il].size() + 2);
+
+    std::vector<int32_t> data(vegas.indices[il]);
+    data.push_back(vegas.prefix_len);
+    data.push_back(vegas.top_k + ubatch->pos[0] + 1 - vegas.prefix_len);
+
+    GGML_ASSERT(data.back() <= vegas.top_k + vegas.max_recent_tokens);
+    ggml_backend_tensor_set(indices, data.data(), 0, data.size() * sizeof(data[0]));
+}
+
+bool llm_graph_input_vegas_indices::can_reuse(const llm_graph_params & params) {
+    return params.vegas_mode == llama_vegas_mode::draft &&
+        params.vegas_top_k + 2 == indices->ne[0];
+}
+
 void llm_graph_input_attn_temp::set_input(const llama_ubatch * ubatch) {
     if (ubatch->pos && attn_scale) {
         const int64_t n_tokens = ubatch->n_tokens;
@@ -1198,6 +1217,8 @@ void llm_graph_result::reset() {
     t_layer_inp.resize(LLAMA_MAX_LAYERS);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
 
+    t_vegas_indices.clear();
+
     t_sampled.clear();
     t_sampled_probs.clear();
     t_sampled_logits.clear();
@@ -1269,6 +1290,11 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
             ggml_set_output(t);
         }
     }
+    for (auto * t : t_vegas_indices) {
+        if (t != nullptr) {
+            ggml_set_output(t);
+        }
+    }
 }
 
 bool llm_graph_result::can_reuse(const llm_graph_params & params) {
@@ -1310,6 +1336,16 @@ llm_graph_input_i * llm_graph_result::add_input(llm_graph_input_ptr input) {
 
 void llm_graph_result::add_fused_node(llm_graph_fused_node result) {
     fused_nodes.push_back(result);
+}
+
+void llm_graph_result::set_vegas_indices(int32_t il, ggml_tensor * indices) {
+    GGML_ASSERT(il >= 0);
+
+    if ((size_t) il >= t_vegas_indices.size()) {
+        t_vegas_indices.resize(il + 1, nullptr);
+    }
+
+    t_vegas_indices[il] = indices;
 }
 
 void llm_graph_result::set_params(const llm_graph_params & params) {
@@ -1357,6 +1393,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     loras            (params.loras),
     mctx             (params.mctx),
     cross            (params.cross),
+    vegas            (params.vegas),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -2402,6 +2439,88 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     k = ggml_permute(ctx0, k, 0, 2, 1, 3);
     v = ggml_permute(ctx0, v, 0, 2, 1, 3);
 
+    const bool use_vegas = vegas != nullptr &&
+            vegas->mode != llama_vegas_mode::disabled &&
+            mctx != nullptr &&
+            !hparams.is_swa(il);
+
+    ggml_tensor * vegas_indices = nullptr;
+    int32_t vegas_sparse_len = 0;
+
+    if (use_vegas && vegas->mode == llama_vegas_mode::verify) {
+        GGML_ASSERT(k->ne[3] == 1 && q->ne[3] == 1);
+        GGML_ASSERT(vegas->prefix_len > 0 && vegas->prefix_len <= k->ne[1]);
+        GGML_ASSERT(vegas->top_k > 0 && vegas->top_k <= vegas->prefix_len);
+
+        ggml_tensor * k_prefix = ggml_view_4d(
+                ctx0, k, k->ne[0], vegas->prefix_len, k->ne[2], 1,
+                k->nb[1], k->nb[2], k->nb[3], 0);
+
+        ggml_tensor * q_score = ggml_view_4d(
+                ctx0, q, q->ne[0], 1, q->ne[2], 1,
+                q->nb[1], q->nb[2], q->nb[3], 0);
+        if (q->ne[1] > 1) {
+            ggml_tensor * q_last = ggml_view_4d(
+                    ctx0, q, q->ne[0], 1, q->ne[2], 1,
+                    q->nb[1], q->nb[2], q->nb[3], (q->ne[1] - 1) * q->nb[1]);
+            q_score = ggml_concat(ctx0, q_score, q_last, 1);
+        }
+
+        GGML_ASSERT(q_score->ne[2] % k_prefix->ne[2] == 0);
+        const int64_t gqa_ratio = q_score->ne[2] / k_prefix->ne[2];
+        if (gqa_ratio > 1 && !hparams.attn_soft_cap) {
+            q_score = ggml_reshape_4d(
+                    ctx0, q_score, q_score->ne[0], q_score->ne[1], gqa_ratio, k_prefix->ne[2]);
+            q_score = ggml_cont(ctx0, ggml_permute(ctx0, q_score, 1, 2, 0, 3));
+            q_score = ggml_sum_rows(ctx0, q_score);
+            q_score = ggml_reshape_4d(
+                    ctx0, q_score, q->ne[0], q_score->ne[2], k_prefix->ne[2], 1);
+        }
+
+        ggml_tensor * score = ggml_mul_mat(ctx0, k_prefix, q_score);
+        ggml_mul_mat_set_prec(score, GGML_PREC_F32);
+
+        if (hparams.attn_soft_cap) {
+            score = ggml_scale(ctx0, score, kq_scale / hparams.f_attn_logit_softcapping);
+            score = ggml_tanh(ctx0, score);
+            score = ggml_scale(ctx0, score, hparams.f_attn_logit_softcapping);
+        } else if (kq_scale != 1.0f) {
+            score = ggml_scale(ctx0, score, kq_scale);
+        }
+
+        score = ggml_cont(ctx0, ggml_permute(ctx0, score, 2, 1, 0, 3));
+        score = ggml_reshape_2d(ctx0, score, score->ne[0] * score->ne[1], vegas->prefix_len);
+        score = ggml_sum_rows(ctx0, score);
+        score = ggml_reshape_1d(ctx0, score, vegas->prefix_len);
+        score = ggml_cont(ctx0, score);
+        cb(score, "vegas_score", il);
+
+        vegas_indices = ggml_top_k(ctx0, score, vegas->top_k);
+        cb(vegas_indices, "vegas_indices", il);
+        res->set_vegas_indices(il, vegas_indices);
+        ggml_build_forward_expand(gf, vegas_indices);
+    } else if (use_vegas && vegas->mode == llama_vegas_mode::draft) {
+        GGML_ASSERT(cparams.flash_attn);
+        GGML_ASSERT(q->ne[1] == 1 && q->ne[3] == 1 && k->ne[3] == 1);
+        GGML_ASSERT(ubatch.pos != nullptr);
+        GGML_ASSERT(vegas->prefix_len > 0 && vegas->prefix_len <= k->ne[1]);
+        GGML_ASSERT(vegas->top_k > 0 && vegas->top_k <= vegas->prefix_len);
+        GGML_ASSERT((size_t) il < vegas->indices.size());
+        GGML_ASSERT((int32_t) vegas->indices[il].size() == vegas->top_k);
+
+        const int32_t current_end = ubatch.pos[ubatch.n_tokens - 1] + 1;
+        GGML_ASSERT(current_end >= vegas->prefix_len && current_end <= k->ne[1]);
+
+        auto inp = std::make_unique<llm_graph_input_vegas_indices>(*vegas, il);
+        inp->indices = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, vegas->top_k + 2);
+        ggml_set_input(inp->indices);
+        vegas_indices = inp->indices;
+        res->add_input(std::move(inp));
+
+        GGML_ASSERT(current_end - vegas->prefix_len <= vegas->max_recent_tokens);
+        vegas_sparse_len = vegas->top_k + vegas->max_recent_tokens;
+    }
+
     // TurboQuant note: graph-side Q rotation (pre-rotate-queries) is implemented below
     // in the flash-attn path. The VEC kernel bug (wrong Q/K stride in
     // vec_dot_fattn_vec_KQ_turbo3_0) was fixed in fattn-common.cuh to match f16 pattern.
@@ -2427,6 +2546,11 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
                                   hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+        if (vegas_indices != nullptr && vegas->mode == llama_vegas_mode::draft) {
+            GGML_ASSERT(sinks == nullptr);
+            GGML_ASSERT(hparams.f_max_alibi_bias == 0.0f);
+            ggml_flash_attn_ext_set_vegas(cur, vegas_indices, vegas->top_k, vegas_sparse_len);
+        }
         res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);

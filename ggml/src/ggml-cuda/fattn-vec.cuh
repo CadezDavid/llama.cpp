@@ -99,7 +99,8 @@ static __global__ void flash_attn_ext_vec(
     // reducing loop overhead and improving ILP in the V aggregation phase.
     // Eighth nthreads_V for turbo: V_cols_per_iter goes from 4→8, processing 8 V positions
     // per outer loop iteration. Halves outer loop count again, more ILP from concurrent V rows.
-    constexpr int nthreads_V  = V_is_unquantized ? (V_is_turbo ? (nthreads_V_q / 8 < 1 ? 1 : nthreads_V_q / 8) : 128 / cpy_nb) : nthreads_V_q;
+    constexpr int nthreads_V_turbo = D >= 512 ? nthreads_V_q / 4 : nthreads_V_q / 8;
+    constexpr int nthreads_V  = V_is_unquantized ? (V_is_turbo ? (nthreads_V_turbo < 1 ? 1 : nthreads_V_turbo) : 128 / cpy_nb) : nthreads_V_q;
 
     static_assert(WARP_SIZE % nthreads_KQ == 0, "bad nthreads_K");
     static_assert(WARP_SIZE % nthreads_V  == 0, "bad nthreads_V");
@@ -120,11 +121,16 @@ static __global__ void flash_attn_ext_vec(
     const int sequence = blockIdx.z / ne02;
     const int head = blockIdx.z - sequence*ne02;
     const int gqa_ratio = ne02 / ne12; // With grouped query attention there are > 1 Q matrices per K, V matrix.
+    const bool vegas_sparse = ne33 == -1;
+    const int * vegas_indices = vegas_sparse ? (const int *) mask : nullptr;
+    const int vegas_recent_start = vegas_sparse ? vegas_indices[ne31] : 0;
+    const int vegas_n_kv = vegas_sparse ? vegas_indices[ne31 + 1] : ne11;
     Q += nb03*sequence + nb02* head              + nb01*ic0;
     K += nb13*sequence + nb12*(head / gqa_ratio);
     V += nb23*sequence + nb22*(head / gqa_ratio);
 
-    const half * maskh  = (const half  *) (mask + nb33*(sequence % ne33) + nb31*ic0);
+    const half * maskh = vegas_sparse || !mask ? nullptr :
+        (const half *) (mask + nb33*(sequence % ne33) + nb31*ic0);
 
     const float slope = get_alibi_slope(max_bias, head, n_head_log2, m0, m1);
 
@@ -293,12 +299,18 @@ static __global__ void flash_attn_ext_vec(
     }
 
     const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
-    K     += blockIdx.y*nthreads * nb11;
-    V     += blockIdx.y*nthreads * nb21;
-    maskh += blockIdx.y*nthreads;
+    if (!vegas_sparse) {
+        K += blockIdx.y*nthreads * nb11;
+        V += blockIdx.y*nthreads * nb21;
+        if (maskh) {
+            maskh += blockIdx.y*nthreads;
+        }
+    }
     for (int k_VKQ_0 = blockIdx.y*nthreads; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nthreads,
              // Increment pointers after each loop:
-             K += gridDim.y*nthreads*nb11, V += gridDim.y*nthreads*nb21, maskh += gridDim.y*nthreads) {
+             K += vegas_sparse ? 0 : gridDim.y*nthreads*nb11,
+             V += vegas_sparse ? 0 : gridDim.y*nthreads*nb21,
+             maskh = vegas_sparse || !maskh ? maskh : maskh + gridDim.y*nthreads) {
 
         // Calculate KQ tile and keep track of new maximum KQ values:
         float KQ_reg[ncols]; // KQ in registers.
@@ -316,9 +328,17 @@ static __global__ void flash_attn_ext_vec(
 #pragma unroll
             for (int j = 0; j < ncols; ++j) {
                 float sum;
-                if constexpr (n_centroids_lut > 0 && ncols == 1 && type_K == GGML_TYPE_TURBO3_0) {
+                const int i_KQ_logical = k_VKQ_0 + i_KQ;
+                const bool i_KQ_valid = !vegas_sparse || i_KQ_logical < vegas_n_kv;
+                const int i_KQ_actual = !i_KQ_valid ? 0 : !vegas_sparse ? i_KQ :
+                    (i_KQ_logical < ne31 ? vegas_indices[i_KQ_logical] : vegas_recent_start + i_KQ_logical - ne31);
+                const char * K_row = K + i_KQ_actual*nb11;
+
+                if (!i_KQ_valid) {
+                    sum = -FLT_MAX/2.0f;
+                } else if constexpr (n_centroids_lut > 0 && ncols == 1 && type_K == GGML_TYPE_TURBO3_0) {
                     // LUT scoring: 8 elements per iteration (2 qs bytes + 1 signs byte)
-                    const block_turbo3_0 * K_turbo = (const block_turbo3_0 *)(K + i_KQ*nb11);
+                    const block_turbo3_0 * K_turbo = (const block_turbo3_0 *) K_row;
                     sum = 0.0f;
                     for (int d0 = 0; d0 < D; d0 += 8) {
                         const int ib = d0 / QK_TURBO3;
@@ -338,7 +358,7 @@ static __global__ void flash_attn_ext_vec(
                     }
                 } else if constexpr (n_centroids_lut > 0 && ncols == 1 && type_K == GGML_TYPE_TURBO2_0) {
                     // LUT scoring for turbo2: 8 elements per iteration (2 qs bytes, no signs)
-                    const block_turbo2_0 * K_turbo = (const block_turbo2_0 *)(K + i_KQ*nb11);
+                    const block_turbo2_0 * K_turbo = (const block_turbo2_0 *) K_row;
                     sum = 0.0f;
                     for (int d0 = 0; d0 < D; d0 += 8) {
                         const int ib = d0 / QK_TURBO2;
@@ -356,15 +376,15 @@ static __global__ void flash_attn_ext_vec(
                                 __half2float(turbo_lut[d0+7][(qs1>>6)&3])) * norm;
                     }
                 } else {
-                    sum = vec_dot_KQ(K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
+                    sum = vec_dot_KQ(K_row, Q_reg[j], Q_i32[j], Q_ds[j]);
                     sum = warp_reduce_sum<nthreads_KQ>(sum);
                 }
 
-                if (use_logit_softcap) {
+                if (i_KQ_valid && use_logit_softcap) {
                     sum = logit_softcap*tanhf(sum);
                 }
 
-                if (mask && (ncols == 1 || ic0 + j < int(ne01.z))) {
+                if (!vegas_sparse && mask && (ncols == 1 || ic0 + j < int(ne01.z))) {
                     sum += slope*__half2float(maskh[j*ne11 + i_KQ]);
                 }
 
@@ -411,6 +431,11 @@ static __global__ void flash_attn_ext_vec(
 #pragma unroll
         for (int k0 = 0; k0 < WARP_SIZE; k0 += V_cols_per_iter) {
             const int k = threadIdx.y*WARP_SIZE + k0 + (nthreads_V == WARP_SIZE ? 0 : threadIdx.x / nthreads_V);
+            const int k_logical = k_VKQ_0 + k;
+            const bool k_valid = !vegas_sparse || k_logical < vegas_n_kv;
+            const int k_actual = !k_valid ? 0 : !vegas_sparse ? k :
+                (k_logical < ne31 ? vegas_indices[k_logical] : vegas_recent_start + k_logical - ne31);
+            const char * V_row = V + k_actual*nb21;
 
 #ifdef V_DOT2_F32_F16_AVAILABLE
             half2 KQ_k[ncols];
@@ -422,6 +447,10 @@ static __global__ void flash_attn_ext_vec(
                 } else {
                     KQ_k[j] = __half2half2(KQ[j*nthreads + k]);
                 }
+            }
+
+            if (!k_valid) {
+                continue;
             }
 
             // Sparse V: skip V dequant if all attention weights for this position are negligible.
@@ -444,14 +473,14 @@ static __global__ void flash_attn_ext_vec(
                 half2 tmp[V_rows_per_thread/2];
                 if constexpr (type_V == GGML_TYPE_BF16) {
                     float2 tmp_f[V_rows_per_thread/2];
-                    dequantize_V(V + k*nb21, tmp_f,
+                    dequantize_V(V_row, tmp_f,
                         2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread);
 #pragma unroll
                     for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
                         tmp[i_VKQ_1] = __float22half2_rn(tmp_f[i_VKQ_1]);
                     }
                 } else {
-                    dequantize_V(V + k*nb21, tmp,
+                    dequantize_V(V_row, tmp,
                         2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread);
                 }
 #pragma unroll
@@ -473,6 +502,10 @@ static __global__ void flash_attn_ext_vec(
                 }
             }
 
+            if (!k_valid) {
+                continue;
+            }
+
             // Sparse V: skip V dequant if all attention weights for this position are negligible.
             // Compiled out for turbo types — see half2 path comment above.
             if constexpr (!V_is_turbo) {
@@ -488,7 +521,7 @@ static __global__ void flash_attn_ext_vec(
             // per-element norm multiply.  centroid[idx]*norm is computed 8/4/16 times
             // (once per centroid) instead of D times (once per element).
             if constexpr (type_V == GGML_TYPE_TURBO3_0) {
-                const block_turbo3_0 * vb = (const block_turbo3_0 *)(V + k*nb21);
+                const block_turbo3_0 * vb = (const block_turbo3_0 *) V_row;
                 int prev_ib = -1;
                 float sc[8];
 
@@ -523,7 +556,7 @@ static __global__ void flash_attn_ext_vec(
                     }
                 }
             } else if constexpr (type_V == GGML_TYPE_TURBO2_0) {
-                const block_turbo2_0 * vb = (const block_turbo2_0 *)(V + k*nb21);
+                const block_turbo2_0 * vb = (const block_turbo2_0 *) V_row;
                 int prev_ib = -1;
                 float sc[4];
 
@@ -556,7 +589,7 @@ static __global__ void flash_attn_ext_vec(
                     }
                 }
             } else if constexpr (type_V == GGML_TYPE_TURBO4_0) {
-                const block_turbo4_0 * vb = (const block_turbo4_0 *)(V + k*nb21);
+                const block_turbo4_0 * vb = (const block_turbo4_0 *) V_row;
                 int prev_ib = -1;
                 float sc[16];
 
@@ -593,7 +626,7 @@ static __global__ void flash_attn_ext_vec(
 #pragma unroll
                 for (int i_VKQ_0 = 0; i_VKQ_0 < D/2; i_VKQ_0 += nthreads_V*V_rows_per_thread/2) {
                     float2 tmp[V_rows_per_thread/2];
-                    dequantize_V(V + k*nb21, tmp,
+                    dequantize_V(V_row, tmp,
                         2*i_VKQ_0 + (nthreads_V == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_V)*V_rows_per_thread);
 #pragma unroll
                     for (int i_VKQ_1 = 0; i_VKQ_1 < V_rows_per_thread/2; ++i_VKQ_1) {
