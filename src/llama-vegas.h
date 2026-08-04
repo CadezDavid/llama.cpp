@@ -18,6 +18,7 @@ struct llama_vegas_state {
     int32_t prefix_len   = 0;
     int32_t top_k        = 0;
     int32_t max_recent_tokens = 0;
+    int32_t selection_layer   = -1;
 
     std::vector<std::vector<int32_t>> indices;
 };

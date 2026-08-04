@@ -129,12 +129,24 @@ LLAMA_API bool llama_vegas_enable(
                      int32_t max_tokens,
                      int32_t max_draft_tokens);
 
+LLAMA_API bool llama_vegas_set_selection_layer(
+        struct llama_context * ctx,
+                     int32_t il);
+
 LLAMA_API void llama_vegas_set_mode(
         struct llama_context * ctx,
                      int32_t mode,
                      int32_t prefix_len);
 
+LLAMA_API bool llama_vegas_resume_draft(struct llama_context * ctx);
+
+LLAMA_API void llama_vegas_pause(struct llama_context * ctx);
+
 LLAMA_API bool llama_vegas_collect_indices(struct llama_context * ctx);
+
+LLAMA_API bool llama_vegas_copy_indices(
+              struct llama_context * dst,
+        const struct llama_context * src);
 
 //
 // model/context data extraction

@@ -433,6 +433,7 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     // Mixed turbo3/q8_0 KV cache types
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO3_0, GGML_TYPE_Q8_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0,     GGML_TYPE_TURBO3_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_Q8_0, GGML_TYPE_TURBO3_0)
 
     // Mixed f16/turbo3 KV cache types
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,      GGML_TYPE_TURBO3_0)
@@ -473,7 +474,8 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO2_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO4_0)
 
-    GGML_ABORT("fatal error");
+    GGML_ABORT("unsupported vector flash attention: D=%lld, K=%s, V=%s",
+            (long long) Q->ne[0], ggml_type_name(K->type), ggml_type_name(V->type));
 }
 
 // Best FlashAttention kernel for a specific GPU:
@@ -511,7 +513,8 @@ static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
     }
 }
 
-static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
+static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(
+        const int device, const ggml_tensor * dst, ggml_backend_cuda_context * ctx = nullptr) {
 #ifndef FLASH_ATTN_AVAILABLE
     GGML_UNUSED(device); GGML_UNUSED(dst);
     return BEST_FATTN_KERNEL_NONE;
@@ -636,6 +639,28 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
+
+    const bool d512_vec_types =
+        (K->type == GGML_TYPE_Q4_0 && V->type == GGML_TYPE_Q4_0) ||
+        (K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q4_0) ||
+        (K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0) ||
+        (K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_TURBO3_0) ||
+        (K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_TURBO4_0);
+    const size_t d512_f16_scratch = (ggml_nelements(K) + ggml_nelements(V)) * sizeof(half);
+
+    // Avoid very large full-cache f16 scratch for quantized D=512 attention batches
+    // when the target and draft contexts leave insufficient device memory.
+    if (ctx != nullptr && Q->ne[0] == 512 && Q->ne[1] <= 4 && d512_vec_types) {
+        size_t free_vram;
+        size_t total_vram;
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaMemGetInfo(&free_vram, &total_vram));
+        const size_t pool_available = ctx->pool().available();
+        const size_t scratch_missing = pool_available < d512_f16_scratch ? d512_f16_scratch - pool_available : 0;
+        if (scratch_missing != 0 && free_vram < scratch_missing + 256ull * 1024 * 1024) {
+            return BEST_FATTN_KERNEL_VEC;
+        }
+    }
 
 #ifdef GGML_USE_HIP
     // HIP/ROCm: the TILE/MMA/WMMA FA paths allocate large f16 temp buffers for
@@ -821,7 +846,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         }
     }
 
-    switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
+    switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst, &ctx)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
         case BEST_FATTN_KERNEL_TILE:

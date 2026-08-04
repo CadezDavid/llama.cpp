@@ -2,6 +2,7 @@
 #include "common.h"
 #include "log.h"
 #include "sampling.h"
+#include "speculative.h"
 #include "llama-ext.h"
 #include "llama.h"
 
@@ -22,6 +23,9 @@ enum class vegas_run_mode {
     baseline,
     dense_spec,
     vegas,
+    mtp,
+    mtp_vegas,
+    mtp_auto,
 };
 
 struct vegas_options {
@@ -30,7 +34,11 @@ struct vegas_options {
     int32_t min_tokens = 256;
     int32_t max_tokens = 0;
     int32_t gamma = 8;
+    int32_t selection_layer = -1;
+    int32_t refresh_interval = 1;
+    int32_t mtp_ubatch = 128;
     int32_t prompt_tokens = 0;
+    bool auto_policy = false;
     bool quiet = false;
 };
 
@@ -73,8 +81,21 @@ static const char * mode_name(vegas_run_mode mode) {
         case vegas_run_mode::baseline:   return "baseline";
         case vegas_run_mode::dense_spec: return "dense-spec";
         case vegas_run_mode::vegas:      return "vegas";
+        case vegas_run_mode::mtp:        return "mtp";
+        case vegas_run_mode::mtp_vegas:  return "mtp-vegas";
+        case vegas_run_mode::mtp_auto:   return "mtp-auto";
     }
     return "unknown";
+}
+
+static bool mode_uses_vegas(vegas_run_mode mode) {
+    return mode == vegas_run_mode::vegas || mode == vegas_run_mode::mtp_vegas ||
+            mode == vegas_run_mode::mtp_auto;
+}
+
+static bool mode_uses_mtp(vegas_run_mode mode) {
+    return mode == vegas_run_mode::mtp || mode == vegas_run_mode::mtp_vegas ||
+            mode == vegas_run_mode::mtp_auto;
 }
 
 static bool parse_i32(const char * text, int32_t & value) {
@@ -131,6 +152,13 @@ static bool parse_vegas_options(
                 options.mode = vegas_run_mode::dense_spec;
             } else if (std::strcmp(value, "vegas") == 0) {
                 options.mode = vegas_run_mode::vegas;
+            } else if (std::strcmp(value, "mtp") == 0) {
+                options.mode = vegas_run_mode::mtp;
+            } else if (std::strcmp(value, "mtp-vegas") == 0) {
+                options.mode = vegas_run_mode::mtp_vegas;
+            } else if (std::strcmp(value, "mtp-auto") == 0) {
+                options.mode = vegas_run_mode::mtp_auto;
+                options.auto_policy = true;
             } else {
                 LOG_ERR("invalid --vegas-mode: %s\n", value);
                 return false;
@@ -165,9 +193,32 @@ static bool parse_vegas_options(
             }
             continue;
         }
+
+        if (const char * value = get_value("--vegas-selection-layer")) {
+            if (!parse_i32(value, options.selection_layer)) {
+                LOG_ERR("invalid --vegas-selection-layer: %s\n", value);
+                return false;
+            }
+            continue;
+        }
+
+        if (const char * value = get_value("--vegas-refresh-interval")) {
+            if (!parse_i32(value, options.refresh_interval)) {
+                LOG_ERR("invalid --vegas-refresh-interval: %s\n", value);
+                return false;
+            }
+            continue;
+        }
         if (const char * value = get_value("--vegas-prompt-tokens")) {
             if (!parse_i32(value, options.prompt_tokens)) {
                 LOG_ERR("invalid --vegas-prompt-tokens: %s\n", value);
+                return false;
+            }
+            continue;
+        }
+        if (const char * value = get_value("--vegas-mtp-ubatch")) {
+            if (!parse_i32(value, options.mtp_ubatch)) {
+                LOG_ERR("invalid --vegas-mtp-ubatch: %s\n", value);
                 return false;
             }
             continue;
@@ -178,7 +229,8 @@ static bool parse_vegas_options(
 
     if (!(options.sparse_ratio > 0.0f && options.sparse_ratio <= 1.0f) ||
             options.min_tokens < 1 || options.max_tokens < 0 || options.gamma < 1 ||
-            options.prompt_tokens < 0 || options.prompt_tokens == 1) {
+            options.refresh_interval < 1 ||
+            options.mtp_ubatch < 1 || options.prompt_tokens < 0 || options.prompt_tokens == 1) {
         LOG_ERR("invalid Vegas configuration\n");
         return false;
     }
@@ -238,17 +290,76 @@ static bool decode_one(llama_context * ctx, llama_batch & batch, llama_token tok
     return llama_decode(ctx, batch) == 0;
 }
 
+static void resolve_auto_policy(
+        vegas_options & options,
+        common_params & params,
+        const llama_model * model,
+        int32_t n_prompt) {
+    if (options.mode != vegas_run_mode::mtp_auto) {
+        return;
+    }
+
+    const bool separate_draft = params.speculative.has_dft();
+    const bool moe = llama_model_n_expert(model) > 0;
+    bool sparse = false;
+
+    if (separate_draft) {
+        sparse = n_prompt >= 96 * 1024;
+        options.gamma = 1;
+        options.sparse_ratio = 0.03f;
+        options.selection_layer = llama_model_n_layer(model) - 1;
+        options.refresh_interval = 1;
+    } else if (moe) {
+        sparse = n_prompt >= 48 * 1024 &&
+                params.cache_type_k == GGML_TYPE_Q4_0 && params.cache_type_v == GGML_TYPE_Q4_0;
+        options.gamma = sparse ? 5 : 2;
+        if (params.cache_type_k == GGML_TYPE_Q8_0 && params.cache_type_v == GGML_TYPE_TURBO4_0) {
+            params.speculative.draft.cache_type_k = GGML_TYPE_Q4_0;
+            params.speculative.draft.cache_type_v = GGML_TYPE_Q4_0;
+        }
+        options.sparse_ratio = 0.03f;
+        options.selection_layer = llama_model_n_layer(model) - 1;
+        options.refresh_interval = 1;
+    } else {
+        const bool q4_cache =
+                params.cache_type_k == GGML_TYPE_Q4_0 && params.cache_type_v == GGML_TYPE_Q4_0;
+        sparse = n_prompt >= (q4_cache ? 48 : 96) * 1024;
+        options.gamma = 4;
+        options.sparse_ratio = std::clamp(0.04f + n_prompt / 2000000.0f, 0.05f, 0.10f);
+        options.selection_layer = std::max(0, (llama_model_n_layer(model) - 1) / 4);
+        options.refresh_interval = 2;
+    }
+
+    options.mode = sparse ? vegas_run_mode::mtp_vegas : vegas_run_mode::mtp;
+    if (!sparse) {
+        options.selection_layer = -1;
+    }
+    LOG_INF("Vegas auto: mode=%s gamma<=%d ratio=%.3f selection-layer=%d refresh=%d draft-cache=%s/%s\n",
+            mode_name(options.mode), options.gamma, options.sparse_ratio,
+            options.selection_layer, options.refresh_interval,
+            ggml_type_name(params.speculative.draft.cache_type_k),
+            ggml_type_name(params.speculative.draft.cache_type_v));
+}
+
 static bool decode_prompt(
         llama_context * ctx,
         std::vector<llama_token> & tokens,
-        int32_t n_tokens) {
+        int32_t n_tokens,
+        common_speculative * spec = nullptr) {
     const int32_t n_batch = (int32_t) llama_n_batch(ctx);
+    llama_batch batch = llama_batch_init(n_batch, 0, 1);
     for (int32_t offset = 0; offset < n_tokens; offset += n_batch) {
         const int32_t count = std::min(n_batch, n_tokens - offset);
-        if (llama_decode(ctx, llama_batch_get_one(tokens.data() + offset, count)) != 0) {
+        common_batch_clear(batch);
+        for (int32_t i = 0; i < count; ++i) {
+            common_batch_add(batch, tokens[offset + i], offset + i, { 0 }, true);
+        }
+        if (llama_decode(ctx, batch) != 0 || !common_speculative_process(spec, batch)) {
+            llama_batch_free(batch);
             return false;
         }
     }
+    llama_batch_free(batch);
     return true;
 }
 
@@ -477,6 +588,157 @@ static bool run_speculative(
     return true;
 }
 
+static bool run_mtp(
+        llama_context * ctx,
+        llama_context * ctx_dft,
+        common_speculative * spec,
+        const llama_vocab * vocab,
+        common_sampler * sampler,
+        llama_token id_last,
+        int32_t n_past,
+        const common_params & params,
+        const vegas_options & options,
+        llama_batch & batch,
+        llama_tokens & history,
+        vegas_metrics & metrics) {
+    const bool sparse = options.mode == vegas_run_mode::mtp_vegas;
+    bool has_eog = false;
+    const int32_t current_gamma = options.gamma;
+    const int64_t start = ggml_time_us();
+
+    while (!has_eog && (params.n_predict < 0 || metrics.n_predict < params.n_predict)) {
+        const int32_t remaining = params.n_predict < 0 ? INT32_MAX : params.n_predict - metrics.n_predict;
+        const int32_t n_max = remaining > 1 ? std::min(current_gamma, remaining - 1) : 0;
+        llama_tokens draft;
+
+        if (n_max > 0) {
+            if (sparse && metrics.n_cycles % options.refresh_interval == 0) {
+                if (!llama_vegas_copy_indices(ctx_dft, ctx)) {
+                    LOG_ERR("failed to copy Vegas indices to MTP context\n");
+                    return false;
+                }
+            } else if (sparse && !llama_vegas_resume_draft(ctx_dft)) {
+                LOG_ERR("failed to resume Vegas indices in MTP context\n");
+                return false;
+            }
+
+            common_speculative_get_draft_params(spec, 0) = {
+                /* .drafting = */ true,
+                /* .n_max    = */ n_max,
+                /* .n_past   = */ n_past,
+                /* .id_last  = */ id_last,
+                /* .prompt   = */ &history,
+                /* .result   = */ &draft,
+            };
+
+            const int64_t draft_start = ggml_time_us();
+            common_speculative_draft(spec);
+            llama_synchronize(ctx_dft);
+            metrics.draft_us += ggml_time_us() - draft_start;
+            metrics.n_drafted += (int32_t) draft.size();
+
+            llama_vegas_pause(ctx_dft);
+            const int64_t rollback_start = ggml_time_us();
+            if (!remove_after(ctx_dft, n_past)) {
+                LOG_ERR("failed to roll back MTP draft state\n");
+                return false;
+            }
+            metrics.rollback_us += ggml_time_us() - rollback_start;
+        }
+
+        const bool refresh_indices = sparse &&
+                (metrics.n_cycles + 1) % options.refresh_interval == 0;
+        if (refresh_indices) {
+            llama_vegas_set_mode(ctx, LLAMA_VEGAS_MODE_VERIFY, n_past + 1);
+        } else if (sparse) {
+            llama_vegas_set_mode(ctx, LLAMA_VEGAS_MODE_DISABLED, 0);
+        }
+
+        common_batch_clear(batch);
+        common_batch_add(batch, id_last, n_past, { 0 }, true);
+        for (size_t i = 0; i < draft.size(); ++i) {
+            common_batch_add(batch, draft[i], n_past + (int32_t) i + 1, { 0 }, true);
+        }
+
+        const int64_t verify_start = ggml_time_us();
+        if (llama_decode(ctx, batch) != 0) {
+            return false;
+        }
+        llama_synchronize(ctx);
+        metrics.verify_us += ggml_time_us() - verify_start;
+
+        if (refresh_indices) {
+            const int64_t collect_start = ggml_time_us();
+            if (!llama_vegas_collect_indices(ctx)) {
+                LOG_ERR("failed to collect Vegas indices\n");
+                return false;
+            }
+            metrics.collect_us += ggml_time_us() - collect_start;
+        }
+
+        if (!common_speculative_process(spec, batch)) {
+            LOG_ERR("failed to process MTP verification batch\n");
+            return false;
+        }
+
+        int32_t accepted = 0;
+        llama_token next = LLAMA_TOKEN_NULL;
+        const int64_t sample_start = ggml_time_us();
+        for (size_t i = 0; i < draft.size(); ++i) {
+            const llama_token target = common_sampler_sample(sampler, ctx, (int32_t) i, true);
+            if (target != draft[i]) {
+                next = target;
+                common_sampler_accept(sampler, next, true);
+                ++metrics.n_rejected;
+                ++metrics.n_predict;
+                history.push_back(next);
+                record_token(ctx, next, options.quiet, metrics);
+                has_eog = llama_vocab_is_eog(vocab, next);
+                break;
+            }
+
+            next = draft[i];
+            common_sampler_accept(sampler, next, true);
+            ++accepted;
+            ++metrics.n_accepted;
+            ++metrics.n_predict;
+            history.push_back(next);
+            record_token(ctx, next, options.quiet, metrics);
+            if (llama_vocab_is_eog(vocab, next)) {
+                has_eog = true;
+                break;
+            }
+        }
+
+        if (!has_eog && accepted == (int32_t) draft.size()) {
+            next = common_sampler_sample(sampler, ctx, (int32_t) draft.size(), true);
+            common_sampler_accept(sampler, next, true);
+            ++metrics.n_predict;
+            history.push_back(next);
+            record_token(ctx, next, options.quiet, metrics);
+            has_eog = llama_vocab_is_eog(vocab, next);
+        }
+        metrics.sample_us += ggml_time_us() - sample_start;
+
+        common_speculative_accept(spec, 0, accepted);
+
+        n_past += accepted + 1;
+        id_last = next;
+        ++metrics.n_cycles;
+
+        const int64_t rollback_start = ggml_time_us();
+        if (!remove_after(ctx, n_past) || !remove_after(ctx_dft, n_past)) {
+            LOG_ERR("failed to roll back rejected MTP verification state\n");
+            return false;
+        }
+        metrics.rollback_us += ggml_time_us() - rollback_start;
+
+    }
+
+    metrics.total_us = ggml_time_us() - start;
+    return true;
+}
+
 static void print_result(
         const common_params & params,
         const vegas_options & options,
@@ -488,9 +750,11 @@ static void print_result(
 
     std::printf(
         "\nVEGAS_RESULT {\"mode\":\"%s\",\"model\":\"%s\","
-        "\"n_prompt\":%d,\"n_predict\":%d,\"gamma\":%d,"
+        "\"n_prompt\":%d,\"n_predict\":%d,\"gamma\":%d,\"auto_policy\":%s,"
+        "\"selection_layer\":%d,\"refresh_interval\":%d,"
         "\"sparse_ratio\":%.6f,\"min_tokens\":%d,\"max_tokens\":%d,"
         "\"cache_type_k\":\"%s\",\"cache_type_v\":\"%s\","
+        "\"draft_cache_type_k\":\"%s\",\"draft_cache_type_v\":\"%s\","
         "\"cycles\":%d,\"drafted\":%d,\"accepted\":%d,\"rejected\":%d,\"graphs_reused\":%d,"
         "\"output_hash\":\"%016" PRIx64 "\","
         "\"accept_rate\":%.6f,\"total_ms\":%.3f,\"tokens_per_second\":%.6f,"
@@ -498,9 +762,12 @@ static void print_result(
         "\"verify_ms\":%.3f,\"collect_ms\":%.3f,\"sample_ms\":%.3f,"
         "\"rollback_ms\":%.3f}\n",
         mode_name(options.mode), params.model.path.c_str(),
-        metrics.n_prompt, metrics.n_predict, options.gamma,
+        metrics.n_prompt, metrics.n_predict, options.gamma, options.auto_policy ? "true" : "false",
+        options.selection_layer, options.refresh_interval,
         options.sparse_ratio, options.min_tokens, options.max_tokens,
         ggml_type_name(params.cache_type_k), ggml_type_name(params.cache_type_v),
+        ggml_type_name(params.speculative.draft.cache_type_k),
+        ggml_type_name(params.speculative.draft.cache_type_v),
         metrics.n_cycles, metrics.n_drafted, metrics.n_accepted, metrics.n_rejected, metrics.n_reused,
         metrics.output_hash,
         accept, metrics.total_us / 1e3, tps,
@@ -535,7 +802,7 @@ int main(int argc, char ** argv) {
         LOG_ERR("Vegas requires --parallel 1\n");
         return 1;
     }
-    if (options.mode == vegas_run_mode::vegas &&
+    if (mode_uses_vegas(options.mode) &&
             params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
         LOG_ERR("Vegas requires flash attention\n");
         return 1;
@@ -546,6 +813,9 @@ int main(int argc, char ** argv) {
     }
 
     params.sampling.backend_sampling = false;
+    if (options.mode == vegas_run_mode::mtp_auto && params.speculative.has_dft()) {
+        options.gamma = 1;
+    }
     if (options.mode != vegas_run_mode::baseline) {
         params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
         params.speculative.draft.n_max = options.gamma;
@@ -563,22 +833,6 @@ int main(int argc, char ** argv) {
     llama_context * ctx = init->context();
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
-    if (options.mode == vegas_run_mode::vegas &&
-            !llama_vegas_enable(
-                    ctx, options.sparse_ratio, options.min_tokens, options.max_tokens, options.gamma)) {
-        LOG_ERR("failed to enable Vegas\n");
-        return 1;
-    }
-
-    if (options.mode != vegas_run_mode::baseline) {
-        const auto rm_type = common_context_can_seq_rm(ctx);
-        if (rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART && rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_RS) {
-            LOG_ERR("model context does not support bounded speculative rollback\n");
-            return 1;
-        }
-        llama_memory_clear(llama_get_memory(ctx), true);
-    }
-
     std::vector<llama_token> prompt = common_tokenize(ctx, params.prompt, true, true);
     if (prompt.size() < 2) {
         LOG_ERR("prompt must contain at least two tokens\n");
@@ -593,6 +847,74 @@ int main(int argc, char ** argv) {
         }
         prompt = std::move(resized);
     }
+
+    resolve_auto_policy(options, params, model, (int32_t) prompt.size());
+    params.speculative.draft.n_max = options.gamma;
+
+    common_speculative_init_result_ptr spec_init;
+    common_speculative_ptr spec;
+    llama_context * ctx_dft = nullptr;
+    if (mode_uses_mtp(options.mode)) {
+        common_params params_dft = common_base_params_to_speculative(params);
+        params_dft.n_ubatch = std::min(params_dft.n_ubatch, options.mtp_ubatch);
+        spec_init = common_speculative_init_from_params(params_dft, model, ctx);
+        ctx_dft = spec_init->context();
+        if (ctx_dft == nullptr) {
+            LOG_ERR("failed to create MTP context\n");
+            return 1;
+        }
+
+        params.speculative.draft.ctx_tgt = ctx;
+        params.speculative.draft.ctx_dft = ctx_dft;
+        spec.reset(common_speculative_init(params.speculative, 1));
+        if (!spec) {
+            LOG_ERR("failed to initialize MTP drafting\n");
+            return 1;
+        }
+    }
+
+    if (options.mode != vegas_run_mode::baseline) {
+        const auto rm_type = common_context_can_seq_rm(ctx);
+        if (rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART && rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_RS) {
+            LOG_ERR("model context does not support bounded speculative rollback\n");
+            return 1;
+        }
+        llama_memory_clear(llama_get_memory(ctx), true);
+    }
+    if (ctx_dft != nullptr) {
+        const auto rm_type = common_context_can_seq_rm(ctx_dft);
+        if (rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART && rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_RS) {
+            LOG_ERR("MTP context does not support bounded speculative rollback\n");
+            return 1;
+        }
+        llama_memory_clear(llama_get_memory(ctx_dft), true);
+    }
+
+    if (mode_uses_vegas(options.mode) &&
+            !llama_vegas_enable(
+                    ctx, options.sparse_ratio, options.min_tokens, options.max_tokens, options.gamma)) {
+        LOG_ERR("failed to enable Vegas\n");
+        return 1;
+    }
+
+    if (options.mode == vegas_run_mode::mtp_vegas &&
+            !llama_vegas_enable(
+                    ctx_dft, options.sparse_ratio, options.min_tokens, options.max_tokens,
+                    options.gamma * options.refresh_interval)) {
+        LOG_ERR("failed to enable Vegas for MTP context\n");
+        return 1;
+    }
+
+    const int32_t selection_layer = options.selection_layer >= 0 ?
+            options.selection_layer : llama_model_n_layer(model) - 1;
+    if (options.mode == vegas_run_mode::mtp_vegas) {
+        options.selection_layer = selection_layer;
+        if (!llama_vegas_set_selection_layer(ctx, selection_layer)) {
+            LOG_ERR("failed to set Vegas target selection layer\n");
+            return 1;
+        }
+    }
+
     if (prompt.size() + options.gamma + 1 > llama_n_ctx(ctx)) {
         LOG_ERR("prompt and draft exceed the context size\n");
         return 1;
@@ -602,7 +924,7 @@ int main(int argc, char ** argv) {
     metrics.n_prompt = (int32_t) prompt.size();
     const int64_t prompt_start = ggml_time_us();
 
-    if (!decode_prompt(ctx, prompt, (int32_t) prompt.size() - 1)) {
+    if (!decode_prompt(ctx, prompt, (int32_t) prompt.size() - 1, spec.get())) {
         LOG_ERR("failed to decode prompt\n");
         return 1;
     }
@@ -610,7 +932,7 @@ int main(int argc, char ** argv) {
     llama_batch batch = llama_batch_init(std::max((int32_t) llama_n_batch(ctx), options.gamma + 1), 0, 1);
     const int32_t last_pos = (int32_t) prompt.size() - 1;
 
-    if (options.mode == vegas_run_mode::vegas) {
+    if (mode_uses_vegas(options.mode)) {
         llama_vegas_set_mode(ctx, LLAMA_VEGAS_MODE_VERIFY, (int32_t) prompt.size());
     }
     if (!decode_one(ctx, batch, prompt.back(), last_pos)) {
@@ -620,7 +942,7 @@ int main(int argc, char ** argv) {
     llama_synchronize(ctx);
     metrics.prompt_us = ggml_time_us() - prompt_start;
 
-    if (options.mode == vegas_run_mode::vegas) {
+    if (mode_uses_vegas(options.mode)) {
         const int64_t select_start = ggml_time_us();
         if (!llama_vegas_collect_indices(ctx)) {
             LOG_ERR("failed to initialize Vegas indices\n");
@@ -629,9 +951,18 @@ int main(int argc, char ** argv) {
         metrics.initial_select_us = ggml_time_us() - select_start;
     }
 
+    if (!common_speculative_process(spec.get(), batch)) {
+        LOG_ERR("failed to process final prompt token for MTP\n");
+        return 1;
+    }
+
+    llama_tokens history(prompt.begin(), prompt.end());
+    common_speculative_begin(spec.get(), 0, history);
+
     common_sampler_ptr sampler(common_sampler_init(model, params.sampling));
     llama_token id_last = common_sampler_sample(sampler.get(), ctx, 0, true);
     common_sampler_accept(sampler.get(), id_last, true);
+    history.push_back(id_last);
     record_token(ctx, id_last, options.quiet, metrics);
     metrics.n_predict = 1;
 
@@ -640,6 +971,10 @@ int main(int argc, char ** argv) {
         ok = run_baseline(
                 ctx, vocab, sampler.get(), id_last, (int32_t) prompt.size(),
                 params, options, batch, metrics);
+    } else if (mode_uses_mtp(options.mode)) {
+        ok = run_mtp(
+                ctx, ctx_dft, spec.get(), vocab, sampler.get(), id_last, (int32_t) prompt.size(),
+                params, options, batch, history, metrics);
     } else {
         ok = run_speculative(
                 ctx, vocab, sampler.get(), id_last, (int32_t) prompt.size(),

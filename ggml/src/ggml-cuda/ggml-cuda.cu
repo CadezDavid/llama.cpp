@@ -531,6 +531,14 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         CUDA_CHECK(cudaFree(ptr));
         pool_size -= size;
     }
+
+    size_t available() const override {
+        size_t result = 0;
+        for (const ggml_cuda_buffer & b : buffer_pool) {
+            result += b.size;
+        }
+        return result;
+    }
 };
 
 // pool with virtual memory
@@ -566,6 +574,10 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
 #endif
             CU_CHECK(cuMemAddressFree(pool_addr, CUDA_POOL_VMM_MAX_SIZE));
         }
+    }
+
+    size_t available() const override {
+        return pool_size - pool_used;
     }
 
     void * alloc(size_t size, size_t * actual_size) override {

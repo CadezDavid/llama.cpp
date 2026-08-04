@@ -159,7 +159,7 @@ void llm_graph_input_vegas_indices::set_input(const llama_ubatch * ubatch) {
 
     std::vector<int32_t> data(vegas.indices[il]);
     data.push_back(vegas.prefix_len);
-    data.push_back(vegas.top_k + ubatch->pos[0] + 1 - vegas.prefix_len);
+    data.push_back(vegas.top_k + std::min(n_kv, ubatch->pos[0] + 1) - vegas.prefix_len);
 
     GGML_ASSERT(data.back() <= vegas.top_k + vegas.max_recent_tokens);
     ggml_backend_tensor_set(indices, data.data(), 0, data.size() * sizeof(data[0]));
@@ -2447,7 +2447,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     ggml_tensor * vegas_indices = nullptr;
     int32_t vegas_sparse_len = 0;
 
-    if (use_vegas && vegas->mode == llama_vegas_mode::verify) {
+    if (use_vegas && vegas->mode == llama_vegas_mode::verify &&
+            (vegas->selection_layer < 0 || vegas->selection_layer == il)) {
         GGML_ASSERT(k->ne[3] == 1 && q->ne[3] == 1);
         GGML_ASSERT(vegas->prefix_len > 0 && vegas->prefix_len <= k->ne[1]);
         GGML_ASSERT(vegas->top_k > 0 && vegas->top_k <= vegas->prefix_len);
@@ -2499,26 +2500,27 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         cb(vegas_indices, "vegas_indices", il);
         res->set_vegas_indices(il, vegas_indices);
         ggml_build_forward_expand(gf, vegas_indices);
-    } else if (use_vegas && vegas->mode == llama_vegas_mode::draft) {
+    } else if (use_vegas && vegas->mode == llama_vegas_mode::draft &&
+            q->ne[1] == 1 && q->ne[3] == 1 && k->ne[3] == 1 &&
+            ubatch.pos != nullptr && ubatch.n_tokens > 0 &&
+            std::min<int32_t>(k->ne[1], ubatch.pos[ubatch.n_tokens - 1] + 1) >= vegas->prefix_len) {
         GGML_ASSERT(cparams.flash_attn);
-        GGML_ASSERT(q->ne[1] == 1 && q->ne[3] == 1 && k->ne[3] == 1);
-        GGML_ASSERT(ubatch.pos != nullptr);
         GGML_ASSERT(vegas->prefix_len > 0 && vegas->prefix_len <= k->ne[1]);
         GGML_ASSERT(vegas->top_k > 0 && vegas->top_k <= vegas->prefix_len);
         GGML_ASSERT((size_t) il < vegas->indices.size());
         GGML_ASSERT((int32_t) vegas->indices[il].size() == vegas->top_k);
 
-        const int32_t current_end = ubatch.pos[ubatch.n_tokens - 1] + 1;
+        const int32_t current_end = std::min<int32_t>(k->ne[1], ubatch.pos[ubatch.n_tokens - 1] + 1);
         GGML_ASSERT(current_end >= vegas->prefix_len && current_end <= k->ne[1]);
 
-        auto inp = std::make_unique<llm_graph_input_vegas_indices>(*vegas, il);
+        auto inp = std::make_unique<llm_graph_input_vegas_indices>(*vegas, il, k->ne[1]);
         inp->indices = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, vegas->top_k + 2);
         ggml_set_input(inp->indices);
         vegas_indices = inp->indices;
         res->add_input(std::move(inp));
 
         GGML_ASSERT(current_end - vegas->prefix_len <= vegas->max_recent_tokens);
-        vegas_sparse_len = vegas->top_k + vegas->max_recent_tokens;
+        vegas_sparse_len = std::min<int32_t>(k->ne[1], vegas->top_k + vegas->max_recent_tokens);
     }
 
     // TurboQuant note: graph-side Q rotation (pre-rotate-queries) is implemented below

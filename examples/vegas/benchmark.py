@@ -31,14 +31,20 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", required=True)
     parser.add_argument("--model", required=True)
+    parser.add_argument("--draft-model")
     parser.add_argument("--prompt", required=True)
     parser.add_argument("--prompt-tokens", type=int, required=True)
     parser.add_argument("--context", type=int, required=True)
     parser.add_argument("--predict", type=int, default=256)
     parser.add_argument("--repetitions", type=int, default=5)
-    parser.add_argument("--modes", nargs="+", default=["baseline", "vegas"])
+    parser.add_argument("--modes", nargs="+", default=["baseline", "mtp", "vegas", "mtp-vegas"])
     parser.add_argument("--gamma", type=int, default=5)
+    parser.add_argument("--self-gamma", type=int)
+    parser.add_argument("--mtp-gamma", type=int)
+    parser.add_argument("--mtp-ubatch", type=int, default=128)
     parser.add_argument("--ratio", type=float, default=0.07)
+    parser.add_argument("--selection-layer", type=int)
+    parser.add_argument("--refresh-interval", type=int, default=1)
     parser.add_argument("--min-tokens", type=int, default=256)
     parser.add_argument("--batch", type=int, default=1024)
     parser.add_argument("--ubatch", type=int, default=512)
@@ -46,11 +52,21 @@ def parse_args():
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--cache-type-k", default="q8_0")
     parser.add_argument("--cache-type-v", default="turbo4")
+    parser.add_argument("--draft-cache-type-k")
+    parser.add_argument("--draft-cache-type-v")
     parser.add_argument("--output", type=Path, required=True)
     return parser.parse_args()
 
 
 def command_for(args, mode):
+    draft_cache_type_k = args.draft_cache_type_k or args.cache_type_k
+    draft_cache_type_v = args.draft_cache_type_v or args.cache_type_v
+    gamma = args.gamma
+    if mode == "vegas" and args.self_gamma is not None:
+        gamma = args.self_gamma
+    if mode in {"mtp", "mtp-vegas", "mtp-auto"} and args.mtp_gamma is not None:
+        gamma = args.mtp_gamma
+
     command = [
         args.binary,
         "-m", args.model,
@@ -70,13 +86,26 @@ def command_for(args, mode):
         "--vegas-quiet",
         "--vegas-mode", mode,
     ]
+    if args.draft_model and mode in {"mtp", "mtp-vegas", "mtp-auto"}:
+        command.extend(["-md", args.draft_model])
+    if mode in {"mtp", "mtp-vegas", "mtp-auto"}:
+        command.extend([
+            "-ngld", "99",
+            "--vegas-mtp-ubatch", str(args.mtp_ubatch),
+            "--cache-type-k-draft", draft_cache_type_k,
+            "--cache-type-v-draft", draft_cache_type_v,
+        ])
     if mode != "baseline":
-        command.extend(["--vegas-gamma", str(args.gamma)])
-    if mode == "vegas":
+        command.extend(["--vegas-gamma", str(gamma)])
+    if mode in {"vegas", "mtp-vegas"}:
         command.extend([
             "--vegas-ratio", str(args.ratio),
             "--vegas-min-tokens", str(args.min_tokens),
         ])
+    if mode == "mtp-vegas" and args.selection_layer is not None:
+        command.extend(["--vegas-selection-layer", str(args.selection_layer)])
+    if mode == "mtp-vegas":
+        command.extend(["--vegas-refresh-interval", str(args.refresh_interval)])
     return command
 
 
@@ -99,7 +128,7 @@ def run_one(args, mode, repetition, order):
         None,
     )
     if completed.returncode != 0 or result_line is None:
-        tail = "\n".join(completed.stdout.splitlines()[-20:])
+        tail = "\n".join(completed.stdout.splitlines()[-80:])
         raise RuntimeError(
             f"run failed: mode={mode} repetition={repetition} "
             f"exit={completed.returncode}\n{tail}"
@@ -119,9 +148,18 @@ def run_one(args, mode, repetition, order):
         "ubatch": args.ubatch,
         "seed": args.seed,
         "prompt": args.prompt,
-        "requested_gamma": args.gamma,
+        "requested_mode": mode,
+        "requested_gamma": (
+            args.self_gamma if mode == "vegas" and args.self_gamma is not None else
+            args.mtp_gamma if mode in {"mtp", "mtp-vegas", "mtp-auto"} and args.mtp_gamma is not None else
+            args.gamma
+        ),
         "requested_ratio": args.ratio,
         "requested_min_tokens": args.min_tokens,
+        "requested_selection_layer": args.selection_layer,
+        "requested_refresh_interval": args.refresh_interval,
+        "requested_draft_cache_type_k": args.draft_cache_type_k or args.cache_type_k,
+        "requested_draft_cache_type_v": args.draft_cache_type_v or args.cache_type_v,
     })
     return result
 
@@ -157,9 +195,11 @@ def summarize(results):
         for result in results
     }
     repetitions = sorted({result["repetition"] for result in results})
-    if all((rep, "baseline") in by_key and (rep, "vegas") in by_key for rep in repetitions):
+    for mode in sorted({result["mode"] for result in results} - {"baseline"}):
+        if not all((rep, "baseline") in by_key and (rep, mode) in by_key for rep in repetitions):
+            continue
         ratios = [
-            by_key[(rep, "vegas")]["tokens_per_second"] /
+            by_key[(rep, mode)]["tokens_per_second"] /
             by_key[(rep, "baseline")]["tokens_per_second"]
             for rep in repetitions
         ]
@@ -168,7 +208,7 @@ def summarize(results):
         for _ in range(10000):
             sample = [rng.choice(ratios) for _ in ratios]
             bootstrap.append(statistics.fmean(sample))
-        summary["paired_vegas_over_baseline"] = {
+        summary[f"paired_{mode}_over_baseline"] = {
             "ratios": ratios,
             "mean": statistics.fmean(ratios),
             "ci95": [percentile(bootstrap, 0.025), percentile(bootstrap, 0.975)],

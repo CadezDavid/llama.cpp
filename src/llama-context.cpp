@@ -1237,11 +1237,12 @@ bool llama_context::vegas_enable(
 
     const bool supported_cache =
         (cparams.type_k == GGML_TYPE_Q8_0 && cparams.type_v == GGML_TYPE_TURBO4_0) ||
+        (cparams.type_k == GGML_TYPE_Q8_0 && cparams.type_v == GGML_TYPE_TURBO3_0) ||
         (cparams.type_k == GGML_TYPE_Q8_0 && cparams.type_v == GGML_TYPE_Q4_0) ||
         (cparams.type_k == GGML_TYPE_Q4_0 && cparams.type_v == GGML_TYPE_Q4_0) ||
         (cparams.type_k == GGML_TYPE_Q8_0 && cparams.type_v == GGML_TYPE_Q8_0);
     if (!supported_cache) {
-        LLAMA_LOG_ERROR("%s: Vegas requires q8_0/turbo4, q8_0/q4_0, q4_0/q4_0, or q8_0/q8_0 KV cache\n", __func__);
+        LLAMA_LOG_ERROR("%s: Vegas requires q8_0/turbo4, q8_0/turbo3, q8_0/q4_0, q4_0/q4_0, or q8_0/q8_0 KV cache\n", __func__);
         return false;
     }
 
@@ -1252,9 +1253,25 @@ bool llama_context::vegas_enable(
     vegas.prefix_len   = 0;
     vegas.top_k        = 0;
     vegas.max_recent_tokens = 2 * max_draft_tokens;
+    vegas.selection_layer = -1;
     vegas.indices.clear();
-    vegas.indices.resize(model.hparams.n_layer());
+    vegas.indices.resize(model.hparams.n_layer_all);
 
+    sched_need_reserve = true;
+
+    return true;
+}
+
+bool llama_context::vegas_set_selection_layer(int32_t il) {
+    if (il < -1 || il >= (int32_t) model.hparams.n_layer()) {
+        return false;
+    }
+
+    if (il >= 0 && (model.hparams.is_recr(il) || model.hparams.is_swa(il))) {
+        return false;
+    }
+
+    vegas.selection_layer = il;
     sched_need_reserve = true;
 
     return true;
@@ -1274,6 +1291,27 @@ void llama_context::vegas_set_mode(llama_vegas_mode mode, int32_t prefix_len) {
             vegas.top_k = std::min(vegas.top_k, vegas.max_tokens);
         }
     }
+}
+
+bool llama_context::vegas_resume_draft() {
+    if (vegas.prefix_len <= 0 || vegas.top_k <= 0) {
+        return false;
+    }
+
+    const bool valid = std::all_of(vegas.indices.begin(), vegas.indices.end(),
+            [this](const std::vector<int32_t> & indices) {
+                return (int32_t) indices.size() == vegas.top_k;
+            });
+    if (!valid) {
+        return false;
+    }
+
+    vegas.mode = llama_vegas_mode::draft;
+    return true;
+}
+
+void llama_context::vegas_pause() {
+    vegas.mode = llama_vegas_mode::disabled;
 }
 
 bool llama_context::vegas_collect_indices() {
@@ -1308,6 +1346,27 @@ bool llama_context::vegas_collect_indices() {
     }
 
     return found;
+}
+
+bool llama_context::vegas_copy_indices(const llama_context & src) {
+    if (src.vegas.mode != llama_vegas_mode::verify || src.vegas.top_k <= 0) {
+        return false;
+    }
+
+    auto it = std::find_if(src.vegas.indices.rbegin(), src.vegas.indices.rend(),
+            [](const std::vector<int32_t> & indices) { return !indices.empty(); });
+    if (it == src.vegas.indices.rend() || (int32_t) it->size() != src.vegas.top_k) {
+        return false;
+    }
+
+    vegas.mode       = llama_vegas_mode::draft;
+    vegas.prefix_len = src.vegas.prefix_len;
+    vegas.top_k      = src.vegas.top_k;
+    for (auto & indices : vegas.indices) {
+        indices = *it;
+    }
+
+    return true;
 }
 
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
@@ -2543,6 +2602,7 @@ llm_graph_params llama_context::graph_params(
         /*.vegas_prefix_len =*/ vegas.prefix_len,
         /*.vegas_top_k =*/ vegas.top_k,
         /*.vegas_max_recent_tokens =*/ vegas.max_recent_tokens,
+        /*.vegas_selection_layer =*/ vegas.selection_layer,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
@@ -4301,11 +4361,27 @@ bool llama_vegas_enable(
     return ctx->vegas_enable(sparse_ratio, min_tokens, max_tokens, max_draft_tokens);
 }
 
+bool llama_vegas_set_selection_layer(llama_context * ctx, int32_t il) {
+    return ctx->vegas_set_selection_layer(il);
+}
+
 void llama_vegas_set_mode(llama_context * ctx, int32_t mode, int32_t prefix_len) {
     GGML_ASSERT(mode >= (int32_t) llama_vegas_mode::disabled && mode <= (int32_t) llama_vegas_mode::verify);
     ctx->vegas_set_mode((llama_vegas_mode) mode, prefix_len);
 }
 
+bool llama_vegas_resume_draft(llama_context * ctx) {
+    return ctx->vegas_resume_draft();
+}
+
+void llama_vegas_pause(llama_context * ctx) {
+    ctx->vegas_pause();
+}
+
 bool llama_vegas_collect_indices(llama_context * ctx) {
     return ctx->vegas_collect_indices();
+}
+
+bool llama_vegas_copy_indices(llama_context * dst, const llama_context * src) {
+    return dst->vegas_copy_indices(*src);
 }

@@ -169,7 +169,8 @@ public:
 
 class llm_graph_input_vegas_indices : public llm_graph_input_i {
 public:
-    llm_graph_input_vegas_indices(const llama_vegas_state & vegas, int32_t il) : vegas(vegas), il(il) {}
+    llm_graph_input_vegas_indices(const llama_vegas_state & vegas, int32_t il, int32_t n_kv) :
+        vegas(vegas), il(il), n_kv(n_kv) {}
     virtual ~llm_graph_input_vegas_indices() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
@@ -179,6 +180,7 @@ public:
 
     const llama_vegas_state & vegas;
     const int32_t il;
+    const int32_t n_kv;
 };
 
 // temperature tuning, used by llama4
@@ -708,6 +710,7 @@ struct llm_graph_params {
     int32_t vegas_prefix_len;
     int32_t vegas_top_k;
     int32_t vegas_max_recent_tokens;
+    int32_t vegas_selection_layer;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -780,7 +783,8 @@ struct llm_graph_params {
 
         if (vegas_mode != llama_vegas_mode::disabled &&
                 (vegas_top_k != other.vegas_top_k ||
-                 vegas_max_recent_tokens != other.vegas_max_recent_tokens)) {
+                 vegas_max_recent_tokens != other.vegas_max_recent_tokens ||
+                 vegas_selection_layer != other.vegas_selection_layer)) {
             return false;
         }
 

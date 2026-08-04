@@ -121,8 +121,12 @@ struct llama_context {
     void set_warmup(bool value);
 
     bool vegas_enable(float sparse_ratio, int32_t min_tokens, int32_t max_tokens, int32_t max_draft_tokens);
+    bool vegas_set_selection_layer(int32_t il);
     void vegas_set_mode(llama_vegas_mode mode, int32_t prefix_len);
+    void vegas_pause();
+    bool vegas_resume_draft();
     bool vegas_collect_indices();
+    bool vegas_copy_indices(const llama_context & src);
 
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
