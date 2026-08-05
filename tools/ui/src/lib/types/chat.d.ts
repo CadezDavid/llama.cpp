@@ -145,7 +145,8 @@ export interface ChatStreamCallbacks {
 	createToolResultMessage?: (
 		toolCallId: string,
 		content: string,
-		extras?: DatabaseMessageExtra[]
+		extras?: DatabaseMessageExtra[],
+		toolCwd?: string
 	) => Promise<DatabaseMessage>;
 	updateToolResultMessage?: (
 		messageId: string,

@@ -203,11 +203,36 @@ export class ChatService {
 		messages: ApiChatMessageData[],
 		options: SettingsChatServiceOptions = {}
 	): ApiChatCompletionRequest {
+		const normalizedMessages = messages
+			.filter((message) => {
+				if (message.role !== MessageRole.SYSTEM || typeof message.content !== 'string') return true;
+				return message.content.trim().length > 0;
+			})
+			.map((message) => ChatService.cloneApiMessage(message));
+
+		if (options.model && !modelsStore.modelSupportsVision(options.model)) {
+			for (const message of normalizedMessages) {
+				if (!Array.isArray(message.content)) continue;
+				message.content = message.content.filter(
+					(part) => part.type !== ContentPartType.IMAGE_URL
+				);
+				if (
+					message.content.length === 1 &&
+					message.content[0].type === ContentPartType.TEXT &&
+					typeof message.content[0].text === 'string'
+				) {
+					message.content = message.content[0].text;
+				}
+			}
+		}
+
 		const requestBody: ApiChatCompletionRequest = {
-			messages: messages.map((message) => ({
+			messages: normalizedMessages.map((message) => ({
 				role: message.role,
 				content: message.content,
-				reasoning_content: message.reasoning_content,
+				reasoning_content: options.excludeReasoningFromContext
+					? undefined
+					: message.reasoning_content,
 				tool_calls: message.tool_calls,
 				tool_call_id: message.tool_call_id
 			})),
@@ -442,6 +467,9 @@ export class ChatService {
 			// model the ::model suffix keeps the per model session distinct
 			if (stream && conversationId) {
 				headers['X-Conversation-Id'] = streamIdentity(conversationId, options.model);
+				// persist the pending stream before the fetch: a reload during the model load or
+				// the prompt processing must still find its way back to the session once it exists
+				ChatService.saveStreamState(conversationId, 0, options.model ?? null);
 			}
 
 			const response = await fetch(API_CHAT.COMPLETIONS, {
@@ -452,6 +480,11 @@ export class ChatService {
 			});
 
 			if (!response.ok) {
+				// a rejected request (including one cancelled by a stop during the model load)
+				// leaves nothing to resume
+				if (conversationId) {
+					ChatService.clearStreamState(conversationId);
+				}
 				const error = await ChatService.parseErrorResponse(response);
 
 				if (onError) {
@@ -611,7 +644,7 @@ export class ChatService {
 		if (!conversationId) return;
 		try {
 			const id = streamIdentity(conversationId, model);
-			await fetch(`${API_STREAM.BASE}/${encodeURIComponent(id)}`, {
+			await fetch(`${API_STREAM.BASE}?conv_id=${encodeURIComponent(id)}`, {
 				method: 'DELETE',
 				headers: getAuthHeaders()
 			});
@@ -704,6 +737,26 @@ export class ChatService {
 	 * existing SSE parser drains it like a fresh stream. The server returns 200 on success, 404 if
 	 * no session exists for the conv_id, and 400 if the offset is below the dropped prefix.
 	 */
+	// probe the resume route status without consuming the stream: the SSE route has no HEAD,
+	// so issue the GET and abort it right after the status line. 0 on network error
+	static async probeResumeStatus(streamId: string): Promise<number> {
+		if (!streamId) return 0;
+		const ac = new AbortController();
+		try {
+			const resp = await fetch(
+				`${API_STREAM.BASE}?conv_id=${encodeURIComponent(streamId)}&from=0`,
+				{
+					headers: getAuthHeaders(),
+					signal: ac.signal
+				}
+			);
+			ac.abort();
+			return resp.status;
+		} catch {
+			return 0;
+		}
+	}
+
 	static async resumeStream(
 		conversationId: string,
 		signal?: AbortSignal,
@@ -713,7 +766,7 @@ export class ChatService {
 		const state = ChatService.getStreamState(conversationId);
 		const from = state?.bytesReceived ?? 0;
 		const id = streamIdentity(conversationId, model);
-		const url = `${API_STREAM.BASE}/${encodeURIComponent(id)}?from=${from}`;
+		const url = `${API_STREAM.BASE}?conv_id=${encodeURIComponent(id)}&from=${from}`;
 		return await fetch(url, { method: 'GET', signal, headers: getAuthHeaders() });
 	}
 

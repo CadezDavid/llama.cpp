@@ -161,7 +161,6 @@
 		const currentId = conversation?.id ?? null;
 
 		if (currentId !== previousConversationId && previousConversationId !== null) {
-			// Conversation changed - trigger fade out/in
 			isVisible = false;
 			requestAnimationFrame(() => {
 				refreshAllMessages();
