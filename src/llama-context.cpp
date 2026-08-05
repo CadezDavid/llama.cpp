@@ -1452,7 +1452,11 @@ bool llama_context::vegas_collect_indices() {
 }
 
 bool llama_context::vegas_copy_indices(const llama_context & src) {
-    if (src.vegas.mode != llama_vegas_mode::verify || src.vegas.top_k <= 0 ||
+    // A paused source retains the most recently verified plan so an adaptive
+    // dense-MTP cycle can later return to sparse drafting without paying a
+    // collector pass during the dense cycle.
+    if ((src.vegas.mode != llama_vegas_mode::verify && src.vegas.mode != llama_vegas_mode::disabled) ||
+            src.vegas.prefix_len <= 0 || src.vegas.top_k <= 0 ||
             src.vegas.plan == nullptr || src.vegas.ready_event == nullptr) {
         return false;
     }

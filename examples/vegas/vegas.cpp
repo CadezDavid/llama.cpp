@@ -259,10 +259,6 @@ static bool parse_vegas_options(
         return false;
     }
 
-    if (options.adaptive_gamma) {
-        options.gamma = vegas_adaptive_gamma::max_gamma;
-    }
-
     return true;
 }
 
@@ -631,30 +627,36 @@ static bool run_mtp(
         vegas_metrics & metrics) {
     const bool sparse = options.mode == vegas_run_mode::mtp_vegas;
     bool has_eog = false;
-    const int32_t current_gamma = options.gamma;
-    vegas_adaptive_gamma adaptive(options.adaptive_beta);
+    const int32_t draft_capacity = options.adaptive_gamma ? vegas_adaptive_gamma::max_gamma : options.gamma;
+    vegas_adaptive_gamma adaptive(options.adaptive_beta, options.gamma);
     const int64_t start = ggml_time_us();
 
     while (!has_eog && (params.n_predict < 0 || metrics.n_predict < params.n_predict)) {
         const int32_t remaining = params.n_predict < 0 ? INT32_MAX : params.n_predict - metrics.n_predict;
-        const int32_t n_max = remaining > 1 ? std::min(current_gamma, remaining - 1) : 0;
+        bool cycle_sparse = sparse;
+        int32_t cycle_gamma = draft_capacity;
+        if (options.adaptive_gamma && remaining > 1) {
+            adaptive.begin_cycle();
+            cycle_sparse = sparse && adaptive.planned_sparse();
+            cycle_gamma = adaptive.planned_gamma();
+        }
+        const int32_t n_max = remaining > 1 ? std::min(cycle_gamma, remaining - 1) : 0;
         llama_tokens draft;
         int64_t cycle_draft_us = 0;
         int64_t cycle_verify_us = 0;
-
-        if (options.adaptive_gamma && n_max > 0) {
-            adaptive.begin_cycle();
-        }
+        int64_t cycle_collect_us = 0;
 
         if (n_max > 0) {
-            if (sparse && metrics.n_cycles % options.refresh_interval == 0) {
+            if (cycle_sparse && metrics.n_cycles % options.refresh_interval == 0) {
                 if (!llama_vegas_copy_indices(ctx_dft, ctx)) {
                     LOG_ERR("failed to copy Vegas indices to MTP context\n");
                     return false;
                 }
-            } else if (sparse && !llama_vegas_resume_draft(ctx_dft)) {
+            } else if (cycle_sparse && !llama_vegas_resume_draft(ctx_dft)) {
                 LOG_ERR("failed to resume Vegas indices in MTP context\n");
                 return false;
+            } else if (!cycle_sparse) {
+                llama_vegas_pause(ctx_dft);
             }
 
             auto & draft_params = common_speculative_get_draft_params(spec, 0);
@@ -687,12 +689,14 @@ static bool run_mtp(
             metrics.rollback_us += ggml_time_us() - rollback_start;
         }
 
-        const bool refresh_indices = sparse &&
+        const bool refresh_indices = cycle_sparse &&
                 (metrics.n_cycles + 1) % options.refresh_interval == 0;
         if (refresh_indices) {
             llama_vegas_set_mode(ctx, LLAMA_VEGAS_MODE_VERIFY, n_past + 1);
         } else if (sparse) {
-            llama_vegas_set_mode(ctx, LLAMA_VEGAS_MODE_DISABLED, 0);
+            // Keep the last verified prefix and plan available for a later
+            // sparse cycle while running this verification densely.
+            llama_vegas_pause(ctx);
         }
 
         common_batch_clear(batch);
@@ -715,7 +719,8 @@ static bool run_mtp(
                 LOG_ERR("failed to collect Vegas indices\n");
                 return false;
             }
-            metrics.collect_us += ggml_time_us() - collect_start;
+            cycle_collect_us = ggml_time_us() - collect_start;
+            metrics.collect_us += cycle_collect_us;
         }
 
         if (!common_speculative_process(spec, batch)) {
@@ -765,7 +770,9 @@ static bool run_mtp(
         common_speculative_accept(spec, 0, accepted);
 
         if (options.adaptive_gamma && !draft.empty()) {
-            adaptive.finish_cycle((int32_t) draft.size(), accepted, cycle_draft_us, cycle_verify_us);
+            adaptive.finish_cycle(
+                    (int32_t) draft.size(), accepted, cycle_draft_us,
+                    cycle_verify_us + cycle_collect_us, cycle_sparse);
             metrics.adaptive_summary = adaptive.summary_json();
         }
 
@@ -862,8 +869,8 @@ int main(int argc, char ** argv) {
         LOG_ERR("Vegas does not support stateful or randomized probability transforms\n");
         return 1;
     }
-    if (options.adaptive_gamma && !mode_uses_mtp(options.mode)) {
-        LOG_ERR("--vegas-adaptive-gamma requires an MTP mode\n");
+    if (options.adaptive_gamma && options.mode != vegas_run_mode::mtp_vegas) {
+        LOG_ERR("--vegas-adaptive-gamma requires --vegas-mode mtp-vegas\n");
         return 1;
     }
 
@@ -904,10 +911,8 @@ int main(int argc, char ** argv) {
     }
 
     resolve_auto_policy(options, params, model, (int32_t) prompt.size());
-    if (options.adaptive_gamma) {
-        options.gamma = vegas_adaptive_gamma::max_gamma;
-    }
-    params.speculative.draft.n_max = options.gamma;
+    const int32_t draft_capacity = options.adaptive_gamma ? vegas_adaptive_gamma::max_gamma : options.gamma;
+    params.speculative.draft.n_max = draft_capacity;
 
     common_speculative_init_result_ptr spec_init;
     common_speculative_ptr spec;
@@ -951,7 +956,7 @@ int main(int argc, char ** argv) {
 
     if (mode_uses_vegas(options.mode) &&
             !llama_vegas_enable(
-                    ctx, options.sparse_ratio, options.min_tokens, options.max_tokens, options.gamma)) {
+                    ctx, options.sparse_ratio, options.min_tokens, options.max_tokens, draft_capacity)) {
         LOG_ERR("failed to enable Vegas\n");
         return 1;
     }
@@ -959,7 +964,7 @@ int main(int argc, char ** argv) {
     if (options.mode == vegas_run_mode::mtp_vegas &&
             !llama_vegas_enable(
                     ctx_dft, options.sparse_ratio, options.min_tokens, options.max_tokens,
-                    options.gamma * options.refresh_interval)) {
+                    draft_capacity * options.refresh_interval)) {
         LOG_ERR("failed to enable Vegas for MTP context\n");
         return 1;
     }
@@ -981,7 +986,7 @@ int main(int argc, char ** argv) {
         }
     }
 
-    if (prompt.size() + options.gamma + 1 > llama_n_ctx(ctx)) {
+    if (prompt.size() + draft_capacity + 1 > llama_n_ctx(ctx)) {
         LOG_ERR("prompt and draft exceed the context size\n");
         return 1;
     }
@@ -995,7 +1000,7 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    llama_batch batch = llama_batch_init(std::max((int32_t) llama_n_batch(ctx), options.gamma + 1), 0, 1);
+    llama_batch batch = llama_batch_init(std::max((int32_t) llama_n_batch(ctx), draft_capacity + 1), 0, 1);
     const int32_t last_pos = (int32_t) prompt.size() - 1;
 
     if (mode_uses_vegas(options.mode)) {

@@ -100,7 +100,8 @@ def command_for(args, mode):
         ])
     if mode != "baseline":
         command.extend(["--vegas-gamma", str(gamma)])
-    if args.adaptive_gamma and mode in {"mtp", "mtp-vegas", "mtp-auto"}:
+    adaptive_gamma = args.adaptive_gamma and mode == "mtp-vegas"
+    if adaptive_gamma:
         command.extend([
             "--vegas-adaptive-gamma",
             "--vegas-adaptive-beta", str(args.adaptive_beta),
@@ -163,7 +164,7 @@ def run_one(args, mode, repetition, order):
             args.mtp_gamma if mode in {"mtp", "mtp-vegas", "mtp-auto"} and args.mtp_gamma is not None else
             args.gamma
         ),
-        "requested_adaptive_gamma": args.adaptive_gamma,
+        "requested_adaptive_gamma": args.adaptive_gamma and mode == "mtp-vegas",
         "requested_adaptive_beta": args.adaptive_beta,
         "requested_ratio": args.ratio,
         "requested_min_tokens": args.min_tokens,

@@ -6,7 +6,8 @@
 #include <cstdio>
 #include <limits>
 
-vegas_adaptive_gamma::vegas_adaptive_gamma(double beta) : beta_(beta) {
+vegas_adaptive_gamma::vegas_adaptive_gamma(double beta, int32_t dense_gamma)
+    : beta_(beta), dense_gamma_(std::clamp(dense_gamma, min_gamma, max_gamma)) {
     if (!(beta_ >= 0.0 && beta_ < 1.0)) {
         beta_ = 0.9;
     }
@@ -15,7 +16,17 @@ vegas_adaptive_gamma::vegas_adaptive_gamma(double beta) : beta_(beta) {
 
 void vegas_adaptive_gamma::begin_cycle() {
     current_draft_.clear();
-    planned_gamma_ = cycles_ == 0 ? max_gamma : best_decision().gamma;
+    if (cycles_ == 0) {
+        planned_gamma_ = dense_gamma_;
+        planned_sparse_ = false;
+    } else if (sparse_cycles_ == 0) {
+        planned_gamma_ = dense_gamma_;
+        planned_sparse_ = true;
+    } else {
+        const auto decision = best_decision();
+        planned_gamma_ = decision.gamma;
+        planned_sparse_ = decision.sparse;
+    }
 }
 
 bool vegas_adaptive_gamma::observe_draft(const common_speculative_draft_observation & observation) {
@@ -24,13 +35,21 @@ bool vegas_adaptive_gamma::observe_draft(const common_speculative_draft_observat
     record.top_probability = observation.top_probability;
     record.acceptance_probability = acceptance_probability(record.entropy, record.top_probability);
     current_draft_.push_back(record);
-
-    if (cycles_ == 0) {
-        planned_gamma_ = max_gamma;
-        return observation.position < max_gamma;
+    if (observation.entropy_on_device) {
+        device_entropy_samples_++;
+    } else {
+        fallback_entropy_samples_++;
     }
 
-    planned_gamma_ = best_decision().gamma;
+    if (!planned_sparse_) {
+        return observation.position < planned_gamma_;
+    }
+
+    if (sparse_cycles_ == 0) {
+        return observation.position < planned_gamma_;
+    }
+
+    planned_gamma_ = best_sparse_decision().gamma;
     return observation.position < planned_gamma_ && observation.position < max_gamma;
 }
 
@@ -38,7 +57,8 @@ void vegas_adaptive_gamma::finish_cycle(
         int32_t drafted,
         int32_t accepted,
         int64_t draft_us,
-        int64_t verify_us) {
+        int64_t verify_us,
+        bool sparse) {
     drafted = std::clamp(drafted, 0, max_gamma);
     accepted = std::clamp(accepted, 0, drafted);
 
@@ -51,31 +71,57 @@ void vegas_adaptive_gamma::finish_cycle(
         update_ema(position_acceptance_[accepted + 1], 0.0);
     }
 
-    if (drafted > 0) {
+    if (drafted > 0 && sparse) {
         update_ema(draft_costs_[drafted], (double) draft_us);
         update_ema(verify_costs_[drafted], (double) verify_us);
         gamma_histogram_[drafted]++;
+        sparse_cycles_++;
+        sparse_drafted_total_ += drafted;
+        sparse_draft_us_total_ += draft_us;
+        sparse_verify_us_total_ += verify_us;
+    } else if (drafted > 0) {
+        const double cost = (double) draft_us + verify_us;
+        if (cost > 0.0) {
+            update_ema(dense_efficiency_, (1.0 + accepted) / cost);
+        }
+        dense_cycles_++;
     }
 
     cycles_++;
     drafted_total_ += drafted;
     accepted_total_ += accepted;
-    draft_us_total_ += draft_us;
-    verify_us_total_ += verify_us;
 }
 
 int32_t vegas_adaptive_gamma::planned_gamma() const {
     return planned_gamma_;
 }
 
+bool vegas_adaptive_gamma::planned_sparse() const {
+    return planned_sparse_;
+}
+
 vegas_adaptive_gamma::decision vegas_adaptive_gamma::best_decision() const {
+    const auto sparse = best_sparse_decision();
+    if (dense_efficiency_.samples > 0 && dense_efficiency_.value >= sparse.efficiency) {
+        return {
+            /* .gamma      = */ dense_gamma_,
+            /* .sparse     = */ false,
+            /* .efficiency = */ dense_efficiency_.value,
+        };
+    }
+    return sparse;
+}
+
+vegas_adaptive_gamma::decision vegas_adaptive_gamma::best_sparse_decision() const {
     decision best;
+    best.sparse = true;
     best.efficiency = -std::numeric_limits<double>::infinity();
 
     for (int32_t gamma = min_gamma; gamma <= max_gamma; ++gamma) {
         const double value = efficiency(gamma);
         if (value > best.efficiency) {
             best.gamma = gamma;
+            best.sparse = true;
             best.efficiency = value;
         }
     }
@@ -96,15 +142,21 @@ std::string vegas_adaptive_gamma::summary_json() const {
     const double accepted_entropy = accepted_entropy_.samples > 0 ? accepted_entropy_.value : 0.0;
     const double rejected_entropy = rejected_entropy_.samples > 0 ? rejected_entropy_.value : 0.0;
 
-    char buffer[512];
+    char buffer[1024];
     std::snprintf(buffer, sizeof(buffer),
             "\"adaptive_gamma\":true,\"adaptive_beta\":%.6f,"
             "\"adaptive_mean_gamma\":%.6f,\"adaptive_planned_gamma\":%d,"
+            "\"adaptive_planned_sparse\":%s,\"adaptive_dense_gamma\":%d,"
+            "\"adaptive_dense_cycles\":%" PRId64 ",\"adaptive_sparse_cycles\":%" PRId64 ","
+            "\"adaptive_device_entropy_samples\":%" PRId64 ","
+            "\"adaptive_fallback_entropy_samples\":%" PRId64 ","
             "\"adaptive_accepted_entropy\":%.6f,\"adaptive_rejected_entropy\":%.6f,"
             "\"adaptive_accepted_entropy_samples\":%" PRId64 ","
             "\"adaptive_rejected_entropy_samples\":%" PRId64 ","
             "\"adaptive_gamma_histogram\":%s",
-            beta_, mean_gamma, planned_gamma_, accepted_entropy, rejected_entropy,
+            beta_, mean_gamma, planned_gamma_, planned_sparse_ ? "true" : "false", dense_gamma_,
+            dense_cycles_, sparse_cycles_, device_entropy_samples_, fallback_entropy_samples_,
+            accepted_entropy, rejected_entropy,
             accepted_entropy_.samples, rejected_entropy_.samples, histogram.c_str());
     return buffer;
 }
@@ -149,8 +201,8 @@ double vegas_adaptive_gamma::draft_cost(int32_t gamma) const {
     if (draft_costs_[gamma].samples > 0) {
         return draft_costs_[gamma].value;
     }
-    if (drafted_total_ > 0 && draft_us_total_ > 0) {
-        return (double) draft_us_total_ / drafted_total_ * gamma;
+    if (sparse_drafted_total_ > 0 && sparse_draft_us_total_ > 0) {
+        return (double) sparse_draft_us_total_ / sparse_drafted_total_ * gamma;
     }
     return (double) gamma;
 }
@@ -184,8 +236,8 @@ double vegas_adaptive_gamma::verify_cost(int32_t gamma) const {
     if (upper > 0) {
         return verify_costs_[upper].value;
     }
-    if (cycles_ > 0 && verify_us_total_ > 0) {
-        return (double) verify_us_total_ / cycles_;
+    if (sparse_cycles_ > 0 && sparse_verify_us_total_ > 0) {
+        return (double) sparse_verify_us_total_ / sparse_cycles_;
     }
     return 1.0;
 }
