@@ -25,6 +25,7 @@ typedef void (* fattn_kernel_t)(
         const char * __restrict__ V,
         const char * __restrict__ mask,
         const char * __restrict__ sinks,
+        float      * __restrict__ score,
         const int  * __restrict__ KV_max,
         float      * __restrict__ dst,
         float2     * __restrict__ dst_meta,
@@ -34,6 +35,7 @@ typedef void (* fattn_kernel_t)(
         const float m1,
         const uint32_t n_head_log2,
         const float logit_softcap,
+        const int32_t * score_prefix,
         const int32_t ne00, const uint3   ne01, const int32_t ne02, const int32_t ne03,
                             const int32_t nb01, const int32_t nb02, const int32_t nb03,
         const int32_t ne10, const int32_t ne11, const int32_t ne12, const int32_t ne13,
@@ -1331,7 +1333,9 @@ void launch_fattn(
 
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
-    const ggml_tensor * vegas = dst->src[5];
+    const ggml_tensor * sparse_kv = dst->src[5];
+    const ggml_tensor * score = dst->src[6];
+    const ggml_tensor * score_prefix = dst->src[7];
 
     ggml_tensor * KQV = dst;
 
@@ -1343,14 +1347,19 @@ void launch_fattn(
     GGML_ASSERT(V->nb[0] == ggml_element_size(V));
 
     GGML_ASSERT(!mask || mask->type == GGML_TYPE_F16);
-    GGML_ASSERT(!vegas || (vegas->type == GGML_TYPE_I32 && ggml_is_contiguous(vegas)));
+    GGML_ASSERT(!sparse_kv || (sparse_kv->type == GGML_TYPE_I32 && ggml_is_contiguous(sparse_kv)));
+    GGML_ASSERT(!score || (score->type == GGML_TYPE_F32 && ggml_is_contiguous(score)));
 
-    const int vegas_top_k = vegas ? ggml_get_op_params_i32(dst, 4) : 0;
-    const int n_kv = vegas ? ggml_get_op_params_i32(dst, 5) : K->ne[1];
-
-    GGML_ASSERT(!vegas || (Q->ne[1] == 1 && Q->ne[3] == 1));
-    GGML_ASSERT(!vegas || (vegas_top_k + 2 == vegas->ne[0] && vegas_top_k > 0));
-    GGML_ASSERT(!vegas || (n_kv >= vegas_top_k && n_kv <= K->ne[1]));
+    const int sparse_n_indices = sparse_kv ? ggml_get_op_params_i32(dst, 4) : 0;
+    const int n_kv = sparse_kv ? ggml_get_op_params_i32(dst, 5) : K->ne[1];
+    const int sparse_suffix_start = sparse_kv ? ggml_get_op_params_i32(dst, 6) : 0;
+    GGML_ASSERT(!sparse_kv || (Q->ne[1] == 1 && Q->ne[3] == 1));
+    GGML_ASSERT(!sparse_kv || (sparse_n_indices == sparse_kv->ne[0] && sparse_n_indices > 0));
+    GGML_ASSERT(!sparse_kv || (n_kv >= sparse_n_indices && n_kv <= K->ne[1]));
+    GGML_ASSERT(!sparse_kv || sparse_suffix_start >= 0);
+    GGML_ASSERT(!score || (score_prefix && score_prefix->type == GGML_TYPE_I32 &&
+            ggml_nelements(score_prefix) == 1 && score->ne[0] == K->ne[2] && score->ne[1] <= K->ne[1]));
+    GGML_ASSERT(!score || (!sparse_kv && Q->ne[3] == 1));
 
     ggml_cuda_pool & pool = ctx.pool();
     cudaStream_t main_stream = ctx.stream();
@@ -1473,7 +1482,7 @@ void launch_fattn(
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths.
-    if (!vegas && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1)) {
+    if (!sparse_kv && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1)) {
         const int64_t s31 = mask->nb[1] / sizeof(half2);
         const int64_t s33 = mask->nb[3] / sizeof(half2);
 
@@ -1592,20 +1601,22 @@ void launch_fattn(
         (const char *) Q->data,
         K_data,
         V_data,
-        vegas ? ((const char *) vegas->data) : (mask ? ((const char *) mask->data) : nullptr),
+        sparse_kv ? ((const char *) sparse_kv->data) : (mask ? ((const char *) mask->data) : nullptr),
         sinks ? ((const char *) sinks->data) : nullptr,
+        score ? (float *) score->data : nullptr,
         KV_max.ptr,
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,
+        score_prefix ? (const int32_t *) score_prefix->data : nullptr,
         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
         K->ne[0], n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,
-        vegas ? vegas_top_k : (mask ? mask->ne[1] : 0),
-        vegas ? 0 : (mask ? mask->ne[2] : 0),
-        vegas ? -1 : (mask ? mask->ne[3] : 0),
-        vegas ? 0 : (mask ? mask->nb[1] : 0),
-        vegas ? 0 : (mask ? mask->nb[2] : 0),
-        vegas ? 0 : (mask ? mask->nb[3] : 0)
+        sparse_kv ? sparse_n_indices : (mask ? mask->ne[1] : 0),
+        sparse_kv ? sparse_suffix_start : (mask ? mask->ne[2] : 0),
+        sparse_kv ? -1 : (mask ? mask->ne[3] : 0),
+        sparse_kv ? 0 : (mask ? mask->nb[1] : 0),
+        sparse_kv ? 0 : (mask ? mask->nb[2] : 0),
+        sparse_kv ? 0 : (mask ? mask->nb[3] : 0)
     );
     CUDA_CHECK(cudaGetLastError());
 

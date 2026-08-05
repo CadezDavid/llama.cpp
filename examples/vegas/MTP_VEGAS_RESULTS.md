@@ -10,6 +10,10 @@ validation results are documented in
 work supersedes the original campaign's untuned conclusion for Qwen27 and
 Qwen35 q4_0/q4_0; the screening tables below remain unchanged evidence.
 
+The later device-resident, fused verification collector and its focused
+correctness/performance checks are documented in
+[`results/fused-collector-2026-08-04/README.md`](results/fused-collector-2026-08-04/README.md).
+
 Completed 256-token measurements from the original campaign were preserved. Every remaining model/context/cache/mode cell was screened once with 128 generated tokens. Clearly negative screens were not confirmed. The retained 256-token MTP versus MTP+Vegas cells use sequential stopping: two order-rotated repetitions first, followed by a third pair only when signs disagree or the effect is within about 5%. Existing n=3 results were preserved and not repeated. OOM configurations were not retried. Screening and confirmatory evidence are reported separately.
 
 Prompt lengths are 16,384, 32,768, 65,536, and 128,000 tokens. Context capacities are 24,576, 40,960, 73,728, and 131,072. Decode throughput excludes model loading and prompt prefill. Runs use batch one, greedy sampling, flash attention, full CUDA offload, and matched target/draft KV formats. Vegas uses gamma 1 and a 3% mask with a 256-token floor. MTP and MTP+Vegas use gamma 3.

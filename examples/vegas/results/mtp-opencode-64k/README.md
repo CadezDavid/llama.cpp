@@ -16,3 +16,8 @@ The test used Gemma 4 31B Q4_K_XL, the Q8_0 Gemma assistant, q8_0/turbo4 target 
 MTP+Vegas was 4.67% slower. Sparse drafting reduced assistant time per proposal by 50.5%, but acceptance fell slightly, two additional dense target verification cycles were needed, and target selection increased verification cost per cycle by 10.9%. The output hashes matched.
 
 This is consistent with a workload-dependent crossover near 64K: assistant sparsity is already effective, but its savings are not large enough to tolerate lower acceptance and Vegas selection overhead.
+
+A later gamma-1 screen on a newly reconstructed version of the same real
+conversation is documented in
+[`../gemma-64k-gamma1-2026-08-04/README.md`](../gemma-64k-gamma1-2026-08-04/README.md).
+It remains negative at refresh intervals 1 and 2.

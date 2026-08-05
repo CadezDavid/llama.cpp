@@ -1,0 +1,5 @@
+0.00.740.080 W load: override 'tokenizer.ggml.add_bos_token' to 'true' for Gemma4
+0.00.784.074 W load: control-looking token:    212 '</s>' was not control-type; this is probably a bug in the model. its type will be overridden
+0.00.784.364 W load: control-looking token:     50 '<|tool_response>' was not control-type; this is probably a bug in the model. its type will be overridden
+0.00.802.969 W load: special_eog_ids contains '<|tool_response>', removing '</s>' token from EOG list
+FFN_SPARSE_EVAL {"sparsity":0.400000,"block_size":1,"prefix_tokens":1024,"eval_tokens":128,"dense_ppl":75.67675428,"sparse_ppl":103.64496626,"ppl_ratio":1.36957468,"mean_kl":0.2178478629,"max_kl":1.2674287391,"mean_l1":0.4274220647,"top1_agreement":0.78906250,"dense_teacher_top1":0.35156250,"sparse_teacher_top1":0.35156250}

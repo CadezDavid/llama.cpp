@@ -133,6 +133,24 @@ LLAMA_API bool llama_vegas_set_selection_layer(
         struct llama_context * ctx,
                      int32_t il);
 
+LLAMA_API bool llama_vegas_set_anchor_tokens(
+        struct llama_context * ctx,
+                     int32_t n_tokens);
+
+LLAMA_API bool llama_vegas_set_ffn_oracle_sparsity(
+        struct llama_context * ctx,
+                       float sparsity);
+
+LLAMA_API bool llama_vegas_set_ffn_oracle_block_size(
+        struct llama_context * ctx,
+                     int32_t block_size);
+
+LLAMA_API bool llama_vegas_set_ffn_proxy(
+        struct llama_context * ctx,
+                       float input_sparsity,
+                     int32_t block_size,
+                        bool use_values);
+
 LLAMA_API void llama_vegas_set_mode(
         struct llama_context * ctx,
                      int32_t mode,

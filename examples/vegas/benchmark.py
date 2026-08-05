@@ -43,7 +43,11 @@ def parse_args():
     parser.add_argument("--mtp-gamma", type=int)
     parser.add_argument("--mtp-ubatch", type=int, default=128)
     parser.add_argument("--ratio", type=float, default=0.07)
+    parser.add_argument("--ffn-oracle-sparsity", type=float, default=0.0)
+    parser.add_argument("--target-ffn-oracle-sparsity", type=float, default=0.0)
+    parser.add_argument("--ffn-oracle-block-size", type=int, default=1)
     parser.add_argument("--selection-layer", type=int)
+    parser.add_argument("--anchor-tokens", type=int, default=0)
     parser.add_argument("--refresh-interval", type=int, default=1)
     parser.add_argument("--min-tokens", type=int, default=256)
     parser.add_argument("--batch", type=int, default=1024)
@@ -85,6 +89,8 @@ def command_for(args, mode):
         "--ignore-eos",
         "--vegas-quiet",
         "--vegas-mode", mode,
+        "--vegas-target-ffn-oracle-sparsity", str(args.target_ffn_oracle_sparsity),
+        "--vegas-ffn-oracle-block-size", str(args.ffn_oracle_block_size),
     ]
     if args.draft_model and mode in {"mtp", "mtp-vegas", "mtp-auto"}:
         command.extend(["-md", args.draft_model])
@@ -94,6 +100,7 @@ def command_for(args, mode):
             "--vegas-mtp-ubatch", str(args.mtp_ubatch),
             "--cache-type-k-draft", draft_cache_type_k,
             "--cache-type-v-draft", draft_cache_type_v,
+            "--vegas-ffn-oracle-sparsity", str(args.ffn_oracle_sparsity),
         ])
     if mode != "baseline":
         command.extend(["--vegas-gamma", str(gamma)])
@@ -101,6 +108,7 @@ def command_for(args, mode):
         command.extend([
             "--vegas-ratio", str(args.ratio),
             "--vegas-min-tokens", str(args.min_tokens),
+            "--vegas-anchor-tokens", str(args.anchor_tokens),
         ])
     if mode == "mtp-vegas" and args.selection_layer is not None:
         command.extend(["--vegas-selection-layer", str(args.selection_layer)])
@@ -155,8 +163,12 @@ def run_one(args, mode, repetition, order):
             args.gamma
         ),
         "requested_ratio": args.ratio,
+        "requested_ffn_oracle_sparsity": args.ffn_oracle_sparsity,
+        "requested_target_ffn_oracle_sparsity": args.target_ffn_oracle_sparsity,
+        "requested_ffn_oracle_block_size": args.ffn_oracle_block_size,
         "requested_min_tokens": args.min_tokens,
         "requested_selection_layer": args.selection_layer,
+        "requested_anchor_tokens": args.anchor_tokens,
         "requested_refresh_interval": args.refresh_interval,
         "requested_draft_cache_type_k": args.draft_cache_type_k or args.cache_type_k,
         "requested_draft_cache_type_v": args.draft_cache_type_v or args.cache_type_v,

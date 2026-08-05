@@ -2443,11 +2443,21 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
 
-    GGML_API void ggml_flash_attn_ext_set_vegas(
+    GGML_API void ggml_flash_attn_ext_set_sparse_kv(
             struct ggml_tensor * a,
             struct ggml_tensor * indices,
-            int32_t              top_k,
-            int32_t              sparse_len);
+            int32_t              n_indices,
+            int32_t              suffix_start,
+            int32_t              n_kv);
+
+    GGML_API void ggml_flash_attn_ext_set_sparse_kv_n_kv(
+            struct ggml_tensor * a,
+            int32_t              n_kv);
+
+    GGML_API void ggml_flash_attn_ext_set_score(
+            struct ggml_tensor * a,
+            struct ggml_tensor * score,
+            struct ggml_tensor * score_prefix);
 
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(

@@ -151,23 +151,40 @@ bool llm_graph_input_pos::can_reuse(const llm_graph_params & params) {
     return res;
 }
 
-void llm_graph_input_vegas_indices::set_input(const llama_ubatch * ubatch) {
-    GGML_ASSERT(il >= 0 && (size_t) il < vegas.indices.size());
-    GGML_ASSERT(indices->type == GGML_TYPE_I32);
+void llm_graph_input_sparse_kv_plan::set_input(const llama_ubatch * ubatch) {
+    GGML_ASSERT(plan->type == GGML_TYPE_I32);
+    GGML_ASSERT(attention->op == GGML_OP_FLASH_ATTN_EXT);
     GGML_ASSERT(ubatch->pos != nullptr && ubatch->n_tokens == 1);
-    GGML_ASSERT((size_t) ggml_nelements(indices) == vegas.indices[il].size() + 2);
+    GGML_ASSERT(ggml_nelements(plan) == vegas.top_k);
 
-    std::vector<int32_t> data(vegas.indices[il]);
-    data.push_back(vegas.prefix_len);
-    data.push_back(vegas.top_k + std::min(n_kv, ubatch->pos[0] + 1) - vegas.prefix_len);
-
-    GGML_ASSERT(data.back() <= vegas.top_k + vegas.max_recent_tokens);
-    ggml_backend_tensor_set(indices, data.data(), 0, data.size() * sizeof(data[0]));
+    const int32_t active_n_kv = vegas.top_k + std::min(n_kv, ubatch->pos[0] + 1) - vegas.prefix_len;
+    GGML_ASSERT(active_n_kv <= vegas.top_k + vegas.max_recent_tokens);
+    ggml_flash_attn_ext_set_sparse_kv_n_kv(attention, active_n_kv);
 }
 
-bool llm_graph_input_vegas_indices::can_reuse(const llm_graph_params & params) {
+bool llm_graph_input_sparse_kv_plan::can_reuse(const llm_graph_params & params) {
     return params.vegas_mode == llama_vegas_mode::draft &&
-        params.vegas_top_k + 2 == indices->ne[0];
+        params.vegas_top_k == plan->ne[0] &&
+        params.vegas_plan == plan_owner &&
+        params.vegas_shared_plan_layer == vegas.shared_plan_layer;
+}
+
+void llm_graph_input_vegas_score::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+    GGML_ASSERT(mask->type == GGML_TYPE_F32);
+    GGML_ASSERT(attention->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(vegas.mode == llama_vegas_mode::verify);
+    GGML_ASSERT(vegas.prefix_len > 0 && vegas.prefix_len <= score_len);
+
+    std::vector<float> data(score_len, -INFINITY);
+    std::fill(data.begin(), data.begin() + vegas.prefix_len, 0.0f);
+    ggml_backend_tensor_set(mask, data.data(), 0, data.size() * sizeof(data[0]));
+    ggml_backend_tensor_set(prefix, &vegas.prefix_len, 0, sizeof(vegas.prefix_len));
+}
+
+bool llm_graph_input_vegas_score::can_reuse(const llm_graph_params & params) {
+    return params.vegas_mode == llama_vegas_mode::verify &&
+        params.vegas_prefix_len > 0 && params.vegas_prefix_len <= score_len;
 }
 
 void llm_graph_input_attn_temp::set_input(const llama_ubatch * ubatch) {
@@ -1217,7 +1234,7 @@ void llm_graph_result::reset() {
     t_layer_inp.resize(LLAMA_MAX_LAYERS);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
 
-    t_vegas_indices.clear();
+    t_vegas_plan_writes.clear();
 
     t_sampled.clear();
     t_sampled_probs.clear();
@@ -1290,7 +1307,7 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
             ggml_set_output(t);
         }
     }
-    for (auto * t : t_vegas_indices) {
+    for (auto * t : t_vegas_plan_writes) {
         if (t != nullptr) {
             ggml_set_output(t);
         }
@@ -1338,14 +1355,14 @@ void llm_graph_result::add_fused_node(llm_graph_fused_node result) {
     fused_nodes.push_back(result);
 }
 
-void llm_graph_result::set_vegas_indices(int32_t il, ggml_tensor * indices) {
+void llm_graph_result::set_vegas_plan_write(int32_t il, ggml_tensor * write) {
     GGML_ASSERT(il >= 0);
 
-    if ((size_t) il >= t_vegas_indices.size()) {
-        t_vegas_indices.resize(il + 1, nullptr);
+    if ((size_t) il >= t_vegas_plan_writes.size()) {
+        t_vegas_plan_writes.resize(il + 1, nullptr);
     }
 
-    t_vegas_indices[il] = indices;
+    t_vegas_plan_writes[il] = write;
 }
 
 void llm_graph_result::set_params(const llm_graph_params & params) {
@@ -1394,6 +1411,11 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     mctx             (params.mctx),
     cross            (params.cross),
     vegas            (params.vegas),
+    vegas_ffn_oracle_sparsity(params.vegas_ffn_oracle_sparsity),
+    vegas_ffn_oracle_block_size(params.vegas_ffn_oracle_block_size),
+    vegas_ffn_proxy_input_sparsity(params.vegas_ffn_proxy_input_sparsity),
+    vegas_ffn_proxy_block_size(params.vegas_ffn_proxy_block_size),
+    vegas_ffn_proxy_use_values(params.vegas_ffn_proxy_use_values),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -1613,6 +1635,9 @@ ggml_tensor * llm_graph_context::build_ffn(
      llm_ffn_op_type   type_op,
    llm_ffn_gate_type   type_gate,
                  int   il) const {
+    ggml_tensor * ffn_inp = cur;
+    const llm_ffn_gate_type ffn_gate_type = type_gate;
+
     // NVFP4 support is currently restricted to
     // 1) LORA absence (*_s would be applied after LORA residual, which is incorrect)
     // 2) bias absense (*_s would be applied after bias addition, which is incorrect)
@@ -1763,6 +1788,73 @@ ggml_tensor * llm_graph_context::build_ffn(
     if (gate && type_gate == LLM_FFN_PAR) {
         cur = ggml_mul(ctx0, cur, tmp);
         cb(cur, "ffn_gate_par", il);
+    }
+
+    if (down && vegas_ffn_oracle_sparsity > 0.0f) {
+        auto select = [&](ggml_tensor * signal, float sparsity, int32_t block_size) {
+            const int64_t n_channels = signal->ne[0];
+            GGML_ASSERT(block_size > 0 && n_channels % block_size == 0);
+            const int64_t n_blocks = n_channels / block_size;
+            const int64_t n_keep = std::max<int64_t>(1,
+                    (int64_t) std::ceil(n_blocks * (1.0f - sparsity)));
+            ggml_tensor * signal_3d = ggml_reshape_3d(
+                    ctx0, signal, block_size, n_blocks, ggml_nrows(signal));
+            ggml_tensor * scores = ggml_reshape_2d(
+                    ctx0, ggml_sum_rows(ctx0, ggml_sqr(ctx0, signal_3d)), n_blocks, ggml_nrows(signal));
+            return ggml_top_k(ctx0, scores, n_keep);
+        };
+        auto retain = [&](ggml_tensor * values, ggml_tensor * indices, int32_t block_size) {
+            const int64_t n_blocks = values->ne[0] / block_size;
+            ggml_tensor * values_3d = ggml_reshape_3d(
+                    ctx0, values, block_size, n_blocks, ggml_nrows(values));
+            ggml_tensor * selected = ggml_get_rows(ctx0, values_3d, indices);
+            ggml_tensor * sparse_3d = ggml_set_rows(
+                    ctx0, ggml_fill(ctx0, values_3d, 0.0f), selected, indices);
+            return ggml_reshape(ctx0, sparse_3d, values);
+        };
+
+        ggml_tensor * selection_signal = cur;
+        if (vegas_ffn_proxy_input_sparsity > 0.0f) {
+            GGML_ASSERT(up && gate && ffn_gate_type == LLM_FFN_PAR);
+            ggml_tensor * inp_indices = select(
+                    ffn_inp, vegas_ffn_proxy_input_sparsity, vegas_ffn_proxy_block_size);
+            ggml_tensor * proxy_inp = retain(ffn_inp, inp_indices, vegas_ffn_proxy_block_size);
+            ggml_tensor * proxy_up = build_lora_mm(up, proxy_inp);
+            ggml_tensor * proxy_gate = build_lora_mm(gate, proxy_inp);
+            if (up_b) {
+                proxy_up = ggml_add(ctx0, proxy_up, up_b);
+            }
+            if (up_s) {
+                proxy_up = ggml_mul(ctx0, proxy_up, up_s);
+            }
+            if (gate_b) {
+                proxy_gate = ggml_add(ctx0, proxy_gate, gate_b);
+            }
+            if (gate_s) {
+                proxy_gate = ggml_mul(ctx0, proxy_gate, gate_s);
+            }
+            switch (type_op) {
+                case LLM_FFN_SILU:
+                    selection_signal = ggml_swiglu_split(ctx0, proxy_gate, proxy_up);
+                    break;
+                case LLM_FFN_GELU:
+                    selection_signal = ggml_geglu_split(ctx0, proxy_gate, proxy_up);
+                    break;
+                case LLM_FFN_RELU:
+                    selection_signal = ggml_reglu_split(ctx0, proxy_gate, proxy_up);
+                    break;
+                default:
+                    GGML_ABORT("unsupported FFN proxy activation");
+            }
+        }
+
+        ggml_tensor * indices = select(
+                selection_signal, vegas_ffn_oracle_sparsity, vegas_ffn_oracle_block_size);
+        cur = retain(
+                vegas_ffn_proxy_use_values ? selection_signal : cur,
+                indices,
+                vegas_ffn_oracle_block_size);
+        cb(cur, "ffn_oracle_sparse", il);
     }
 
     if (down) {
@@ -2445,6 +2537,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             !hparams.is_swa(il);
 
     ggml_tensor * vegas_indices = nullptr;
+    ggml_tensor * vegas_score = nullptr;
+    llm_graph_input_sparse_kv_plan * vegas_input = nullptr;
+    llm_graph_input_vegas_score * vegas_score_input = nullptr;
     int32_t vegas_sparse_len = 0;
 
     if (use_vegas && vegas->mode == llama_vegas_mode::verify &&
@@ -2452,54 +2547,16 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         GGML_ASSERT(k->ne[3] == 1 && q->ne[3] == 1);
         GGML_ASSERT(vegas->prefix_len > 0 && vegas->prefix_len <= k->ne[1]);
         GGML_ASSERT(vegas->top_k > 0 && vegas->top_k <= vegas->prefix_len);
+        auto inp = std::make_unique<llm_graph_input_vegas_score>(*vegas, k->ne[1]);
+        inp->mask = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, k->ne[1]);
+        inp->prefix = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
+        ggml_set_input(inp->mask);
+        ggml_set_input(inp->prefix);
+        vegas_score_input = inp.get();
+        res->add_input(std::move(inp));
 
-        ggml_tensor * k_prefix = ggml_view_4d(
-                ctx0, k, k->ne[0], vegas->prefix_len, k->ne[2], 1,
-                k->nb[1], k->nb[2], k->nb[3], 0);
-
-        ggml_tensor * q_score = ggml_view_4d(
-                ctx0, q, q->ne[0], 1, q->ne[2], 1,
-                q->nb[1], q->nb[2], q->nb[3], 0);
-        if (q->ne[1] > 1) {
-            ggml_tensor * q_last = ggml_view_4d(
-                    ctx0, q, q->ne[0], 1, q->ne[2], 1,
-                    q->nb[1], q->nb[2], q->nb[3], (q->ne[1] - 1) * q->nb[1]);
-            q_score = ggml_concat(ctx0, q_score, q_last, 1);
-        }
-
-        GGML_ASSERT(q_score->ne[2] % k_prefix->ne[2] == 0);
-        const int64_t gqa_ratio = q_score->ne[2] / k_prefix->ne[2];
-        if (gqa_ratio > 1 && !hparams.attn_soft_cap) {
-            q_score = ggml_reshape_4d(
-                    ctx0, q_score, q_score->ne[0], q_score->ne[1], gqa_ratio, k_prefix->ne[2]);
-            q_score = ggml_cont(ctx0, ggml_permute(ctx0, q_score, 1, 2, 0, 3));
-            q_score = ggml_sum_rows(ctx0, q_score);
-            q_score = ggml_reshape_4d(
-                    ctx0, q_score, q->ne[0], q_score->ne[2], k_prefix->ne[2], 1);
-        }
-
-        ggml_tensor * score = ggml_mul_mat(ctx0, k_prefix, q_score);
-        ggml_mul_mat_set_prec(score, GGML_PREC_F32);
-
-        if (hparams.attn_soft_cap) {
-            score = ggml_scale(ctx0, score, kq_scale / hparams.f_attn_logit_softcapping);
-            score = ggml_tanh(ctx0, score);
-            score = ggml_scale(ctx0, score, hparams.f_attn_logit_softcapping);
-        } else if (kq_scale != 1.0f) {
-            score = ggml_scale(ctx0, score, kq_scale);
-        }
-
-        score = ggml_cont(ctx0, ggml_permute(ctx0, score, 2, 1, 0, 3));
-        score = ggml_reshape_2d(ctx0, score, score->ne[0] * score->ne[1], vegas->prefix_len);
-        score = ggml_sum_rows(ctx0, score);
-        score = ggml_reshape_1d(ctx0, score, vegas->prefix_len);
-        score = ggml_cont(ctx0, score);
-        cb(score, "vegas_score", il);
-
-        vegas_indices = ggml_top_k(ctx0, score, vegas->top_k);
-        cb(vegas_indices, "vegas_indices", il);
-        res->set_vegas_indices(il, vegas_indices);
-        ggml_build_forward_expand(gf, vegas_indices);
+        vegas_score = ggml_fill(
+                ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, k->ne[2], k->ne[1]), 0.0f);
     } else if (use_vegas && vegas->mode == llama_vegas_mode::draft &&
             q->ne[1] == 1 && q->ne[3] == 1 && k->ne[3] == 1 &&
             ubatch.pos != nullptr && ubatch.n_tokens > 0 &&
@@ -2507,20 +2564,24 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         GGML_ASSERT(cparams.flash_attn);
         GGML_ASSERT(vegas->prefix_len > 0 && vegas->prefix_len <= k->ne[1]);
         GGML_ASSERT(vegas->top_k > 0 && vegas->top_k <= vegas->prefix_len);
-        GGML_ASSERT((size_t) il < vegas->indices.size());
-        GGML_ASSERT((int32_t) vegas->indices[il].size() == vegas->top_k);
+        GGML_ASSERT(vegas->plan != nullptr && vegas->top_k <= vegas->plan_capacity);
 
         const int32_t current_end = std::min<int32_t>(k->ne[1], ubatch.pos[ubatch.n_tokens - 1] + 1);
         GGML_ASSERT(current_end >= vegas->prefix_len && current_end <= k->ne[1]);
 
-        auto inp = std::make_unique<llm_graph_input_vegas_indices>(*vegas, il, k->ne[1]);
-        inp->indices = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, vegas->top_k + 2);
-        ggml_set_input(inp->indices);
-        vegas_indices = inp->indices;
+        const int32_t plan_layer = vegas->shared_plan_layer >= 0 ? vegas->shared_plan_layer : il;
+        GGML_ASSERT(plan_layer >= 0 && (size_t) plan_layer < vegas->plan_valid.size());
+        GGML_ASSERT(vegas->plan_valid[plan_layer]);
+
+        auto inp = std::make_unique<llm_graph_input_sparse_kv_plan>(*vegas, k->ne[1]);
+        inp->plan = ggml_view_1d(
+                ctx0, vegas->plan, vegas->top_k, plan_layer * vegas->plan->nb[1]);
+        vegas_indices = inp->plan;
+        vegas_input = inp.get();
         res->add_input(std::move(inp));
 
         GGML_ASSERT(current_end - vegas->prefix_len <= vegas->max_recent_tokens);
-        vegas_sparse_len = std::min<int32_t>(k->ne[1], vegas->top_k + vegas->max_recent_tokens);
+        vegas_sparse_len = vegas->top_k + current_end - vegas->prefix_len;
     }
 
     // TurboQuant note: graph-side Q rotation (pre-rotate-queries) is implemented below
@@ -2551,12 +2612,46 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         if (vegas_indices != nullptr && vegas->mode == llama_vegas_mode::draft) {
             GGML_ASSERT(sinks == nullptr);
             GGML_ASSERT(hparams.f_max_alibi_bias == 0.0f);
-            ggml_flash_attn_ext_set_vegas(cur, vegas_indices, vegas->top_k, vegas_sparse_len);
+            ggml_flash_attn_ext_set_sparse_kv(
+                    cur, vegas_indices, vegas->top_k, vegas->prefix_len, vegas_sparse_len);
+            vegas_input->attention = cur;
+        }
+        if (vegas_score != nullptr) {
+            GGML_ASSERT(sinks == nullptr);
+            GGML_ASSERT(hparams.f_max_alibi_bias == 0.0f);
+            ggml_flash_attn_ext_set_score(cur, vegas_score, vegas_score_input->prefix);
+            vegas_score_input->attention = cur;
         }
         res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);
         ggml_flash_attn_ext_set_prec (cur, GGML_PREC_F32);
+
+        if (vegas_score != nullptr) {
+            ggml_build_forward_expand(gf, cur);
+
+            vegas_score = ggml_reshape_1d(ctx0, ggml_sum_rows(ctx0, vegas_score), vegas_score->ne[1]);
+            vegas_score = ggml_add(ctx0, vegas_score, vegas_score_input->mask);
+
+            const int32_t n_anchors = std::min(vegas->anchor_tokens, std::min(vegas->top_k, vegas->prefix_len));
+            if (n_anchors > 0) {
+                ggml_tensor * anchors = ggml_fill(
+                        ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_anchors), INFINITY);
+                vegas_score = ggml_set_1d(ctx0, vegas_score, anchors, 0);
+            }
+            cb(vegas_score, "vegas_score", il);
+
+            vegas_indices = ggml_top_k(ctx0, vegas_score, vegas->top_k);
+            cb(vegas_indices, "vegas_indices", il);
+
+            GGML_ASSERT(vegas->plan != nullptr && vegas->top_k <= vegas->plan_capacity);
+            ggml_tensor * plan_indices = ggml_view_1d(
+                    ctx0, vegas->plan, vegas->top_k, il * vegas->plan->nb[1]);
+            ggml_tensor * plan_write = ggml_cpy(ctx0, vegas_indices, plan_indices);
+            cb(plan_write, "vegas_plan_write", il);
+            res->set_vegas_plan_write(il, plan_write);
+            ggml_build_forward_expand(gf, plan_write);
+        }
 
         // TurboQuant: inverse WHT on FA output when V values are WHT-rotated.
         // For MLA, V is a view of K with different ne[0] (e.g. V=512, K=576).

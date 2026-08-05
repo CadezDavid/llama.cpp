@@ -122,6 +122,10 @@ struct llama_context {
 
     bool vegas_enable(float sparse_ratio, int32_t min_tokens, int32_t max_tokens, int32_t max_draft_tokens);
     bool vegas_set_selection_layer(int32_t il);
+    bool vegas_set_anchor_tokens(int32_t n_tokens);
+    bool vegas_set_ffn_oracle_sparsity(float sparsity);
+    bool vegas_set_ffn_oracle_block_size(int32_t block_size);
+    bool vegas_set_ffn_proxy(float input_sparsity, int32_t block_size, bool use_values);
     void vegas_set_mode(llama_vegas_mode mode, int32_t prefix_len);
     void vegas_pause();
     bool vegas_resume_draft();
@@ -298,6 +302,10 @@ private:
     llama_memory_ptr memory;
 
     llama_vegas_state vegas;
+    ggml_context_ptr vegas_plan_ctx;
+    ggml_backend_buffer_ptr vegas_plan_buf;
+    ggml_backend_event_ptr vegas_plan_event;
+    ggml_backend_t vegas_plan_backend = nullptr;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};

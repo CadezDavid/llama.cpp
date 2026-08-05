@@ -25,6 +25,7 @@ static __global__ void flash_attn_ext_vec(
         const char * V_ptr,
         const char * mask_ptr,
         const char * sinks_ptr,
+        float      * score_ptr,
         const int  * KV_max_ptr,
         float      * dst_ptr,
         float2     * dst_meta_ptr,
@@ -34,6 +35,7 @@ static __global__ void flash_attn_ext_vec(
         const float m1,
         const uint32_t n_head_log2,
         const float logit_softcap,
+        const int32_t * score_prefix_ptr,
         const int32_t ne00, const uint3   ne01, const int32_t ne02, const int32_t ne03,
                             const int32_t nb01, const int32_t nb02, const int32_t nb03,
         const int32_t ne10, const int32_t ne11, const int32_t ne12, const int32_t ne13,
@@ -48,9 +50,11 @@ static __global__ void flash_attn_ext_vec(
     const char * GGML_CUDA_RESTRICT V        = V_ptr;
     const char * GGML_CUDA_RESTRICT mask     = mask_ptr;
     const char * GGML_CUDA_RESTRICT sinks    = sinks_ptr;
+    float      * GGML_CUDA_RESTRICT score    = score_ptr;
     const int  * GGML_CUDA_RESTRICT KV_max   = KV_max_ptr;
     float      * GGML_CUDA_RESTRICT dst      = dst_ptr;
     float2     * GGML_CUDA_RESTRICT dst_meta = dst_meta_ptr;
+    const int32_t score_prefix = score_prefix_ptr ? *score_prefix_ptr : 0;
 
     // Skip unused kernel variants for faster compilation:
     if (use_logit_softcap && !(D == 128 || D == 256)) {
@@ -121,15 +125,15 @@ static __global__ void flash_attn_ext_vec(
     const int sequence = blockIdx.z / ne02;
     const int head = blockIdx.z - sequence*ne02;
     const int gqa_ratio = ne02 / ne12; // With grouped query attention there are > 1 Q matrices per K, V matrix.
-    const bool vegas_sparse = ne33 == -1;
-    const int * vegas_indices = vegas_sparse ? (const int *) mask : nullptr;
-    const int vegas_recent_start = vegas_sparse ? vegas_indices[ne31] : 0;
-    const int vegas_n_kv = vegas_sparse ? vegas_indices[ne31 + 1] : ne11;
+    const bool use_sparse_kv = ne33 == -1;
+    const int * sparse_indices = use_sparse_kv ? (const int *) mask : nullptr;
+    const int sparse_recent_start = use_sparse_kv ? ne32 : 0;
+    const int sparse_n_kv = ne11;
     Q += nb03*sequence + nb02* head              + nb01*ic0;
     K += nb13*sequence + nb12*(head / gqa_ratio);
     V += nb23*sequence + nb22*(head / gqa_ratio);
 
-    const half * maskh = vegas_sparse || !mask ? nullptr :
+    const half * maskh = use_sparse_kv || !mask ? nullptr :
         (const half *) (mask + nb33*(sequence % ne33) + nb31*ic0);
 
     const float slope = get_alibi_slope(max_bias, head, n_head_log2, m0, m1);
@@ -299,7 +303,7 @@ static __global__ void flash_attn_ext_vec(
     }
 
     const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
-    if (!vegas_sparse) {
+    if (!use_sparse_kv) {
         K += blockIdx.y*nthreads * nb11;
         V += blockIdx.y*nthreads * nb21;
         if (maskh) {
@@ -308,9 +312,9 @@ static __global__ void flash_attn_ext_vec(
     }
     for (int k_VKQ_0 = blockIdx.y*nthreads; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nthreads,
              // Increment pointers after each loop:
-             K += vegas_sparse ? 0 : gridDim.y*nthreads*nb11,
-             V += vegas_sparse ? 0 : gridDim.y*nthreads*nb21,
-             maskh = vegas_sparse || !maskh ? maskh : maskh + gridDim.y*nthreads) {
+             K += use_sparse_kv ? 0 : gridDim.y*nthreads*nb11,
+             V += use_sparse_kv ? 0 : gridDim.y*nthreads*nb21,
+             maskh = use_sparse_kv || !maskh ? maskh : maskh + gridDim.y*nthreads) {
 
         // Calculate KQ tile and keep track of new maximum KQ values:
         float KQ_reg[ncols]; // KQ in registers.
@@ -329,9 +333,9 @@ static __global__ void flash_attn_ext_vec(
             for (int j = 0; j < ncols; ++j) {
                 float sum;
                 const int i_KQ_logical = k_VKQ_0 + i_KQ;
-                const bool i_KQ_valid = !vegas_sparse || i_KQ_logical < vegas_n_kv;
-                const int i_KQ_actual = !i_KQ_valid ? 0 : !vegas_sparse ? i_KQ :
-                    (i_KQ_logical < ne31 ? vegas_indices[i_KQ_logical] : vegas_recent_start + i_KQ_logical - ne31);
+                const bool i_KQ_valid = !use_sparse_kv || i_KQ_logical < sparse_n_kv;
+                const int i_KQ_actual = !i_KQ_valid ? 0 : !use_sparse_kv ? i_KQ :
+                    (i_KQ_logical < ne31 ? sparse_indices[i_KQ_logical] : sparse_recent_start + i_KQ_logical - ne31);
                 const char * K_row = K + i_KQ_actual*nb11;
 
                 if (!i_KQ_valid) {
@@ -384,7 +388,14 @@ static __global__ void flash_attn_ext_vec(
                     sum = logit_softcap*tanhf(sum);
                 }
 
-                if (!vegas_sparse && mask && (ncols == 1 || ic0 + j < int(ne01.z))) {
+                const bool score_writer =
+                    (nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ) == uint32_t(i_KQ_0);
+                if (score && score_writer && i_KQ_logical < score_prefix &&
+                        (ic0 + j == 0 || ic0 + j == int(ne01.z) - 1)) {
+                    atomicAdd(score + i_KQ_logical*ne12 + head/gqa_ratio, sum);
+                }
+
+                if (!use_sparse_kv && mask && (ncols == 1 || ic0 + j < int(ne01.z))) {
                     sum += slope*__half2float(maskh[j*ne11 + i_KQ]);
                 }
 
@@ -432,9 +443,9 @@ static __global__ void flash_attn_ext_vec(
         for (int k0 = 0; k0 < WARP_SIZE; k0 += V_cols_per_iter) {
             const int k = threadIdx.y*WARP_SIZE + k0 + (nthreads_V == WARP_SIZE ? 0 : threadIdx.x / nthreads_V);
             const int k_logical = k_VKQ_0 + k;
-            const bool k_valid = !vegas_sparse || k_logical < vegas_n_kv;
-            const int k_actual = !k_valid ? 0 : !vegas_sparse ? k :
-                (k_logical < ne31 ? vegas_indices[k_logical] : vegas_recent_start + k_logical - ne31);
+            const bool k_valid = !use_sparse_kv || k_logical < sparse_n_kv;
+            const int k_actual = !k_valid ? 0 : !use_sparse_kv ? k :
+                (k_logical < ne31 ? sparse_indices[k_logical] : sparse_recent_start + k_logical - ne31);
             const char * V_row = V + k_actual*nb21;
 
 #ifdef V_DOT2_F32_F16_AVAILABLE
@@ -778,8 +789,9 @@ static __global__ void flash_attn_ext_vec(
         dst_meta[((sequence*int(ne01.z) + ic0 + tid)*ne02 + head)*gridDim.y + blockIdx.y] = make_float2(KQ_max[tid], KQ_sum[tid]);
     }
 #else
-    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, scale,
+    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, score_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, scale,
         max_bias, m0, m1, n_head_log2, logit_softcap,
+        score_prefix_ptr,
         ne00, ne01, ne02, ne03,
               nb01, nb02, nb03,
         ne10, ne11, ne12, ne13,

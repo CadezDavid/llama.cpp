@@ -5521,21 +5521,56 @@ void ggml_flash_attn_ext_add_sinks(
     a->src[4] = sinks;
 }
 
-void ggml_flash_attn_ext_set_vegas(
+void ggml_flash_attn_ext_set_sparse_kv(
         struct ggml_tensor * a,
         struct ggml_tensor * indices,
-        int32_t              top_k,
-        int32_t              sparse_len) {
+        int32_t              n_indices,
+        int32_t              suffix_start,
+        int32_t              n_kv) {
     GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
     GGML_ASSERT(a->src[5] == NULL);
     GGML_ASSERT(indices != NULL && indices->type == GGML_TYPE_I32);
     GGML_ASSERT(ggml_is_contiguous(indices));
-    GGML_ASSERT(indices->ne[0] == top_k + 2);
-    GGML_ASSERT(top_k > 0 && sparse_len >= top_k);
+    GGML_ASSERT(indices->ne[0] == n_indices);
+    GGML_ASSERT(n_indices > 0 && suffix_start >= 0 && n_kv >= n_indices);
+    GGML_ASSERT(suffix_start + n_kv - n_indices <= a->src[1]->ne[1]);
 
     a->src[5] = indices;
-    ggml_set_op_params_i32(a, 4, top_k);
-    ggml_set_op_params_i32(a, 5, sparse_len);
+    ggml_set_op_params_i32(a, 4, n_indices);
+    ggml_set_op_params_i32(a, 6, suffix_start);
+    ggml_flash_attn_ext_set_sparse_kv_n_kv(a, n_kv);
+}
+
+void ggml_flash_attn_ext_set_sparse_kv_n_kv(
+        struct ggml_tensor * a,
+        int32_t              n_kv) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(a->src[5] != NULL);
+
+    const int32_t n_indices = ggml_get_op_params_i32(a, 4);
+    const int32_t suffix_start = ggml_get_op_params_i32(a, 6);
+    GGML_ASSERT(n_kv >= n_indices);
+    GGML_ASSERT(suffix_start + n_kv - n_indices <= a->src[1]->ne[1]);
+
+    ggml_set_op_params_i32(a, 5, n_kv);
+}
+
+void ggml_flash_attn_ext_set_score(
+        struct ggml_tensor * a,
+        struct ggml_tensor * score,
+        struct ggml_tensor * score_prefix) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(a->src[6] == NULL);
+    GGML_ASSERT(a->src[7] == NULL);
+    GGML_ASSERT(score != NULL && score->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(score));
+    GGML_ASSERT(score->ne[0] == a->src[1]->ne[2]);
+    GGML_ASSERT(score->ne[1] <= a->src[1]->ne[1]);
+    GGML_ASSERT(score_prefix != NULL && score_prefix->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_nelements(score_prefix) == 1);
+
+    a->src[6] = score;
+    a->src[7] = score_prefix;
 }
 
 // ggml_flash_attn_back

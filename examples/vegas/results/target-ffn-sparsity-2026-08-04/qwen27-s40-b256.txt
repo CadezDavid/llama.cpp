@@ -1,0 +1,1 @@
+FFN_SPARSE_EVAL {"sparsity":0.400000,"block_size":256,"proxy_input_sparsity":0.000000,"proxy_block_size":1,"prefix_tokens":1024,"eval_tokens":128,"dense_ppl":1.92458018,"sparse_ppl":2.51004950,"ppl_ratio":1.30420625,"mean_kl":0.2868604918,"max_kl":5.0056299218,"mean_l1":0.2985830609,"top1_agreement":0.83593750,"dense_teacher_top1":0.85156250,"sparse_teacher_top1":0.76562500}

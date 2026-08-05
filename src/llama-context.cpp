@@ -1246,6 +1246,63 @@ bool llama_context::vegas_enable(
         return false;
     }
 
+    const int32_t plan_capacity = [&]() {
+        const int32_t ratio_tokens = (int32_t) std::ceil(cparams.n_ctx * sparse_ratio);
+        int32_t capacity = std::min<int32_t>(cparams.n_ctx, std::max(min_tokens, ratio_tokens));
+        if (max_tokens > 0) {
+            capacity = std::min(capacity, max_tokens);
+        }
+        return capacity;
+    }();
+
+    vegas_plan_backend = nullptr;
+    for (auto * backend : backend_ptrs) {
+        if (ggml_backend_get_device(backend) == dev) {
+            vegas_plan_backend = backend;
+            break;
+        }
+    }
+    if (vegas_plan_backend == nullptr) {
+        LLAMA_LOG_ERROR("%s: failed to find the Vegas CUDA backend\n", __func__);
+        return false;
+    }
+
+    vegas_plan_event.reset();
+    vegas_plan_buf.reset();
+    vegas_plan_ctx.reset();
+
+    ggml_init_params plan_params = {
+        /*.mem_size   =*/ ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    vegas_plan_ctx.reset(ggml_init(plan_params));
+    if (!vegas_plan_ctx) {
+        LLAMA_LOG_ERROR("%s: failed to create the Vegas plan context\n", __func__);
+        return false;
+    }
+
+    ggml_tensor * plan = ggml_new_tensor_2d(
+            vegas_plan_ctx.get(), GGML_TYPE_I32, plan_capacity, model.hparams.n_layer_all);
+    ggml_set_name(plan, "vegas_sparse_kv_plan");
+
+    vegas_plan_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(
+            vegas_plan_ctx.get(), ggml_backend_get_default_buffer_type(vegas_plan_backend)));
+    if (!vegas_plan_buf) {
+        LLAMA_LOG_ERROR("%s: failed to allocate the Vegas plan buffer\n", __func__);
+        vegas_plan_ctx.reset();
+        return false;
+    }
+    ggml_backend_buffer_clear(vegas_plan_buf.get(), 0);
+
+    vegas_plan_event.reset(ggml_backend_event_new(dev));
+    if (!vegas_plan_event) {
+        LLAMA_LOG_ERROR("%s: failed to allocate the Vegas CUDA event\n", __func__);
+        vegas_plan_buf.reset();
+        vegas_plan_ctx.reset();
+        return false;
+    }
+
     vegas.mode         = llama_vegas_mode::disabled;
     vegas.sparse_ratio = sparse_ratio;
     vegas.min_tokens   = min_tokens;
@@ -1254,8 +1311,13 @@ bool llama_context::vegas_enable(
     vegas.top_k        = 0;
     vegas.max_recent_tokens = 2 * max_draft_tokens;
     vegas.selection_layer = -1;
-    vegas.indices.clear();
-    vegas.indices.resize(model.hparams.n_layer_all);
+    vegas.anchor_tokens = 0;
+    vegas.plan = plan;
+    vegas.plan_capacity = plan_capacity;
+    vegas.shared_plan_layer = -1;
+    vegas.ready_event = vegas_plan_event.get();
+    vegas.wait_for_plan = false;
+    vegas.plan_valid.assign(model.hparams.n_layer_all, 0);
 
     sched_need_reserve = true;
 
@@ -1277,6 +1339,53 @@ bool llama_context::vegas_set_selection_layer(int32_t il) {
     return true;
 }
 
+bool llama_context::vegas_set_anchor_tokens(int32_t n_tokens) {
+    if (n_tokens < 0) {
+        return false;
+    }
+
+    vegas.anchor_tokens = n_tokens;
+    sched_need_reserve = true;
+
+    return true;
+}
+
+bool llama_context::vegas_set_ffn_oracle_sparsity(float sparsity) {
+    if (!std::isfinite(sparsity) || sparsity < 0.0f || sparsity >= 1.0f) {
+        return false;
+    }
+
+    vegas.ffn_oracle_sparsity = sparsity;
+    sched_need_reserve = true;
+
+    return true;
+}
+
+bool llama_context::vegas_set_ffn_oracle_block_size(int32_t block_size) {
+    if (block_size < 1) {
+        return false;
+    }
+
+    vegas.ffn_oracle_block_size = block_size;
+    sched_need_reserve = true;
+
+    return true;
+}
+
+bool llama_context::vegas_set_ffn_proxy(float input_sparsity, int32_t block_size, bool use_values) {
+    if (!std::isfinite(input_sparsity) || input_sparsity < 0.0f || input_sparsity >= 1.0f ||
+            block_size < 1) {
+        return false;
+    }
+
+    vegas.ffn_proxy_input_sparsity = input_sparsity;
+    vegas.ffn_proxy_block_size = block_size;
+    vegas.ffn_proxy_use_values = use_values;
+    sched_need_reserve = true;
+
+    return true;
+}
+
 void llama_context::vegas_set_mode(llama_vegas_mode mode, int32_t prefix_len) {
     GGML_ASSERT(prefix_len >= 0);
 
@@ -1290,20 +1399,26 @@ void llama_context::vegas_set_mode(llama_vegas_mode mode, int32_t prefix_len) {
         if (vegas.max_tokens > 0) {
             vegas.top_k = std::min(vegas.top_k, vegas.max_tokens);
         }
+        GGML_ASSERT(vegas.top_k <= vegas.plan_capacity);
     }
 }
 
 bool llama_context::vegas_resume_draft() {
-    if (vegas.prefix_len <= 0 || vegas.top_k <= 0) {
+    if (vegas.prefix_len <= 0 || vegas.top_k <= 0 || vegas.plan == nullptr) {
         return false;
     }
 
-    const bool valid = std::all_of(vegas.indices.begin(), vegas.indices.end(),
-            [this](const std::vector<int32_t> & indices) {
-                return (int32_t) indices.size() == vegas.top_k;
-            });
-    if (!valid) {
-        return false;
+    if (vegas.shared_plan_layer >= 0) {
+        if ((size_t) vegas.shared_plan_layer >= vegas.plan_valid.size() ||
+                !vegas.plan_valid[vegas.shared_plan_layer]) {
+            return false;
+        }
+    } else {
+        for (uint32_t il = 0; il < model.hparams.n_layer_all; ++il) {
+            if (!model.hparams.is_recr(il) && !model.hparams.is_swa(il) && !vegas.plan_valid[il]) {
+                return false;
+            }
+        }
     }
 
     vegas.mode = llama_vegas_mode::draft;
@@ -1319,9 +1434,7 @@ bool llama_context::vegas_collect_indices() {
         return false;
     }
 
-    synchronize();
-
-    const auto & outputs = gf_res_prev->get_vegas_indices();
+    const auto & outputs = gf_res_prev->get_vegas_plan_writes();
     if (outputs.empty()) {
         return false;
     }
@@ -1333,38 +1446,54 @@ bool llama_context::vegas_collect_indices() {
             continue;
         }
 
-        if (tensor->type != GGML_TYPE_I32 || ggml_nelements(tensor) != vegas.top_k) {
+        if (tensor->type != GGML_TYPE_I32 || ggml_nelements(tensor) != vegas.top_k || tensor->data == nullptr) {
             LLAMA_LOG_ERROR("%s: invalid Vegas indices at layer %zu\n", __func__, il);
             return false;
         }
 
-        auto & indices = vegas.indices[il];
-        indices.resize(vegas.top_k);
-        ggml_backend_tensor_get(tensor, indices.data(), 0, ggml_nbytes(tensor));
-        std::sort(indices.begin(), indices.end());
+        vegas.plan_valid[il] = 1;
         found = true;
+    }
+
+    if (found) {
+        GGML_ASSERT(vegas.ready_event != nullptr && vegas_plan_backend != nullptr);
+        ggml_backend_event_record(vegas.ready_event, vegas_plan_backend);
+        vegas.wait_for_plan = true;
     }
 
     return found;
 }
 
 bool llama_context::vegas_copy_indices(const llama_context & src) {
-    if (src.vegas.mode != llama_vegas_mode::verify || src.vegas.top_k <= 0) {
+    if (src.vegas.mode != llama_vegas_mode::verify || src.vegas.top_k <= 0 ||
+            src.vegas.plan == nullptr || src.vegas.ready_event == nullptr) {
         return false;
     }
 
-    auto it = std::find_if(src.vegas.indices.rbegin(), src.vegas.indices.rend(),
-            [](const std::vector<int32_t> & indices) { return !indices.empty(); });
-    if (it == src.vegas.indices.rend() || (int32_t) it->size() != src.vegas.top_k) {
+    int32_t source_layer = src.vegas.selection_layer;
+    if (source_layer < 0) {
+        for (int32_t il = (int32_t) src.vegas.plan_valid.size() - 1; il >= 0; --il) {
+            if (src.vegas.plan_valid[il]) {
+                source_layer = il;
+                break;
+            }
+        }
+    }
+    if (source_layer < 0 || (size_t) source_layer >= src.vegas.plan_valid.size() ||
+            !src.vegas.plan_valid[source_layer]) {
         return false;
     }
 
     vegas.mode       = llama_vegas_mode::draft;
     vegas.prefix_len = src.vegas.prefix_len;
     vegas.top_k      = src.vegas.top_k;
-    for (auto & indices : vegas.indices) {
-        indices = *it;
-    }
+    vegas.plan       = src.vegas.plan;
+    vegas.plan_capacity = src.vegas.plan_capacity;
+    vegas.shared_plan_layer = source_layer;
+    vegas.ready_event = src.vegas.ready_event;
+    vegas.wait_for_plan = true;
+    vegas.plan_valid.assign(src.vegas.plan_valid.size(), 0);
+    vegas.plan_valid[source_layer] = 1;
 
     return true;
 }
@@ -1543,6 +1672,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->set_inputs(&ubatch);
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+    }
+
+    if (vegas.mode == llama_vegas_mode::draft && vegas.wait_for_plan) {
+        GGML_ASSERT(vegas.ready_event != nullptr && vegas_plan_backend != nullptr);
+        ggml_backend_event_wait(vegas_plan_backend, vegas.ready_event);
+        vegas.wait_for_plan = false;
     }
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
@@ -2603,6 +2738,14 @@ llm_graph_params llama_context::graph_params(
         /*.vegas_top_k =*/ vegas.top_k,
         /*.vegas_max_recent_tokens =*/ vegas.max_recent_tokens,
         /*.vegas_selection_layer =*/ vegas.selection_layer,
+        /*.vegas_anchor_tokens =*/ vegas.anchor_tokens,
+        /*.vegas_ffn_oracle_sparsity =*/ vegas.ffn_oracle_sparsity,
+        /*.vegas_ffn_oracle_block_size =*/ vegas.ffn_oracle_block_size,
+        /*.vegas_ffn_proxy_input_sparsity =*/ vegas.ffn_proxy_input_sparsity,
+        /*.vegas_ffn_proxy_block_size =*/ vegas.ffn_proxy_block_size,
+        /*.vegas_ffn_proxy_use_values =*/ vegas.ffn_proxy_use_values,
+        /*.vegas_plan =*/ vegas.plan,
+        /*.vegas_shared_plan_layer =*/ vegas.shared_plan_layer,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
@@ -4363,6 +4506,22 @@ bool llama_vegas_enable(
 
 bool llama_vegas_set_selection_layer(llama_context * ctx, int32_t il) {
     return ctx->vegas_set_selection_layer(il);
+}
+
+bool llama_vegas_set_anchor_tokens(llama_context * ctx, int32_t n_tokens) {
+    return ctx->vegas_set_anchor_tokens(n_tokens);
+}
+
+bool llama_vegas_set_ffn_oracle_sparsity(llama_context * ctx, float sparsity) {
+    return ctx->vegas_set_ffn_oracle_sparsity(sparsity);
+}
+
+bool llama_vegas_set_ffn_oracle_block_size(llama_context * ctx, int32_t block_size) {
+    return ctx->vegas_set_ffn_oracle_block_size(block_size);
+}
+
+bool llama_vegas_set_ffn_proxy(llama_context * ctx, float input_sparsity, int32_t block_size, bool use_values) {
+    return ctx->vegas_set_ffn_proxy(input_sparsity, block_size, use_values);
 }
 
 void llama_vegas_set_mode(llama_context * ctx, int32_t mode, int32_t prefix_len) {

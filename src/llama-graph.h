@@ -167,20 +167,38 @@ public:
     const uint32_t n_pos_per_embd = 1;
 };
 
-class llm_graph_input_vegas_indices : public llm_graph_input_i {
+class llm_graph_input_sparse_kv_plan : public llm_graph_input_i {
 public:
-    llm_graph_input_vegas_indices(const llama_vegas_state & vegas, int32_t il, int32_t n_kv) :
-        vegas(vegas), il(il), n_kv(n_kv) {}
-    virtual ~llm_graph_input_vegas_indices() = default;
+    llm_graph_input_sparse_kv_plan(const llama_vegas_state & vegas, int32_t n_kv) :
+        vegas(vegas), plan_owner(vegas.plan), n_kv(n_kv) {}
+    virtual ~llm_graph_input_sparse_kv_plan() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
     bool can_reuse(const llm_graph_params & params) override;
 
-    ggml_tensor * indices = nullptr;
+    ggml_tensor * plan = nullptr;
+    ggml_tensor * attention = nullptr;
 
     const llama_vegas_state & vegas;
-    const int32_t il;
+    const ggml_tensor * plan_owner;
     const int32_t n_kv;
+};
+
+class llm_graph_input_vegas_score : public llm_graph_input_i {
+public:
+    llm_graph_input_vegas_score(const llama_vegas_state & vegas, int32_t score_len) :
+        vegas(vegas), score_len(score_len) {}
+    virtual ~llm_graph_input_vegas_score() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * mask = nullptr;
+    ggml_tensor * prefix = nullptr;
+    ggml_tensor * attention = nullptr;
+
+    const llama_vegas_state & vegas;
+    const int32_t score_len;
 };
 
 // temperature tuning, used by llama4
@@ -711,6 +729,14 @@ struct llm_graph_params {
     int32_t vegas_top_k;
     int32_t vegas_max_recent_tokens;
     int32_t vegas_selection_layer;
+    int32_t vegas_anchor_tokens;
+    float vegas_ffn_oracle_sparsity;
+    int32_t vegas_ffn_oracle_block_size;
+    float vegas_ffn_proxy_input_sparsity;
+    int32_t vegas_ffn_proxy_block_size;
+    bool vegas_ffn_proxy_use_values;
+    const ggml_tensor * vegas_plan;
+    int32_t vegas_shared_plan_layer;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -781,14 +807,21 @@ struct llm_graph_params {
             return false;
         }
 
-        if (vegas_mode != llama_vegas_mode::disabled &&
-                (vegas_top_k != other.vegas_top_k ||
-                 vegas_max_recent_tokens != other.vegas_max_recent_tokens ||
-                 vegas_selection_layer != other.vegas_selection_layer)) {
+        if (vegas_ffn_oracle_sparsity != other.vegas_ffn_oracle_sparsity ||
+                vegas_ffn_oracle_block_size != other.vegas_ffn_oracle_block_size ||
+                vegas_ffn_proxy_input_sparsity != other.vegas_ffn_proxy_input_sparsity ||
+                vegas_ffn_proxy_block_size != other.vegas_ffn_proxy_block_size ||
+                vegas_ffn_proxy_use_values != other.vegas_ffn_proxy_use_values) {
             return false;
         }
 
-        if (vegas_mode == llama_vegas_mode::verify && vegas_prefix_len != other.vegas_prefix_len) {
+        if (vegas_mode != llama_vegas_mode::disabled &&
+                (vegas_top_k != other.vegas_top_k ||
+                 vegas_max_recent_tokens != other.vegas_max_recent_tokens ||
+                 vegas_selection_layer != other.vegas_selection_layer ||
+                 vegas_anchor_tokens != other.vegas_anchor_tokens ||
+                 vegas_plan != other.vegas_plan ||
+                 vegas_shared_plan_layer != other.vegas_shared_plan_layer)) {
             return false;
         }
 
@@ -867,8 +900,8 @@ public:
 
     const std::vector<llm_graph_fused_node> & get_fused_nodes() const { return fused_nodes; }
 
-    void set_vegas_indices(int32_t il, ggml_tensor * indices);
-    const std::vector<ggml_tensor *> & get_vegas_indices() const { return t_vegas_indices; }
+    void set_vegas_plan_write(int32_t il, ggml_tensor * write);
+    const std::vector<ggml_tensor *> & get_vegas_plan_writes() const { return t_vegas_plan_writes; }
 
     void set_params(const llm_graph_params & params);
 
@@ -881,7 +914,7 @@ public:
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
 
     std::vector<ggml_tensor *> t_layer_inp;
-    std::vector<ggml_tensor *> t_vegas_indices;
+    std::vector<ggml_tensor *> t_vegas_plan_writes;
 
     std::map<llama_seq_id, ggml_tensor *> t_sampled_logits;
     std::map<llama_seq_id, ggml_tensor *> t_candidates;
@@ -971,6 +1004,12 @@ struct llm_graph_context {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
     const llama_vegas_state      * vegas;
+
+    const float vegas_ffn_oracle_sparsity;
+    const int32_t vegas_ffn_oracle_block_size;
+    const float vegas_ffn_proxy_input_sparsity;
+    const int32_t vegas_ffn_proxy_block_size;
+    const bool vegas_ffn_proxy_use_values;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
