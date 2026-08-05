@@ -1747,7 +1747,10 @@ int main(int argc, char ** argv) {
     const int32_t draft_capacity = options.mode == vegas_run_mode::mtp_hierarchical ?
             options.hierarchical.max_tokens :
             (options.adaptive_gamma ? vegas_adaptive_gamma::max_gamma : options.gamma);
-    const int32_t recent_capacity = (options.refresh_interval + 1) * (draft_capacity + 1);
+    // Include the verification input on both sides of a reused plan and the
+    // next MTP boundary token. Qwen MoE reaches this final extra position when
+    // an inner round starts immediately after a full accepted block.
+    const int32_t recent_capacity = (options.refresh_interval + 1) * (draft_capacity + 1) + 1;
     params.speculative.draft.n_max = draft_capacity;
 
     common_speculative_init_result_ptr spec_init;
