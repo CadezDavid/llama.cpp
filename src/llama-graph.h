@@ -798,6 +798,7 @@ struct llm_graph_params {
     int32_t vegas_shared_plan_layer;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
+    bool entropy_all;
 
     static bool samplers_equal(
           const std::map<llama_seq_id, llama_sampler *> & lhs,
@@ -859,6 +860,9 @@ struct llm_graph_params {
         }
 
         if (!samplers_equal(samplers, other.samplers)) {
+            return false;
+        }
+        if (entropy_all != other.entropy_all) {
             return false;
         }
 
@@ -972,6 +976,7 @@ public:
     std::map<llama_seq_id, ggml_tensor *> t_sampled;
     std::map<llama_seq_id, ggml_tensor *> t_sampled_probs;
     std::map<llama_seq_id, ggml_tensor *> t_sampled_statistics;
+    std::vector<ggml_tensor *> t_entropy_statistics;
 
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
@@ -1058,6 +1063,7 @@ struct llm_graph_context {
     const llama_vegas_state      * vegas;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
+    const bool entropy_all;
 
     const llm_graph_cb & cb_func;
 

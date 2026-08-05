@@ -1230,9 +1230,9 @@ bool llama_context::vegas_enable(
         float sparse_ratio,
         int32_t min_tokens,
         int32_t max_tokens,
-        int32_t max_draft_tokens) {
+        int32_t max_recent_tokens) {
     if (!(sparse_ratio > 0.0f && sparse_ratio <= 1.0f) ||
-            min_tokens < 1 || max_tokens < 0 || max_draft_tokens < 1) {
+            min_tokens < 1 || max_tokens < 0 || max_recent_tokens < 1) {
         return false;
     }
 
@@ -1332,7 +1332,7 @@ bool llama_context::vegas_enable(
     vegas.max_tokens   = max_tokens;
     vegas.prefix_len   = 0;
     vegas.top_k        = 0;
-    vegas.max_recent_tokens = 2 * max_draft_tokens;
+    vegas.max_recent_tokens = max_recent_tokens;
     vegas.selection_layer = -1;
     vegas.anchor_tokens = 0;
     vegas.plan = plan;
@@ -1395,11 +1395,14 @@ bool llama_context::vegas_resume_draft() {
         return false;
     }
 
-    if (vegas.shared_plan_layer >= 0) {
-        if ((size_t) vegas.shared_plan_layer >= vegas.plan_valid.size() ||
-                !vegas.plan_valid[vegas.shared_plan_layer]) {
+    const int32_t shared_layer = vegas.shared_plan_layer >= 0 ?
+            vegas.shared_plan_layer : vegas.selection_layer;
+    if (shared_layer >= 0) {
+        if ((size_t) shared_layer >= vegas.plan_valid.size() ||
+                !vegas.plan_valid[shared_layer]) {
             return false;
         }
+        vegas.shared_plan_layer = shared_layer;
     } else {
         for (uint32_t il = 0; il < model.hparams.n_layer_all; ++il) {
             if (!model.hparams.is_recr(il) && !model.hparams.is_swa(il) && !vegas.plan_valid[il]) {
@@ -1544,6 +1547,14 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     sched_need_reserve = true;
 
     return true;
+}
+
+void llama_context::set_entropy_output(bool enabled) {
+    if (sampling.entropy_all == enabled) {
+        return;
+    }
+    sampling.entropy_all = enabled;
+    sched_need_reserve = true;
 }
 
 void llama_context::set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales) {
@@ -2318,6 +2329,20 @@ int llama_context::decode(const llama_batch & batch_inp) {
             copy_tensor_async_candidates(res->t_candidates,     sampling.candidates, stride, sampling.candidates_count, seq_to_output_row, sched.get());
         }
 
+        if (sampling.entropy_all && !res->t_entropy_statistics.empty()) {
+            GGML_ASSERT(res->t_entropy_statistics.size() == n_outputs);
+            for (size_t i = 0; i < res->t_entropy_statistics.size(); ++i) {
+                ggml_tensor * tensor = res->t_entropy_statistics[i];
+                GGML_ASSERT(tensor != nullptr && ggml_nelements(tensor) == 2);
+                const size_t row = n_outputs_prev + i;
+                GGML_ASSERT(row < sampling.statistics_count.size());
+                ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), tensor);
+                ggml_backend_tensor_get_async(
+                        backend, tensor, sampling.statistics.data + 2*row, 0, 2*sizeof(float));
+                sampling.statistics_count[row] = 2;
+            }
+        }
+
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
     } while (mctx->next());
@@ -2424,7 +2449,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     }
 
     // Allocate backend sampling output buffers if there are backend samplers configured.
-    const bool has_sampling = !sampling.samplers.empty();
+    const bool has_sampling = !sampling.samplers.empty() || sampling.entropy_all;
     if (has_sampling) {
         backend_float_count = (2 * n_vocab + 2) * n_outputs_max; // logits + probs + entropy statistics
         backend_token_count = (1 + n_vocab) * n_outputs_max;    // sampled + candidates
@@ -2764,6 +2789,7 @@ llm_graph_params llama_context::graph_params(
         /*.vegas_plan =*/ vegas.plan,
         /*.vegas_shared_plan_layer =*/ vegas.shared_plan_layer,
         /*.samplers    =*/ sampling.samplers,
+        /*.entropy_all =*/ sampling.entropy_all,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
@@ -4543,8 +4569,8 @@ bool llama_vegas_enable(
                  float sparse_ratio,
                int32_t min_tokens,
                int32_t max_tokens,
-               int32_t max_draft_tokens) {
-    return ctx->vegas_enable(sparse_ratio, min_tokens, max_tokens, max_draft_tokens);
+               int32_t max_recent_tokens) {
+    return ctx->vegas_enable(sparse_ratio, min_tokens, max_tokens, max_recent_tokens);
 }
 
 bool llama_vegas_set_selection_layer(llama_context * ctx, int32_t il) {
@@ -4574,4 +4600,17 @@ bool llama_vegas_collect_indices(llama_context * ctx) {
 
 bool llama_vegas_copy_indices(llama_context * dst, const llama_context * src) {
     return dst->vegas_copy_indices(*src);
+}
+
+void llama_set_entropy_output(llama_context * ctx, bool enabled) {
+    ctx->set_entropy_output(enabled);
+}
+
+bool llama_memory_checkpoint_recurrent(llama_context * ctx, llama_seq_id seq_id) {
+    llama_synchronize(ctx);
+    return ctx->get_memory()->seq_checkpoint_recurrent(seq_id);
+}
+
+bool llama_memory_restore_recurrent(llama_context * ctx, llama_seq_id seq_id) {
+    return ctx->get_memory()->seq_restore_recurrent(seq_id);
 }

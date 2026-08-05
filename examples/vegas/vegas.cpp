@@ -4,10 +4,12 @@
 #include "sampling.h"
 #include "speculative.h"
 #include "adaptive-gamma.h"
+#include "hierarchical-policy.h"
 #include "llama-ext.h"
 #include "llama.h"
 
 #include <algorithm>
+#include <array>
 #include <clocale>
 #include <cmath>
 #include <cstdio>
@@ -16,6 +18,7 @@
 #include <inttypes.h>
 #include <memory>
 #include <random>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -26,6 +29,7 @@ enum class vegas_run_mode {
     vegas,
     mtp,
     mtp_vegas,
+    mtp_hierarchical,
     mtp_auto,
 };
 
@@ -43,6 +47,8 @@ struct vegas_options {
     bool auto_policy = false;
     bool adaptive_gamma = false;
     float adaptive_beta = 0.9f;
+    vegas_hierarchical_limits hierarchical;
+    bool hierarchical_trace = false;
     bool quiet = false;
 };
 
@@ -79,7 +85,196 @@ struct vegas_metrics {
     int32_t n_reused = 0;
     uint64_t output_hash = UINT64_C(1469598103934665603);
     std::string adaptive_summary;
+    std::string hierarchical_summary;
 };
+
+enum class hierarchical_token_source : int32_t {
+    mtp = 0,
+    sparse_correction = 1,
+    sparse_extension = 2,
+};
+
+struct hierarchical_entropy_stats {
+    double entropy_sum = 0.0;
+    double top_probability_sum = 0.0;
+    int64_t samples = 0;
+
+    void add(float entropy, float top_probability) {
+        if (std::isfinite(entropy) && std::isfinite(top_probability)) {
+            entropy_sum += entropy;
+            top_probability_sum += top_probability;
+            samples++;
+        }
+    }
+};
+
+struct hierarchical_round_trace {
+    int32_t round = 0;
+    int32_t provisional_before = 0;
+    int32_t requested = 0;
+    int32_t drafted = 0;
+    int32_t sparse_accepted = 0;
+    bool correction = false;
+    bool extension = false;
+    int32_t provisional_after = 0;
+    int64_t mtp_us = 0;
+    int64_t mtp_process_us = 0;
+    int64_t sparse_us = 0;
+    int64_t sparse_sample_us = 0;
+    std::vector<llama_token> mtp_tokens;
+    std::vector<llama_token> sparse_tokens;
+    std::vector<float> mtp_entropy;
+    std::vector<float> mtp_top_probability;
+    std::vector<float> sparse_entropy;
+    std::vector<float> sparse_top_probability;
+};
+
+struct hierarchical_cycle_trace {
+    int32_t cycle = 0;
+    int32_t start_pos = 0;
+    vegas_hierarchical_stop stop = vegas_hierarchical_stop::continue_drafting;
+    std::vector<hierarchical_round_trace> rounds;
+    std::vector<llama_token> provisional_tokens;
+    std::vector<int32_t> provenance;
+    std::vector<uint8_t> dense_matches;
+    std::vector<float> dense_entropy;
+    std::vector<float> dense_top_probability;
+    int32_t dense_accepted = 0;
+    int32_t committed = 0;
+    int32_t end_pos = 0;
+    int64_t dense_us = 0;
+    int64_t dense_sample_us = 0;
+};
+
+struct hierarchical_metrics {
+    int64_t mtp_us = 0;
+    int64_t mtp_process_us = 0;
+    int64_t sparse_us = 0;
+    int64_t sparse_sample_us = 0;
+    int64_t dense_us = 0;
+    int64_t dense_sample_us = 0;
+    int64_t plan_us = 0;
+    int64_t state_us = 0;
+    int64_t rollback_us = 0;
+
+    int64_t outer_cycles = 0;
+    int64_t inner_rounds = 0;
+    int64_t mtp_drafted = 0;
+    int64_t sparse_decodes = 0;
+    int64_t sparse_checked = 0;
+    int64_t sparse_accepted = 0;
+    int64_t sparse_corrections = 0;
+    int64_t sparse_extensions = 0;
+    int64_t provisional_tokens = 0;
+    int64_t dense_accepted = 0;
+    int64_t dense_corrections = 0;
+    int64_t dense_bonus = 0;
+    int64_t committed_tokens = 0;
+    int64_t device_entropy_samples = 0;
+    int64_t fallback_entropy_samples = 0;
+    int64_t rollback_failures = 0;
+    int64_t position_mismatches = 0;
+    int64_t snapshot_failures = 0;
+    int64_t empty_drafts = 0;
+
+    std::array<int64_t, 4> round_histogram {};
+    std::array<int64_t, 11> provisional_histogram {};
+    std::array<int64_t, 11> sparse_prefix_histogram {};
+    std::array<int64_t, 11> dense_prefix_histogram {};
+    std::array<int64_t, 3> correction_histogram {};
+    std::array<int64_t, 8> stop_histogram {};
+    std::array<int64_t, 3> proposed_by_source {};
+    std::array<int64_t, 3> accepted_by_source {};
+
+    hierarchical_entropy_stats sparse_match_entropy;
+    hierarchical_entropy_stats sparse_correction_entropy;
+    hierarchical_entropy_stats dense_match_entropy;
+    hierarchical_entropy_stats dense_rejection_entropy;
+
+    std::vector<hierarchical_cycle_trace> traces;
+};
+
+template<typename T, size_t N>
+static void json_array(std::ostringstream & stream, const std::array<T, N> & values) {
+    stream << "[";
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (i > 0) stream << ",";
+        stream << values[i];
+    }
+    stream << "]";
+}
+
+template<typename T>
+static void json_vector(std::ostringstream & stream, const std::vector<T> & values) {
+    stream << "[";
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (i > 0) stream << ",";
+        stream << +values[i];
+    }
+    stream << "]";
+}
+
+static void json_entropy_stats(std::ostringstream & stream, const hierarchical_entropy_stats & stats) {
+    stream << "{\"samples\":" << stats.samples
+           << ",\"mean_entropy\":" << (stats.samples > 0 ? stats.entropy_sum / stats.samples : 0.0)
+           << ",\"mean_top_probability\":"
+           << (stats.samples > 0 ? stats.top_probability_sum / stats.samples : 0.0) << "}";
+}
+
+struct hierarchical_draft_observer_data {
+    hierarchical_round_trace * trace = nullptr;
+    hierarchical_metrics * metrics = nullptr;
+};
+
+static bool hierarchical_draft_observer(
+        void * userdata,
+        const common_speculative_draft_observation & observation) {
+    auto * data = static_cast<hierarchical_draft_observer_data *>(userdata);
+    data->trace->mtp_entropy.push_back(observation.entropy);
+    data->trace->mtp_top_probability.push_back(observation.top_probability);
+    if (observation.entropy_on_device) {
+        data->metrics->device_entropy_samples++;
+    } else {
+        data->metrics->fallback_entropy_samples++;
+    }
+    return true;
+}
+
+struct hierarchical_entropy_observation {
+    float entropy = 0.0f;
+    float top_probability = 0.0f;
+    bool on_device = false;
+};
+
+static hierarchical_entropy_observation hierarchical_entropy(llama_context * ctx, int32_t idx) {
+    hierarchical_entropy_observation result;
+    result.on_device = llama_get_sampled_entropy_ith(
+            ctx, idx, &result.entropy, &result.top_probability);
+    if (result.on_device) {
+        return result;
+    }
+
+    const float * logits = llama_get_logits_ith(ctx, idx);
+    const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+    if (logits == nullptr || n_vocab <= 0) {
+        return result;
+    }
+
+    const float max_logit = *std::max_element(logits, logits + n_vocab);
+    double sum = 0.0;
+    double weighted_shifted_logit = 0.0;
+    for (int32_t token = 0; token < n_vocab; ++token) {
+        const double shifted = (double) logits[token] - max_logit;
+        const double weight = std::exp(shifted);
+        sum += weight;
+        weighted_shifted_logit += weight * shifted;
+    }
+    if (sum > 0.0 && std::isfinite(sum)) {
+        result.top_probability = (float) (1.0 / sum);
+        result.entropy = (float) (std::log(sum) - weighted_shifted_logit / sum);
+    }
+    return result;
+}
 
 static const char * mode_name(vegas_run_mode mode) {
     switch (mode) {
@@ -88,6 +283,7 @@ static const char * mode_name(vegas_run_mode mode) {
         case vegas_run_mode::vegas:      return "vegas";
         case vegas_run_mode::mtp:        return "mtp";
         case vegas_run_mode::mtp_vegas:  return "mtp-vegas";
+        case vegas_run_mode::mtp_hierarchical: return "mtp-hierarchical";
         case vegas_run_mode::mtp_auto:   return "mtp-auto";
     }
     return "unknown";
@@ -95,12 +291,12 @@ static const char * mode_name(vegas_run_mode mode) {
 
 static bool mode_uses_vegas(vegas_run_mode mode) {
     return mode == vegas_run_mode::vegas || mode == vegas_run_mode::mtp_vegas ||
-            mode == vegas_run_mode::mtp_auto;
+            mode == vegas_run_mode::mtp_hierarchical || mode == vegas_run_mode::mtp_auto;
 }
 
 static bool mode_uses_mtp(vegas_run_mode mode) {
     return mode == vegas_run_mode::mtp || mode == vegas_run_mode::mtp_vegas ||
-            mode == vegas_run_mode::mtp_auto;
+            mode == vegas_run_mode::mtp_hierarchical || mode == vegas_run_mode::mtp_auto;
 }
 
 static bool parse_i32(const char * text, int32_t & value) {
@@ -153,6 +349,10 @@ static bool parse_vegas_options(
             options.adaptive_gamma = true;
             continue;
         }
+        if (arg == "--vegas-hier-trace") {
+            options.hierarchical_trace = true;
+            continue;
+        }
 
         if (const char * value = get_value("--vegas-mode")) {
             if (std::strcmp(value, "baseline") == 0) {
@@ -165,6 +365,8 @@ static bool parse_vegas_options(
                 options.mode = vegas_run_mode::mtp;
             } else if (std::strcmp(value, "mtp-vegas") == 0) {
                 options.mode = vegas_run_mode::mtp_vegas;
+            } else if (std::strcmp(value, "mtp-hierarchical") == 0) {
+                options.mode = vegas_run_mode::mtp_hierarchical;
             } else if (std::strcmp(value, "mtp-auto") == 0) {
                 options.mode = vegas_run_mode::mtp_auto;
                 options.auto_policy = true;
@@ -205,6 +407,34 @@ static bool parse_vegas_options(
         if (const char * value = get_value("--vegas-adaptive-beta")) {
             if (!parse_f32(value, options.adaptive_beta)) {
                 LOG_ERR("invalid --vegas-adaptive-beta: %s\n", value);
+                return false;
+            }
+            continue;
+        }
+        if (const char * value = get_value("--vegas-hier-target")) {
+            if (!parse_i32(value, options.hierarchical.target_tokens)) {
+                LOG_ERR("invalid --vegas-hier-target: %s\n", value);
+                return false;
+            }
+            continue;
+        }
+        if (const char * value = get_value("--vegas-hier-max-tokens")) {
+            if (!parse_i32(value, options.hierarchical.max_tokens)) {
+                LOG_ERR("invalid --vegas-hier-max-tokens: %s\n", value);
+                return false;
+            }
+            continue;
+        }
+        if (const char * value = get_value("--vegas-hier-max-rounds")) {
+            if (!parse_i32(value, options.hierarchical.max_rounds)) {
+                LOG_ERR("invalid --vegas-hier-max-rounds: %s\n", value);
+                return false;
+            }
+            continue;
+        }
+        if (const char * value = get_value("--vegas-hier-max-corrections")) {
+            if (!parse_i32(value, options.hierarchical.max_corrections)) {
+                LOG_ERR("invalid --vegas-hier-max-corrections: %s\n", value);
                 return false;
             }
             continue;
@@ -254,7 +484,10 @@ static bool parse_vegas_options(
             options.min_tokens < 1 || options.max_tokens < 0 || options.gamma < 1 ||
             options.anchor_tokens < 0 || options.refresh_interval < 1 ||
             options.mtp_ubatch < 1 || options.prompt_tokens < 0 || options.prompt_tokens == 1 ||
-            !(options.adaptive_beta >= 0.0f && options.adaptive_beta < 1.0f)) {
+            !(options.adaptive_beta >= 0.0f && options.adaptive_beta < 1.0f) ||
+            options.hierarchical.target_tokens < 1 || options.hierarchical.max_tokens < 1 ||
+            options.hierarchical.target_tokens > options.hierarchical.max_tokens ||
+            options.hierarchical.max_rounds < 1 || options.hierarchical.max_corrections < 1) {
         LOG_ERR("invalid Vegas configuration\n");
         return false;
     }
@@ -793,6 +1026,595 @@ static bool run_mtp(
     return true;
 }
 
+static bool run_mtp_hierarchical(
+        llama_context * ctx,
+        llama_context * ctx_dft,
+        common_speculative * spec,
+        const llama_vocab * vocab,
+        common_sampler * sampler,
+        llama_token id_last,
+        int32_t n_past,
+        const common_params & params,
+        const vegas_options & options,
+        llama_batch & batch,
+        llama_tokens & history,
+        vegas_metrics & metrics,
+        hierarchical_metrics & hierarchical) {
+    bool has_eog = false;
+    const int64_t start = ggml_time_us();
+
+    while (!has_eog && (params.n_predict < 0 || metrics.n_predict < params.n_predict)) {
+        const int32_t remaining = params.n_predict < 0 ? INT32_MAX : params.n_predict - metrics.n_predict;
+        const int32_t outer_capacity = remaining > 1 ?
+                std::min(options.hierarchical.max_tokens, remaining - 1) : 0;
+        const int32_t outer_n_past = n_past;
+        const llama_token outer_id_last = id_last;
+        const size_t outer_history_size = history.size();
+
+        if (!llama_memory_checkpoint_recurrent(ctx, 0)) {
+            hierarchical.snapshot_failures++;
+            LOG_ERR("failed to checkpoint target recurrent state before hierarchical cycle\n");
+            return false;
+        }
+
+        hierarchical_cycle_trace cycle;
+        cycle.cycle = (int32_t) hierarchical.outer_cycles;
+        cycle.start_pos = outer_n_past;
+
+        std::vector<uint8_t> spec_state;
+        const int64_t snapshot_start = ggml_time_us();
+        if (!common_speculative_get_state(spec, 0, spec_state)) {
+            hierarchical.snapshot_failures++;
+            LOG_ERR("failed to snapshot MTP state before hierarchical cycle\n");
+            return false;
+        }
+        hierarchical.state_us += ggml_time_us() - snapshot_start;
+
+        common_sampler_ptr provisional_sampler(common_sampler_clone(sampler));
+        llama_tokens provisional_history = history;
+        llama_tokens provisional;
+        std::vector<hierarchical_token_source> provenance;
+        provisional.reserve(outer_capacity);
+        provenance.reserve(outer_capacity);
+        int32_t provisional_n_past = outer_n_past;
+        llama_token provisional_last = outer_id_last;
+        int32_t corrections = 0;
+        bool provisional_eog = false;
+
+        if (outer_capacity > 0) {
+            const int64_t plan_start = ggml_time_us();
+            if (!llama_vegas_copy_indices(ctx_dft, ctx)) {
+                LOG_ERR("failed to copy authoritative Vegas indices for hierarchical MTP\n");
+                return false;
+            }
+            hierarchical.plan_us += ggml_time_us() - plan_start;
+        }
+
+        vegas_hierarchical_stop stop = outer_capacity > 0 ?
+                vegas_hierarchical_stop::continue_drafting : vegas_hierarchical_stop::output_limit;
+
+        while (stop == vegas_hierarchical_stop::continue_drafting) {
+            hierarchical_round_trace round;
+            round.round = (int32_t) cycle.rounds.size();
+            round.provisional_before = (int32_t) provisional.size();
+            round.requested = std::min(options.gamma, outer_capacity - (int32_t) provisional.size());
+            if (round.requested <= 0) {
+                stop = vegas_hierarchical_stop::hard_cap;
+                break;
+            }
+
+            llama_tokens draft;
+            if (!llama_vegas_resume_draft(ctx_dft)) {
+                LOG_ERR("failed to resume hierarchical MTP Vegas plan\n");
+                return false;
+            }
+
+            auto & draft_params = common_speculative_get_draft_params(spec, 0);
+            draft_params = {
+                /* .drafting = */ true,
+                /* .n_max    = */ round.requested,
+                /* .n_past   = */ provisional_n_past,
+                /* .id_last  = */ provisional_last,
+                /* .prompt   = */ &provisional_history,
+                /* .result   = */ &draft,
+            };
+            hierarchical_draft_observer_data observer_data {
+                /* .trace   = */ &round,
+                /* .metrics = */ &hierarchical,
+            };
+            draft_params.observer = hierarchical_draft_observer;
+            draft_params.observer_userdata = &observer_data;
+
+            const int64_t mtp_start = ggml_time_us();
+            common_speculative_draft(spec);
+            llama_synchronize(ctx_dft);
+            round.mtp_us = ggml_time_us() - mtp_start;
+            hierarchical.mtp_us += round.mtp_us;
+            hierarchical.mtp_drafted += draft.size();
+            metrics.draft_us += round.mtp_us;
+            metrics.n_drafted += (int32_t) draft.size();
+            round.drafted = (int32_t) draft.size();
+            round.mtp_tokens = draft;
+
+            llama_vegas_pause(ctx_dft);
+            const int64_t draft_rollback_start = ggml_time_us();
+            if (!remove_after(ctx_dft, provisional_n_past)) {
+                hierarchical.rollback_failures++;
+                LOG_ERR("failed to roll back hierarchical MTP draft state\n");
+                return false;
+            }
+            const int64_t draft_rollback_us = ggml_time_us() - draft_rollback_start;
+            hierarchical.rollback_us += draft_rollback_us;
+            metrics.rollback_us += draft_rollback_us;
+
+            const bool empty_draft = draft.empty();
+            if (!empty_draft) {
+                if (!llama_vegas_resume_draft(ctx)) {
+                    LOG_ERR("failed to resume sparse-target Vegas plan\n");
+                    return false;
+                }
+
+                bool mismatch = false;
+                for (size_t i = 0; i < draft.size(); ++i) {
+                    const int64_t sparse_start = ggml_time_us();
+                    if (!decode_one(ctx, batch, provisional_last, provisional_n_past)) {
+                        return false;
+                    }
+                    llama_synchronize(ctx);
+                    const int64_t sparse_decode_us = ggml_time_us() - sparse_start;
+                    round.sparse_us += sparse_decode_us;
+                    hierarchical.sparse_us += sparse_decode_us;
+                    hierarchical.sparse_decodes++;
+
+                    const auto entropy = hierarchical_entropy(ctx, 0);
+                    round.sparse_entropy.push_back(entropy.entropy);
+                    round.sparse_top_probability.push_back(entropy.top_probability);
+                    if (entropy.on_device) hierarchical.device_entropy_samples++;
+                    else hierarchical.fallback_entropy_samples++;
+
+                    const int64_t process_start = ggml_time_us();
+                    if (!common_speculative_process(spec, batch)) {
+                        LOG_ERR("failed to process sparse-target token for MTP\n");
+                        return false;
+                    }
+                    llama_synchronize(ctx_dft);
+                    const int64_t process_us = ggml_time_us() - process_start;
+                    round.mtp_process_us += process_us;
+                    hierarchical.mtp_process_us += process_us;
+
+                    const int64_t sample_start = ggml_time_us();
+                    const llama_token sparse_token = common_sampler_sample(provisional_sampler.get(), ctx, 0, true);
+                    round.sparse_sample_us += ggml_time_us() - sample_start;
+                    round.sparse_tokens.push_back(sparse_token);
+                    hierarchical.sparse_checked++;
+
+                    if (sparse_token == draft[i]) {
+                        common_sampler_accept(provisional_sampler.get(), draft[i], true);
+                        provisional.push_back(draft[i]);
+                        provenance.push_back(hierarchical_token_source::mtp);
+                        provisional_history.push_back(draft[i]);
+                        provisional_last = draft[i];
+                        provisional_n_past++;
+                        round.sparse_accepted++;
+                        hierarchical.sparse_accepted++;
+                        hierarchical.proposed_by_source[(int) hierarchical_token_source::mtp]++;
+                        hierarchical.sparse_match_entropy.add(entropy.entropy, entropy.top_probability);
+                        provisional_eog = llama_vocab_is_eog(vocab, draft[i]);
+                        if (provisional_eog || (int32_t) provisional.size() >= outer_capacity) {
+                            break;
+                        }
+                        continue;
+                    }
+
+                    common_sampler_accept(provisional_sampler.get(), sparse_token, true);
+                    provisional.push_back(sparse_token);
+                    provenance.push_back(hierarchical_token_source::sparse_correction);
+                    provisional_history.push_back(sparse_token);
+                    provisional_last = sparse_token;
+                    provisional_n_past++;
+                    corrections++;
+                    round.correction = true;
+                    hierarchical.sparse_corrections++;
+                    hierarchical.proposed_by_source[(int) hierarchical_token_source::sparse_correction]++;
+                    hierarchical.sparse_correction_entropy.add(entropy.entropy, entropy.top_probability);
+                    provisional_eog = llama_vocab_is_eog(vocab, sparse_token);
+                    mismatch = true;
+                    break;
+                }
+
+                if (!mismatch && !provisional_eog && round.sparse_accepted == (int32_t) draft.size() &&
+                        (int32_t) provisional.size() < outer_capacity) {
+                    const int64_t sparse_start = ggml_time_us();
+                    if (!decode_one(ctx, batch, provisional_last, provisional_n_past)) {
+                        return false;
+                    }
+                    llama_synchronize(ctx);
+                    const int64_t sparse_decode_us = ggml_time_us() - sparse_start;
+                    round.sparse_us += sparse_decode_us;
+                    hierarchical.sparse_us += sparse_decode_us;
+                    hierarchical.sparse_decodes++;
+
+                    const auto entropy = hierarchical_entropy(ctx, 0);
+                    round.sparse_entropy.push_back(entropy.entropy);
+                    round.sparse_top_probability.push_back(entropy.top_probability);
+                    if (entropy.on_device) hierarchical.device_entropy_samples++;
+                    else hierarchical.fallback_entropy_samples++;
+
+                    const int64_t process_start = ggml_time_us();
+                    if (!common_speculative_process(spec, batch)) {
+                        LOG_ERR("failed to process sparse-target extension for MTP\n");
+                        return false;
+                    }
+                    llama_synchronize(ctx_dft);
+                    const int64_t process_us = ggml_time_us() - process_start;
+                    round.mtp_process_us += process_us;
+                    hierarchical.mtp_process_us += process_us;
+
+                    const int64_t sample_start = ggml_time_us();
+                    const llama_token extension = common_sampler_sample(provisional_sampler.get(), ctx, 0, true);
+                    round.sparse_sample_us += ggml_time_us() - sample_start;
+                    round.sparse_tokens.push_back(extension);
+                    common_sampler_accept(provisional_sampler.get(), extension, true);
+                    provisional.push_back(extension);
+                    provenance.push_back(hierarchical_token_source::sparse_extension);
+                    provisional_history.push_back(extension);
+                    provisional_last = extension;
+                    provisional_n_past++;
+                    round.extension = true;
+                    hierarchical.sparse_extensions++;
+                    hierarchical.proposed_by_source[(int) hierarchical_token_source::sparse_extension]++;
+                    provisional_eog = llama_vocab_is_eog(vocab, extension);
+                }
+
+                hierarchical.sparse_sample_us += round.sparse_sample_us;
+                common_speculative_accept(spec, 0, round.sparse_accepted);
+            } else {
+                hierarchical.empty_drafts++;
+            }
+
+            round.provisional_after = (int32_t) provisional.size();
+            cycle.rounds.push_back(std::move(round));
+            hierarchical.inner_rounds++;
+
+            stop = vegas_hierarchical_should_stop(
+                    options.hierarchical,
+                    (int32_t) provisional.size(),
+                    (int32_t) cycle.rounds.size(),
+                    corrections,
+                    provisional_eog,
+                    empty_draft,
+                    (int32_t) provisional.size() >= outer_capacity);
+        }
+
+        cycle.stop = stop;
+        cycle.provisional_tokens = provisional;
+        cycle.provenance.reserve(provenance.size());
+        for (auto source : provenance) cycle.provenance.push_back((int32_t) source);
+
+        const int64_t restore_start = ggml_time_us();
+        llama_vegas_pause(ctx);
+        llama_vegas_pause(ctx_dft);
+        const llama_pos target_pos_before_restore = llama_memory_seq_pos_max(llama_get_memory(ctx), 0);
+        const llama_pos draft_pos_before_restore = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), 0);
+        const bool target_restored = remove_after(ctx, outer_n_past);
+        const bool draft_restored = remove_after(ctx_dft, outer_n_past);
+        if (!target_restored || !draft_restored) {
+            hierarchical.rollback_failures++;
+            LOG_ERR("failed to restore authoritative KV prefix before dense verification: "
+                    "target_ok=%d draft_ok=%d target_pos=%d draft_pos=%d restore_pos=%d\n",
+                    target_restored, draft_restored, (int) target_pos_before_restore,
+                    (int) draft_pos_before_restore, outer_n_past);
+            return false;
+        }
+        if (!llama_memory_restore_recurrent(ctx, 0)) {
+            hierarchical.snapshot_failures++;
+            LOG_ERR("failed to restore target recurrent checkpoint before dense verification\n");
+            return false;
+        }
+        if (!common_speculative_set_state(spec, 0, spec_state)) {
+            hierarchical.snapshot_failures++;
+            LOG_ERR("failed to restore authoritative MTP state\n");
+            return false;
+        }
+        std::vector<uint8_t> restored_state;
+        if (!common_speculative_get_state(spec, 0, restored_state) || restored_state != spec_state) {
+            hierarchical.snapshot_failures++;
+            LOG_ERR("MTP state did not round-trip during hierarchical restore\n");
+            return false;
+        }
+        const int64_t restore_us = ggml_time_us() - restore_start;
+        hierarchical.state_us += restore_us;
+
+        const bool refresh_indices = (metrics.n_cycles + 1) % options.refresh_interval == 0;
+        if (refresh_indices) {
+            llama_vegas_set_mode(ctx, LLAMA_VEGAS_MODE_VERIFY, outer_n_past + 1);
+        } else {
+            llama_vegas_pause(ctx);
+        }
+
+        common_batch_clear(batch);
+        common_batch_add(batch, outer_id_last, outer_n_past, { 0 }, true);
+        for (size_t i = 0; i < provisional.size(); ++i) {
+            common_batch_add(batch, provisional[i], outer_n_past + (int32_t) i + 1, { 0 }, true);
+        }
+
+        const int64_t dense_start = ggml_time_us();
+        if (llama_decode(ctx, batch) != 0) {
+            return false;
+        }
+        llama_synchronize(ctx);
+        cycle.dense_us = ggml_time_us() - dense_start;
+        hierarchical.dense_us += cycle.dense_us;
+        metrics.verify_us += cycle.dense_us;
+
+        for (int32_t i = 0; i < batch.n_tokens; ++i) {
+            const auto entropy = hierarchical_entropy(ctx, i);
+            cycle.dense_entropy.push_back(entropy.entropy);
+            cycle.dense_top_probability.push_back(entropy.top_probability);
+            if (entropy.on_device) hierarchical.device_entropy_samples++;
+            else hierarchical.fallback_entropy_samples++;
+        }
+
+        const int64_t process_start = ggml_time_us();
+        if (!common_speculative_process(spec, batch)) {
+            LOG_ERR("failed to process dense hierarchical verification for MTP\n");
+            return false;
+        }
+        llama_synchronize(ctx_dft);
+        hierarchical.mtp_process_us += ggml_time_us() - process_start;
+
+        if (refresh_indices) {
+            const int64_t plan_start = ggml_time_us();
+            if (!llama_vegas_collect_indices(ctx)) {
+                LOG_ERR("failed to collect authoritative hierarchical Vegas indices\n");
+                return false;
+            }
+            const int64_t plan_us = ggml_time_us() - plan_start;
+            hierarchical.plan_us += plan_us;
+            metrics.collect_us += plan_us;
+        }
+
+        int32_t accepted = 0;
+        llama_token next = LLAMA_TOKEN_NULL;
+        bool emitted_dense_extra = false;
+        const int64_t dense_sample_start = ggml_time_us();
+        for (size_t i = 0; i < provisional.size(); ++i) {
+            const llama_token target = common_sampler_sample(sampler, ctx, (int32_t) i, true);
+            const bool match = target == provisional[i];
+            cycle.dense_matches.push_back(match ? 1 : 0);
+            const auto source = provenance[i];
+            if (match) {
+                next = provisional[i];
+                common_sampler_accept(sampler, next, true);
+                accepted++;
+                metrics.n_accepted++;
+                metrics.n_predict++;
+                hierarchical.dense_accepted++;
+                hierarchical.accepted_by_source[(int) source]++;
+                hierarchical.dense_match_entropy.add(
+                        cycle.dense_entropy[i], cycle.dense_top_probability[i]);
+                history.push_back(next);
+                record_token(ctx, next, options.quiet, metrics);
+                if (llama_vocab_is_eog(vocab, next)) {
+                    has_eog = true;
+                    break;
+                }
+                continue;
+            }
+
+            next = target;
+            common_sampler_accept(sampler, next, true);
+            metrics.n_rejected++;
+            metrics.n_predict++;
+            hierarchical.dense_corrections++;
+            emitted_dense_extra = true;
+            hierarchical.dense_rejection_entropy.add(
+                    cycle.dense_entropy[i], cycle.dense_top_probability[i]);
+            history.push_back(next);
+            record_token(ctx, next, options.quiet, metrics);
+            has_eog = llama_vocab_is_eog(vocab, next);
+            break;
+        }
+
+        if (!has_eog && accepted == (int32_t) provisional.size()) {
+            next = common_sampler_sample(sampler, ctx, (int32_t) provisional.size(), true);
+            common_sampler_accept(sampler, next, true);
+            metrics.n_predict++;
+            hierarchical.dense_bonus++;
+            emitted_dense_extra = true;
+            history.push_back(next);
+            record_token(ctx, next, options.quiet, metrics);
+            has_eog = llama_vocab_is_eog(vocab, next);
+        }
+        cycle.dense_sample_us = ggml_time_us() - dense_sample_start;
+        hierarchical.dense_sample_us += cycle.dense_sample_us;
+        metrics.sample_us += cycle.dense_sample_us;
+
+        common_speculative_accept(spec, 0, accepted);
+
+        const int32_t committed = accepted + (emitted_dense_extra ? 1 : 0);
+        hierarchical.committed_tokens += committed;
+        hierarchical.provisional_tokens += provisional.size();
+        cycle.dense_accepted = accepted;
+        cycle.committed = committed;
+
+        n_past += accepted + 1;
+        id_last = next;
+        metrics.n_cycles++;
+        hierarchical.outer_cycles++;
+
+        hierarchical.round_histogram[std::min<size_t>(cycle.rounds.size(), 3)]++;
+        hierarchical.provisional_histogram[std::min<size_t>(provisional.size(), 10)]++;
+        hierarchical.dense_prefix_histogram[std::min(accepted, 10)]++;
+        hierarchical.correction_histogram[std::min(corrections, 2)]++;
+        hierarchical.stop_histogram[(int) stop]++;
+        for (const auto & round : cycle.rounds) {
+            hierarchical.sparse_prefix_histogram[std::min(round.sparse_accepted, 10)]++;
+        }
+
+        const int64_t rollback_start = ggml_time_us();
+        if (!remove_after(ctx, n_past) || !remove_after(ctx_dft, n_past)) {
+            hierarchical.rollback_failures++;
+            LOG_ERR("failed to roll back rejected hierarchical verification state\n");
+            return false;
+        }
+        const int64_t rollback_us = ggml_time_us() - rollback_start;
+        hierarchical.rollback_us += rollback_us;
+        metrics.rollback_us += rollback_us;
+
+        const llama_pos target_pos = llama_memory_seq_pos_max(llama_get_memory(ctx), 0);
+        const llama_pos draft_pos = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), 0);
+        if (target_pos != n_past - 1 || draft_pos != n_past - 1 ||
+                history.size() != outer_history_size + (size_t) committed) {
+            hierarchical.position_mismatches++;
+            LOG_ERR("hierarchical state mismatch: target=%d draft=%d expected=%d history=%zu expected_history=%zu\n",
+                    (int) target_pos, (int) draft_pos, n_past - 1,
+                    history.size(), outer_history_size + (size_t) committed);
+            return false;
+        }
+
+        cycle.end_pos = n_past;
+        if (options.hierarchical_trace) {
+            hierarchical.traces.push_back(std::move(cycle));
+        }
+    }
+
+    metrics.total_us = ggml_time_us() - start;
+    return true;
+}
+
+static std::string hierarchical_summary_json(
+        const vegas_options & options,
+        const hierarchical_metrics & metrics) {
+    std::ostringstream out;
+    out << "\"hierarchical\":true"
+        << ",\"hierarchical_trace_schema\":1"
+        << ",\"hierarchical_target\":" << options.hierarchical.target_tokens
+        << ",\"hierarchical_max_tokens\":" << options.hierarchical.max_tokens
+        << ",\"hierarchical_max_rounds\":" << options.hierarchical.max_rounds
+        << ",\"hierarchical_max_corrections\":" << options.hierarchical.max_corrections
+        << ",\"hierarchical_outer_cycles\":" << metrics.outer_cycles
+        << ",\"hierarchical_inner_rounds\":" << metrics.inner_rounds
+        << ",\"hierarchical_mtp_drafted\":" << metrics.mtp_drafted
+        << ",\"hierarchical_sparse_decodes\":" << metrics.sparse_decodes
+        << ",\"hierarchical_sparse_checked\":" << metrics.sparse_checked
+        << ",\"hierarchical_sparse_accepted\":" << metrics.sparse_accepted
+        << ",\"hierarchical_sparse_corrections\":" << metrics.sparse_corrections
+        << ",\"hierarchical_sparse_extensions\":" << metrics.sparse_extensions
+        << ",\"hierarchical_provisional_tokens\":" << metrics.provisional_tokens
+        << ",\"hierarchical_dense_accepted\":" << metrics.dense_accepted
+        << ",\"hierarchical_dense_corrections\":" << metrics.dense_corrections
+        << ",\"hierarchical_dense_bonus\":" << metrics.dense_bonus
+        << ",\"hierarchical_committed_tokens\":" << metrics.committed_tokens
+        << ",\"hierarchical_committed_per_dense_cycle\":"
+        << (metrics.outer_cycles > 0 ? (double) metrics.committed_tokens / metrics.outer_cycles : 0.0)
+        << ",\"hierarchical_sparse_agreement\":"
+        << (metrics.sparse_checked > 0 ? (double) metrics.sparse_accepted / metrics.sparse_checked : 0.0)
+        << ",\"hierarchical_dense_acceptance\":"
+        << (metrics.provisional_tokens > 0 ? (double) metrics.dense_accepted / metrics.provisional_tokens : 0.0)
+        << ",\"hierarchical_mtp_ms\":" << metrics.mtp_us / 1e3
+        << ",\"hierarchical_mtp_process_ms\":" << metrics.mtp_process_us / 1e3
+        << ",\"hierarchical_sparse_ms\":" << metrics.sparse_us / 1e3
+        << ",\"hierarchical_sparse_sample_ms\":" << metrics.sparse_sample_us / 1e3
+        << ",\"hierarchical_dense_ms\":" << metrics.dense_us / 1e3
+        << ",\"hierarchical_dense_sample_ms\":" << metrics.dense_sample_us / 1e3
+        << ",\"hierarchical_plan_ms\":" << metrics.plan_us / 1e3
+        << ",\"hierarchical_state_ms\":" << metrics.state_us / 1e3
+        << ",\"hierarchical_rollback_ms\":" << metrics.rollback_us / 1e3
+        << ",\"hierarchical_device_entropy_samples\":" << metrics.device_entropy_samples
+        << ",\"hierarchical_fallback_entropy_samples\":" << metrics.fallback_entropy_samples
+        << ",\"hierarchical_rollback_failures\":" << metrics.rollback_failures
+        << ",\"hierarchical_position_mismatches\":" << metrics.position_mismatches
+        << ",\"hierarchical_snapshot_failures\":" << metrics.snapshot_failures
+        << ",\"hierarchical_empty_drafts\":" << metrics.empty_drafts;
+
+    out << ",\"hierarchical_round_histogram\":";
+    json_array(out, metrics.round_histogram);
+    out << ",\"hierarchical_provisional_histogram\":";
+    json_array(out, metrics.provisional_histogram);
+    out << ",\"hierarchical_sparse_prefix_histogram\":";
+    json_array(out, metrics.sparse_prefix_histogram);
+    out << ",\"hierarchical_dense_prefix_histogram\":";
+    json_array(out, metrics.dense_prefix_histogram);
+    out << ",\"hierarchical_correction_histogram\":";
+    json_array(out, metrics.correction_histogram);
+    out << ",\"hierarchical_stop_histogram\":";
+    json_array(out, metrics.stop_histogram);
+    out << ",\"hierarchical_proposed_by_source\":";
+    json_array(out, metrics.proposed_by_source);
+    out << ",\"hierarchical_accepted_by_source\":";
+    json_array(out, metrics.accepted_by_source);
+
+    out << ",\"hierarchical_sparse_match_entropy\":";
+    json_entropy_stats(out, metrics.sparse_match_entropy);
+    out << ",\"hierarchical_sparse_correction_entropy\":";
+    json_entropy_stats(out, metrics.sparse_correction_entropy);
+    out << ",\"hierarchical_dense_match_entropy\":";
+    json_entropy_stats(out, metrics.dense_match_entropy);
+    out << ",\"hierarchical_dense_rejection_entropy\":";
+    json_entropy_stats(out, metrics.dense_rejection_entropy);
+
+    if (options.hierarchical_trace) {
+        out << ",\"hierarchical_trace\":[";
+        for (size_t i = 0; i < metrics.traces.size(); ++i) {
+            if (i > 0) out << ",";
+            const auto & cycle = metrics.traces[i];
+            out << "{\"cycle\":" << cycle.cycle
+                << ",\"start_pos\":" << cycle.start_pos
+                << ",\"stop\":\"" << vegas_hierarchical_stop_name(cycle.stop) << "\""
+                << ",\"provisional_tokens\":";
+            json_vector(out, cycle.provisional_tokens);
+            out << ",\"provenance\":";
+            json_vector(out, cycle.provenance);
+            out << ",\"dense_matches\":";
+            json_vector(out, cycle.dense_matches);
+            out << ",\"dense_entropy\":";
+            json_vector(out, cycle.dense_entropy);
+            out << ",\"dense_top_probability\":";
+            json_vector(out, cycle.dense_top_probability);
+            out << ",\"dense_accepted\":" << cycle.dense_accepted
+                << ",\"committed\":" << cycle.committed
+                << ",\"end_pos\":" << cycle.end_pos
+                << ",\"dense_ms\":" << cycle.dense_us / 1e3
+                << ",\"dense_sample_ms\":" << cycle.dense_sample_us / 1e3
+                << ",\"rounds\":[";
+            for (size_t j = 0; j < cycle.rounds.size(); ++j) {
+                if (j > 0) out << ",";
+                const auto & round = cycle.rounds[j];
+                out << "{\"round\":" << round.round
+                    << ",\"provisional_before\":" << round.provisional_before
+                    << ",\"requested\":" << round.requested
+                    << ",\"drafted\":" << round.drafted
+                    << ",\"sparse_accepted\":" << round.sparse_accepted
+                    << ",\"correction\":" << (round.correction ? "true" : "false")
+                    << ",\"extension\":" << (round.extension ? "true" : "false")
+                    << ",\"provisional_after\":" << round.provisional_after
+                    << ",\"mtp_ms\":" << round.mtp_us / 1e3
+                    << ",\"mtp_process_ms\":" << round.mtp_process_us / 1e3
+                    << ",\"sparse_ms\":" << round.sparse_us / 1e3
+                    << ",\"sparse_sample_ms\":" << round.sparse_sample_us / 1e3
+                    << ",\"mtp_tokens\":";
+                json_vector(out, round.mtp_tokens);
+                out << ",\"sparse_tokens\":";
+                json_vector(out, round.sparse_tokens);
+                out << ",\"mtp_entropy\":";
+                json_vector(out, round.mtp_entropy);
+                out << ",\"mtp_top_probability\":";
+                json_vector(out, round.mtp_top_probability);
+                out << ",\"sparse_entropy\":";
+                json_vector(out, round.sparse_entropy);
+                out << ",\"sparse_top_probability\":";
+                json_vector(out, round.sparse_top_probability);
+                out << "}";
+            }
+            out << "]}";
+        }
+        out << "]";
+    }
+
+    return out.str();
+}
+
 static void print_result(
         const common_params & params,
         const vegas_options & options,
@@ -801,6 +1623,13 @@ static void print_result(
     const double tps = seconds > 0.0 ? metrics.n_predict / seconds : 0.0;
     const double accept = metrics.n_drafted > 0 ?
         (double) metrics.n_accepted / metrics.n_drafted : 0.0;
+    std::string extra;
+    if (!metrics.adaptive_summary.empty()) {
+        extra += "," + metrics.adaptive_summary;
+    }
+    if (!metrics.hierarchical_summary.empty()) {
+        extra += "," + metrics.hierarchical_summary;
+    }
 
     std::printf(
         "\nVEGAS_RESULT {\"mode\":\"%s\",\"model\":\"%s\","
@@ -815,7 +1644,7 @@ static void print_result(
         "\"accept_rate\":%.6f,\"total_ms\":%.3f,\"tokens_per_second\":%.6f,"
         "\"prompt_ms\":%.3f,\"initial_select_ms\":%.3f,\"draft_ms\":%.3f,"
         "\"verify_ms\":%.3f,\"collect_ms\":%.3f,\"sample_ms\":%.3f,"
-        "\"rollback_ms\":%.3f%s%s}\n",
+        "\"rollback_ms\":%.3f%s}\n",
         mode_name(options.mode), params.model.path.c_str(),
         metrics.n_prompt, metrics.n_predict, options.gamma, options.auto_policy ? "true" : "false",
         options.selection_layer, options.anchor_tokens, options.refresh_interval,
@@ -830,9 +1659,7 @@ static void print_result(
         metrics.prompt_us / 1e3, metrics.initial_select_us / 1e3,
         metrics.draft_us / 1e3, metrics.verify_us / 1e3,
         metrics.collect_us / 1e3, metrics.sample_us / 1e3,
-        metrics.rollback_us / 1e3,
-        metrics.adaptive_summary.empty() ? "" : ",",
-        metrics.adaptive_summary.c_str());
+        metrics.rollback_us / 1e3, extra.c_str());
 }
 
 int main(int argc, char ** argv) {
@@ -873,6 +1700,10 @@ int main(int argc, char ** argv) {
         LOG_ERR("--vegas-adaptive-gamma requires --vegas-mode mtp-vegas\n");
         return 1;
     }
+    if (options.hierarchical_trace && options.mode != vegas_run_mode::mtp_hierarchical) {
+        LOG_ERR("--vegas-hier-trace requires --vegas-mode mtp-hierarchical\n");
+        return 1;
+    }
 
     params.sampling.backend_sampling = false;
     if (options.mode == vegas_run_mode::mtp_auto && params.speculative.has_dft()) {
@@ -880,7 +1711,9 @@ int main(int argc, char ** argv) {
     }
     if (options.mode != vegas_run_mode::baseline) {
         params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
-        params.speculative.draft.n_max = options.gamma;
+        params.speculative.draft.n_max = options.mode == vegas_run_mode::mtp_hierarchical ?
+                options.hierarchical.max_tokens :
+                (options.adaptive_gamma ? vegas_adaptive_gamma::max_gamma : options.gamma);
     }
 
     llama_backend_init();
@@ -911,7 +1744,10 @@ int main(int argc, char ** argv) {
     }
 
     resolve_auto_policy(options, params, model, (int32_t) prompt.size());
-    const int32_t draft_capacity = options.adaptive_gamma ? vegas_adaptive_gamma::max_gamma : options.gamma;
+    const int32_t draft_capacity = options.mode == vegas_run_mode::mtp_hierarchical ?
+            options.hierarchical.max_tokens :
+            (options.adaptive_gamma ? vegas_adaptive_gamma::max_gamma : options.gamma);
+    const int32_t recent_capacity = (options.refresh_interval + 1) * (draft_capacity + 1);
     params.speculative.draft.n_max = draft_capacity;
 
     common_speculative_init_result_ptr spec_init;
@@ -956,15 +1792,15 @@ int main(int argc, char ** argv) {
 
     if (mode_uses_vegas(options.mode) &&
             !llama_vegas_enable(
-                    ctx, options.sparse_ratio, options.min_tokens, options.max_tokens, draft_capacity)) {
+                    ctx, options.sparse_ratio, options.min_tokens, options.max_tokens, recent_capacity)) {
         LOG_ERR("failed to enable Vegas\n");
         return 1;
     }
 
-    if (options.mode == vegas_run_mode::mtp_vegas &&
+    if ((options.mode == vegas_run_mode::mtp_vegas || options.mode == vegas_run_mode::mtp_hierarchical) &&
             !llama_vegas_enable(
                     ctx_dft, options.sparse_ratio, options.min_tokens, options.max_tokens,
-                    draft_capacity * options.refresh_interval)) {
+                    recent_capacity)) {
         LOG_ERR("failed to enable Vegas for MTP context\n");
         return 1;
     }
@@ -978,7 +1814,7 @@ int main(int argc, char ** argv) {
 
     const int32_t selection_layer = options.selection_layer >= 0 ?
             options.selection_layer : llama_model_n_layer(model) - 1;
-    if (options.mode == vegas_run_mode::mtp_vegas) {
+    if (options.mode == vegas_run_mode::mtp_vegas || options.mode == vegas_run_mode::mtp_hierarchical) {
         options.selection_layer = selection_layer;
         if (!llama_vegas_set_selection_layer(ctx, selection_layer)) {
             LOG_ERR("failed to set Vegas target selection layer\n");
@@ -1037,11 +1873,21 @@ int main(int argc, char ** argv) {
     record_token(ctx, id_last, options.quiet, metrics);
     metrics.n_predict = 1;
 
+    if (options.mode == vegas_run_mode::mtp_hierarchical) {
+        llama_set_entropy_output(ctx, true);
+    }
+
     bool ok;
+    hierarchical_metrics hierarchical;
     if (options.mode == vegas_run_mode::baseline) {
         ok = run_baseline(
                 ctx, vocab, sampler.get(), id_last, (int32_t) prompt.size(),
                 params, options, batch, metrics);
+    } else if (options.mode == vegas_run_mode::mtp_hierarchical) {
+        ok = run_mtp_hierarchical(
+                ctx, ctx_dft, spec.get(), vocab, sampler.get(), id_last, (int32_t) prompt.size(),
+                params, options, batch, history, metrics, hierarchical);
+        metrics.hierarchical_summary = hierarchical_summary_json(options, hierarchical);
     } else if (mode_uses_mtp(options.mode)) {
         ok = run_mtp(
                 ctx, ctx_dft, spec.get(), vocab, sampler.get(), id_last, (int32_t) prompt.size(),
@@ -1057,6 +1903,9 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    if (options.mode == vegas_run_mode::mtp_hierarchical) {
+        llama_set_entropy_output(ctx, false);
+    }
     metrics.n_reused = llama_perf_context(ctx).n_reused;
     print_result(params, options, metrics);
     llama_batch_free(batch);

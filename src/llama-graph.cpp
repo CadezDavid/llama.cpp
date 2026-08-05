@@ -15,6 +15,7 @@
 #include "llama-memory-recurrent.h"
 
 #include <cassert>
+#include <cinttypes>
 #include <cmath>
 #include <cstring>
 #include <numeric>
@@ -159,6 +160,11 @@ void llm_graph_input_sparse_kv_plan::set_input(const llama_ubatch * ubatch) {
     GGML_ASSERT(ggml_nelements(plan) == vegas.top_k);
 
     const int32_t active_n_kv = vegas.top_k + std::min(n_kv, ubatch->pos[0] + 1) - vegas.prefix_len;
+    if (active_n_kv > vegas.top_k + vegas.max_recent_tokens) {
+        LLAMA_LOG_ERROR("%s: sparse KV plan overflow: active=%d top_k=%d recent_max=%d n_kv=%d pos=%d prefix=%d\n",
+                __func__, active_n_kv, vegas.top_k, vegas.max_recent_tokens,
+                n_kv, ubatch->pos[0], vegas.prefix_len);
+    }
     GGML_ASSERT(active_n_kv <= vegas.top_k + vegas.max_recent_tokens);
     ggml_flash_attn_ext_set_sparse_kv_n_kv(attention, active_n_kv);
 }
@@ -1343,6 +1349,7 @@ void llm_graph_result::reset() {
     t_sampled.clear();
     t_sampled_probs.clear();
     t_sampled_statistics.clear();
+    t_entropy_statistics.clear();
     t_sampled_logits.clear();
     t_candidates.clear();
 
@@ -1408,6 +1415,11 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
         }
     }
     for (auto & [seq_id, t] : t_sampled_statistics) {
+        if (t != nullptr) {
+            ggml_set_output(t);
+        }
+    }
+    for (auto * t : t_entropy_statistics) {
         if (t != nullptr) {
             ggml_set_output(t);
         }
@@ -1522,6 +1534,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cross            (params.cross),
     vegas            (params.vegas),
     samplers         (params.samplers),
+    entropy_all      (params.entropy_all),
     cb_func          (params.cb),
     res              (params.res),
     ctx0             (res->get_ctx()),
@@ -3929,15 +3942,17 @@ void llm_graph_context::build_pooling(
 }
 
 void llm_graph_context::build_sampling() const {
-    if (samplers.empty() || !res->t_logits) {
+    if ((samplers.empty() && !entropy_all) || !res->t_logits) {
         return;
     }
 
     std::array<ggml_tensor *, 2> outs;
     outs[0] = res->t_logits;
 
-    auto inp_sampling = std::make_unique<llm_graph_input_sampling>(samplers);
-    res->add_input(std::move(inp_sampling));
+    if (!samplers.empty()) {
+        auto inp_sampling = std::make_unique<llm_graph_input_sampling>(samplers);
+        res->add_input(std::move(inp_sampling));
+    }
 
     std::map<llama_seq_id, int32_t> seq_to_logit_row;
     int32_t logit_row_idx = 0;
@@ -4007,6 +4022,26 @@ void llm_graph_context::build_sampling() const {
             res->t_sampled_statistics[seq_id] = data.statistics;
             outs[1] = data.statistics;
             ggml_build_forward_select(gf, outs.data(), outs.size(), i_out);
+        }
+    }
+
+    if (entropy_all) {
+        res->t_entropy_statistics.reserve(res->t_logits->ne[1]);
+        for (int64_t row = 0; row < res->t_logits->ne[1]; ++row) {
+            ggml_tensor * logits = ggml_view_1d(
+                    ctx0, res->t_logits, res->t_logits->ne[0], row * res->t_logits->nb[1]);
+            ggml_tensor * probs = ggml_soft_max(ctx0, logits);
+            ggml_tensor * probs_clamped = ggml_clamp(ctx0, probs, 1e-10f, 1.0f);
+            ggml_tensor * entropy = ggml_scale(ctx0,
+                    ggml_sum(ctx0, ggml_mul(ctx0, probs_clamped, ggml_log(ctx0, probs_clamped))), -1.0f);
+            ggml_tensor * max_idx = ggml_argmax(ctx0, probs);
+            ggml_tensor * probs_rows = ggml_reshape_2d(ctx0, probs, 1, ggml_nelements(probs));
+            ggml_tensor * top_probability = ggml_reshape_1d(ctx0,
+                    ggml_get_rows(ctx0, probs_rows, max_idx), 1);
+            ggml_tensor * statistics = ggml_concat(ctx0, entropy, top_probability, 0);
+            ggml_format_name(statistics, "entropy_statistics_%" PRId64, row);
+            res->t_entropy_statistics.push_back(statistics);
+            ggml_build_forward_expand(gf, statistics);
         }
     }
 

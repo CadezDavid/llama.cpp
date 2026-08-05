@@ -44,6 +44,8 @@ public:
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
+    bool seq_checkpoint_recurrent(llama_seq_id seq_id) override;
+    bool seq_restore_recurrent   (llama_seq_id seq_id) override;
     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
     void seq_keep(llama_seq_id seq_id)                                                          override;
     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
@@ -108,9 +110,20 @@ public:
 
     std::vector<mem_cell> cells;
 
+    bool checkpoint_valid = false;
+    llama_seq_id checkpoint_seq_id = -1;
+    uint32_t checkpoint_head = 0;
+    uint32_t checkpoint_used = 0;
+    uint32_t checkpoint_n = 0;
+    int32_t checkpoint_rs_z = -1;
+    std::vector<uint32_t> checkpoint_rs_idx;
+    std::vector<mem_cell> checkpoint_cells;
+
     // per layer
     std::vector<ggml_tensor *> r_l;
     std::vector<ggml_tensor *> s_l;
+    std::vector<ggml_tensor *> r_checkpoint_l;
+    std::vector<ggml_tensor *> s_checkpoint_l;
 
 private:
     //const llama_model & model;

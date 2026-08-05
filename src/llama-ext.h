@@ -127,7 +127,7 @@ LLAMA_API bool llama_vegas_enable(
                        float sparse_ratio,
                      int32_t min_tokens,
                      int32_t max_tokens,
-                     int32_t max_draft_tokens);
+                     int32_t max_recent_tokens);
 
 LLAMA_API bool llama_vegas_set_selection_layer(
         struct llama_context * ctx,
@@ -151,6 +151,13 @@ LLAMA_API bool llama_vegas_collect_indices(struct llama_context * ctx);
 LLAMA_API bool llama_vegas_copy_indices(
               struct llama_context * dst,
         const struct llama_context * src);
+
+// Compute full-vocabulary entropy and top probability on the backend for every
+// requested logits row, independently of backend token sampling.
+LLAMA_API void llama_set_entropy_output(struct llama_context * ctx, bool enabled);
+
+LLAMA_API bool llama_memory_checkpoint_recurrent(struct llama_context * ctx, llama_seq_id seq_id);
+LLAMA_API bool llama_memory_restore_recurrent   (struct llama_context * ctx, llama_seq_id seq_id);
 
 //
 // model/context data extraction

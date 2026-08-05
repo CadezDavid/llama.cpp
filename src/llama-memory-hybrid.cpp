@@ -149,6 +149,14 @@ bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
     return mem_attn->seq_rm(seq_id, p0, p1);
 }
 
+bool llama_memory_hybrid::seq_checkpoint_recurrent(llama_seq_id seq_id) {
+    return mem_recr->seq_checkpoint_recurrent(seq_id);
+}
+
+bool llama_memory_hybrid::seq_restore_recurrent(llama_seq_id seq_id) {
+    return mem_recr->seq_restore_recurrent(seq_id);
+}
+
 void llama_memory_hybrid::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     mem_attn->seq_cp(seq_id_src, seq_id_dst, p0, p1);
     mem_recr->seq_cp(seq_id_src, seq_id_dst, p0, p1);

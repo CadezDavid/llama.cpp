@@ -51,7 +51,7 @@ llama_memory_recurrent::llama_memory_recurrent(
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
-                /*.mem_size   =*/ size_t(2u*n_layer*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t((n_rs_seq > 0 ? 4u : 2u)*n_layer*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -71,6 +71,8 @@ llama_memory_recurrent::llama_memory_recurrent(
 
     r_l.resize(n_layer);
     s_l.resize(n_layer);
+    r_checkpoint_l.resize(n_layer);
+    s_checkpoint_l.resize(n_layer);
 
     for (int i = 0; i < n_layer; i++) {
         if (filter && !filter(i)) {
@@ -103,6 +105,14 @@ llama_memory_recurrent::llama_memory_recurrent(
         ggml_format_name(s, "cache_s_l%d", i);
         r_l[i] = r;
         s_l[i] = s;
+        if (n_rs_seq > 0) {
+            ggml_tensor * r_checkpoint = ggml_new_tensor_2d(ctx, type_r, hparams.n_embd_r(), mem_size);
+            ggml_tensor * s_checkpoint = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), mem_size);
+            ggml_format_name(r_checkpoint, "cache_r_checkpoint_l%d", i);
+            ggml_format_name(s_checkpoint, "cache_s_checkpoint_l%d", i);
+            r_checkpoint_l[i] = r_checkpoint;
+            s_checkpoint_l[i] = s_checkpoint;
+        }
     }
 
     // allocate tensors and initialize the buffers to avoid NaNs in the padding
@@ -229,6 +239,78 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
         head = new_head;
     }
 
+    return true;
+}
+
+static void recurrent_copy_group_to_checkpoint(
+        ggml_tensor * tensor, uint32_t group_size, uint32_t src_group, ggml_tensor * checkpoint) {
+    if (tensor == nullptr || checkpoint == nullptr) {
+        return;
+    }
+    ggml_tensor src = *tensor;
+    std::copy(std::begin(checkpoint->ne), std::end(checkpoint->ne), std::begin(src.ne));
+    std::copy(std::begin(checkpoint->nb), std::end(checkpoint->nb), std::begin(src.nb));
+    src.data = (char *) tensor->data + (size_t) src_group * group_size * tensor->nb[1];
+    ggml_backend_tensor_copy(&src, checkpoint);
+}
+
+static void recurrent_copy_checkpoint_to_group(
+        ggml_tensor * checkpoint, ggml_tensor * tensor, uint32_t group_size, uint32_t dst_group) {
+    if (tensor == nullptr || checkpoint == nullptr) {
+        return;
+    }
+    ggml_tensor dst = *tensor;
+    std::copy(std::begin(checkpoint->ne), std::end(checkpoint->ne), std::begin(dst.ne));
+    std::copy(std::begin(checkpoint->nb), std::end(checkpoint->nb), std::begin(dst.nb));
+    dst.data = (char *) tensor->data + (size_t) dst_group * group_size * tensor->nb[1];
+    ggml_backend_tensor_copy(checkpoint, &dst);
+}
+
+bool llama_memory_recurrent::seq_checkpoint_recurrent(llama_seq_id seq_id) {
+    if (n_rs_seq == 0 || seq_id < 0 || (size_t) seq_id >= rs_idx.size()) {
+        return false;
+    }
+
+    const uint32_t source_group = rs_idx[seq_id];
+
+    // Use the logical source group because an accepted-prefix rollback from
+    // the previous dense verification may not have been consumed yet. The
+    // checkpoint tensors are separate because one-token recurrent graphs can
+    // overwrite every regular rollback group.
+    for (size_t il = 0; il < r_l.size(); ++il) {
+        recurrent_copy_group_to_checkpoint(r_l[il], size, source_group, r_checkpoint_l[il]);
+        recurrent_copy_group_to_checkpoint(s_l[il], size, source_group, s_checkpoint_l[il]);
+    }
+    checkpoint_valid  = true;
+    checkpoint_seq_id = seq_id;
+    checkpoint_head   = head;
+    checkpoint_used   = used;
+    checkpoint_n      = n;
+    checkpoint_rs_z   = rs_z;
+    checkpoint_rs_idx = rs_idx;
+    checkpoint_cells  = cells;
+    return true;
+}
+
+bool llama_memory_recurrent::seq_restore_recurrent(llama_seq_id seq_id) {
+    if (n_rs_seq == 0 || !checkpoint_valid || seq_id != checkpoint_seq_id ||
+            seq_id < 0 || (size_t) seq_id >= rs_idx.size()) {
+        return false;
+    }
+
+    for (size_t il = 0; il < r_l.size(); ++il) {
+        recurrent_copy_checkpoint_to_group(r_checkpoint_l[il], r_l[il], size, n_rs_seq);
+        recurrent_copy_checkpoint_to_group(s_checkpoint_l[il], s_l[il], size, n_rs_seq);
+    }
+
+    head   = checkpoint_head;
+    used   = checkpoint_used;
+    n      = checkpoint_n;
+    rs_z   = checkpoint_rs_z;
+    rs_idx = checkpoint_rs_idx;
+    cells  = checkpoint_cells;
+    set_rs_idx(seq_id, n_rs_seq);
+    checkpoint_valid = false;
     return true;
 }
 
@@ -714,6 +796,11 @@ size_t llama_memory_recurrent::size_r_bytes() const {
             size_r_bytes += ggml_nbytes(r);
         }
     }
+    for (const auto & r : r_checkpoint_l) {
+        if (r != nullptr) {
+            size_r_bytes += ggml_nbytes(r);
+        }
+    }
 
     return size_r_bytes;
 }
@@ -722,6 +809,11 @@ size_t llama_memory_recurrent::size_s_bytes() const {
     size_t size_s_bytes = 0;
 
     for (const auto & s : s_l) {
+        if (s != nullptr) {
+            size_s_bytes += ggml_nbytes(s);
+        }
+    }
+    for (const auto & s : s_checkpoint_l) {
         if (s != nullptr) {
             size_s_bytes += ggml_nbytes(s);
         }

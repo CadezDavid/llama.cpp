@@ -117,6 +117,11 @@ struct llama_memory_i {
     virtual void clear(bool data) = 0;
 
     virtual bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) = 0;
+    // Preserve and restore recurrent state across a sequence of independently
+    // decoded tokens. Attention-only memories intentionally use the no-op
+    // defaults; their tail can be restored with seq_rm().
+    virtual bool seq_checkpoint_recurrent(llama_seq_id seq_id) { (void) seq_id; return true; }
+    virtual bool seq_restore_recurrent   (llama_seq_id seq_id) { (void) seq_id; return true; }
     virtual void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) = 0;
     virtual void seq_keep(llama_seq_id seq_id) = 0;
     virtual void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) = 0;

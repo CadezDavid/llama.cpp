@@ -121,7 +121,7 @@ struct llama_context {
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
-    bool vegas_enable(float sparse_ratio, int32_t min_tokens, int32_t max_tokens, int32_t max_draft_tokens);
+    bool vegas_enable(float sparse_ratio, int32_t min_tokens, int32_t max_tokens, int32_t max_recent_tokens);
     bool vegas_set_selection_layer(int32_t il);
     bool vegas_set_anchor_tokens(int32_t n_tokens);
     void vegas_set_mode(llama_vegas_mode mode, int32_t prefix_len);
@@ -263,6 +263,7 @@ public:
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
+    void set_entropy_output(bool enabled);
 
 private:
     llm_graph_params graph_params(
@@ -324,6 +325,7 @@ private:
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active
         std::map<llama_seq_id, llama_sampler *> samplers;
+        bool entropy_all = false;
 
         buffer_view<float>       logits     = {nullptr, 0};
         buffer_view<llama_token> sampled    = {nullptr, 0};
