@@ -57,6 +57,7 @@ def parse_args():
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--predict", type=int, default=128)
     parser.add_argument("--repetitions", type=int, default=1)
+    parser.add_argument("--ratio", type=float)
     parser.add_argument("--configurations", nargs="+", choices=CONFIGURATIONS, default=list(CONFIGURATIONS))
     return parser.parse_args()
 
@@ -83,7 +84,7 @@ def make_args(args, config):
         hier_max_corrections=2,
         hier_trace=True,
         mtp_ubatch=config["ubatch"],
-        ratio=config["ratio"],
+        ratio=args.ratio if args.ratio is not None else config["ratio"],
         selection_layer=config["selection_layer"],
         anchor_tokens=config["anchor_tokens"],
         refresh_interval=config["refresh_interval"],
