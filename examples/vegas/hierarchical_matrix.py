@@ -42,6 +42,7 @@ CONTEXTS = {
 }
 
 MODES = ("mtp", "mtp-vegas", "mtp-hierarchical")
+KERNELS = ("direct", "gather")
 RATIOS = (1.0, 0.75, 0.5, 0.35, 0.2, 0.1)
 HORIZONS = (8, 12, 20, 32, 50)
 
@@ -53,6 +54,7 @@ def parse_args():
     parser.add_argument("--models", nargs="+", choices=MODELS, default=list(MODELS))
     parser.add_argument("--contexts", nargs="+", choices=CONTEXTS, default=list(CONTEXTS))
     parser.add_argument("--modes", nargs="+", choices=MODES, default=["mtp-hierarchical"])
+    parser.add_argument("--kernels", nargs="+", choices=KERNELS, default=["direct"])
     parser.add_argument("--ratios", nargs="+", type=float, choices=RATIOS, default=[0.5])
     parser.add_argument("--horizons", nargs="+", type=int, choices=HORIZONS, default=list(HORIZONS))
     parser.add_argument("--gamma", type=int, default=3)
@@ -62,7 +64,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def make_args(args, model, context, ratio, horizon, mode):
+def make_args(args, model, context, ratio, horizon, mode, kernel):
     rounds = math.ceil(horizon / args.gamma) + 2
     return SimpleNamespace(
         binary=args.binary,
@@ -100,7 +102,7 @@ def make_args(args, model, context, ratio, horizon, mode):
         temperature=0.0,
         cache_type_k="q8_0",
         cache_type_v="q4_0",
-        sparse_kernel="direct",
+        sparse_kernel=kernel,
         draft_cache_type_k="q8_0",
         draft_cache_type_v="q4_0",
         output=args.output_dir / "results.jsonl",
@@ -118,6 +120,7 @@ def result_key(row):
     return (
         row["configuration"],
         row["requested_mode"],
+        row["requested_sparse_kernel"],
         row["matrix_ratio"],
         row["matrix_horizon"],
         row["repetition"],
@@ -128,6 +131,7 @@ def compact_row(row):
     compact = {
         "configuration": row["configuration"],
         "mode": row["requested_mode"],
+        "kernel": row["requested_sparse_kernel"],
         "ratio": row["matrix_ratio"],
         "horizon": row["matrix_horizon"],
         "repetition": row["repetition"],
@@ -155,7 +159,7 @@ def compact_row(row):
 
 def write_summary(output_dir, results):
     rows = sorted((compact_row(row) for row in results), key=lambda row: (
-        row["configuration"], row["mode"], row["ratio"], row["horizon"], row["repetition"]
+        row["configuration"], row["mode"], row["kernel"], row["ratio"], row["horizon"], row["repetition"]
     ))
     (output_dir / "summary.json").write_text(
         json.dumps({"schema_version": 2, "runs": rows}, indent=2, sort_keys=True) + "\n",
@@ -171,6 +175,7 @@ def ensure_manifest(args):
         "models": args.models,
         "contexts": args.contexts,
         "modes": args.modes,
+        "kernels": args.kernels,
         "ratios": args.ratios,
         "horizons": args.horizons,
         "gamma": args.gamma,
@@ -205,34 +210,36 @@ def main():
                 # Vanilla MTP has no sparse ratio or dense horizon. Run it once per configuration.
                 ratios = [1.0] if mode == "mtp" else args.ratios
                 horizons = [args.gamma] if mode != "mtp-hierarchical" else args.horizons
-                for ratio in ratios:
-                    for horizon in horizons:
-                        for repetition in range(args.repetitions):
-                            key = (configuration, mode, ratio, horizon, repetition)
-                            if key in completed:
-                                continue
-                            print(
-                                f"VEGAS_HIERARCHICAL_START configuration={configuration} mode={mode} "
-                                f"ratio={ratio} horizon={horizon} repetition={repetition}",
-                                flush=True,
-                            )
-                            row = run_one(
-                                make_args(args, model, context, ratio, horizon, mode),
-                                mode,
-                                repetition,
-                                0,
-                            )
-                            row.update({
-                                "configuration": configuration,
-                                "matrix_ratio": ratio,
-                                "matrix_horizon": horizon,
-                            })
-                            results.append(row)
-                            completed.add(key)
-                            with output_path.open("a", encoding="utf-8") as stream:
-                                stream.write(json.dumps(row, sort_keys=True) + "\n")
-                            write_summary(args.output_dir, results)
-                            print("VEGAS_HIERARCHICAL_RESULT " + json.dumps(compact_row(row), sort_keys=True), flush=True)
+                kernels = ["direct"] if mode == "mtp" else args.kernels
+                for kernel in kernels:
+                    for ratio in ratios:
+                        for horizon in horizons:
+                            for repetition in range(args.repetitions):
+                                key = (configuration, mode, kernel, ratio, horizon, repetition)
+                                if key in completed:
+                                    continue
+                                print(
+                                    f"VEGAS_HIERARCHICAL_START configuration={configuration} mode={mode} "
+                                    f"kernel={kernel} ratio={ratio} horizon={horizon} repetition={repetition}",
+                                    flush=True,
+                                )
+                                row = run_one(
+                                    make_args(args, model, context, ratio, horizon, mode, kernel),
+                                    mode,
+                                    repetition,
+                                    0,
+                                )
+                                row.update({
+                                    "configuration": configuration,
+                                    "matrix_ratio": ratio,
+                                    "matrix_horizon": horizon,
+                                })
+                                results.append(row)
+                                completed.add(key)
+                                with output_path.open("a", encoding="utf-8") as stream:
+                                    stream.write(json.dumps(row, sort_keys=True) + "\n")
+                                write_summary(args.output_dir, results)
+                                print("VEGAS_HIERARCHICAL_RESULT " + json.dumps(compact_row(row), sort_keys=True), flush=True)
 
 
 if __name__ == "__main__":
