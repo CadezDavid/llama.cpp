@@ -46,6 +46,7 @@ def parse_args():
     parser.add_argument("--hier-max-rounds", type=int, default=3)
     parser.add_argument("--hier-max-corrections", type=int, default=2)
     parser.add_argument("--hier-trace", action="store_true")
+    parser.add_argument("--same-prefix-trace", action="store_true")
     parser.add_argument("--self-gamma", type=int)
     parser.add_argument("--mtp-gamma", type=int)
     parser.add_argument("--mtp-ubatch", type=int, default=128)
@@ -73,7 +74,7 @@ def command_for(args, mode):
     if mode == "vegas" and args.self_gamma is not None:
         gamma = args.self_gamma
     mtp_modes = {"mtp", "mtp-vegas", "mtp-auto", "mtp-hierarchical"}
-    vegas_modes = {"vegas", "mtp-vegas", "mtp-hierarchical"}
+    vegas_modes = {"vegas", "mtp-vegas", "mtp-hierarchical", "same-prefix"}
     if mode in mtp_modes and args.mtp_gamma is not None:
         gamma = args.mtp_gamma
 
@@ -119,9 +120,9 @@ def command_for(args, mode):
             "--vegas-min-tokens", str(args.min_tokens),
             "--vegas-anchor-tokens", str(args.anchor_tokens),
         ])
-    if mode in {"mtp-vegas", "mtp-hierarchical"} and args.selection_layer is not None:
+    if mode in {"mtp-vegas", "mtp-hierarchical", "same-prefix"} and args.selection_layer is not None:
         command.extend(["--vegas-selection-layer", str(args.selection_layer)])
-    if mode in {"mtp-vegas", "mtp-hierarchical"}:
+    if mode in {"mtp-vegas", "mtp-hierarchical", "same-prefix"}:
         command.extend(["--vegas-refresh-interval", str(args.refresh_interval)])
     if mode == "mtp-hierarchical":
         command.extend([
@@ -132,6 +133,8 @@ def command_for(args, mode):
         ])
         if args.hier_trace:
             command.append("--vegas-hier-trace")
+    if mode == "same-prefix" and getattr(args, "same_prefix_trace", False):
+        command.append("--vegas-same-prefix-trace")
     return command
 
 
@@ -192,6 +195,7 @@ def run_one(args, mode, repetition, order):
         "requested_hier_max_rounds": args.hier_max_rounds,
         "requested_hier_max_corrections": args.hier_max_corrections,
         "requested_hier_trace": args.hier_trace,
+        "requested_same_prefix_trace": getattr(args, "same_prefix_trace", False),
         "requested_draft_cache_type_k": args.draft_cache_type_k or args.cache_type_k,
         "requested_draft_cache_type_v": args.draft_cache_type_v or args.cache_type_v,
     })

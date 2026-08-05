@@ -5,6 +5,7 @@
 #include "speculative.h"
 #include "adaptive-gamma.h"
 #include "hierarchical-policy.h"
+#include "same-prefix.h"
 #include "llama-ext.h"
 #include "llama.h"
 
@@ -31,6 +32,7 @@ enum class vegas_run_mode {
     mtp_vegas,
     mtp_hierarchical,
     mtp_auto,
+    same_prefix,
 };
 
 struct vegas_options {
@@ -49,6 +51,7 @@ struct vegas_options {
     float adaptive_beta = 0.9f;
     vegas_hierarchical_limits hierarchical;
     bool hierarchical_trace = false;
+    bool same_prefix_trace = false;
     bool quiet = false;
 };
 
@@ -86,6 +89,75 @@ struct vegas_metrics {
     uint64_t output_hash = UINT64_C(1469598103934665603);
     std::string adaptive_summary;
     std::string hierarchical_summary;
+    std::string same_prefix_summary;
+};
+
+struct same_prefix_step_trace {
+    int32_t position = 0;
+    int32_t sampled_dense_token = -1;
+    vegas_same_prefix_comparison comparison;
+    int64_t sparse_us = 0;
+    int64_t dense_us = 0;
+    int64_t state_us = 0;
+    int64_t rollback_us = 0;
+    int64_t comparison_us = 0;
+};
+
+struct same_prefix_metrics {
+    int64_t sparse_us = 0;
+    int64_t dense_us = 0;
+    int64_t state_us = 0;
+    int64_t rollback_us = 0;
+    int64_t comparison_us = 0;
+    int64_t probes = 0;
+    int64_t top1_matches = 0;
+    int64_t snapshot_failures = 0;
+    int64_t rollback_failures = 0;
+    int64_t position_mismatches = 0;
+
+    double dense_entropy_sum = 0.0;
+    double sparse_entropy_sum = 0.0;
+    double dense_top_probability_sum = 0.0;
+    double sparse_top_probability_sum = 0.0;
+    double dense_margin_sum = 0.0;
+    double sparse_margin_sum = 0.0;
+    double sparse_probability_of_dense_top1_sum = 0.0;
+    double dense_probability_of_sparse_top1_sum = 0.0;
+    double dense_top_rank_in_sparse_sum = 0.0;
+    double sparse_top_rank_in_dense_sum = 0.0;
+    double kl_dense_sparse_sum = 0.0;
+    double kl_sparse_dense_sum = 0.0;
+    double jensen_shannon_sum = 0.0;
+    double total_variation_sum = 0.0;
+    double top_k_overlap_sum = 0.0;
+
+    std::vector<same_prefix_step_trace> traces;
+
+    void add(const same_prefix_step_trace & trace) {
+        const auto & comparison = trace.comparison;
+        probes++;
+        top1_matches += comparison.top1_match;
+        sparse_us += trace.sparse_us;
+        dense_us += trace.dense_us;
+        state_us += trace.state_us;
+        rollback_us += trace.rollback_us;
+        comparison_us += trace.comparison_us;
+        dense_entropy_sum += comparison.dense.entropy;
+        sparse_entropy_sum += comparison.sparse.entropy;
+        dense_top_probability_sum += comparison.dense.top_probability;
+        sparse_top_probability_sum += comparison.sparse.top_probability;
+        dense_margin_sum += comparison.dense.top_margin;
+        sparse_margin_sum += comparison.sparse.top_margin;
+        sparse_probability_of_dense_top1_sum += comparison.sparse_probability_of_dense_top1;
+        dense_probability_of_sparse_top1_sum += comparison.dense_probability_of_sparse_top1;
+        dense_top_rank_in_sparse_sum += comparison.dense_top_rank_in_sparse;
+        sparse_top_rank_in_dense_sum += comparison.sparse_top_rank_in_dense;
+        kl_dense_sparse_sum += comparison.kl_dense_sparse;
+        kl_sparse_dense_sum += comparison.kl_sparse_dense;
+        jensen_shannon_sum += comparison.jensen_shannon;
+        total_variation_sum += comparison.total_variation;
+        top_k_overlap_sum += comparison.top_k_overlap;
+    }
 };
 
 enum class hierarchical_token_source : int32_t {
@@ -285,13 +357,15 @@ static const char * mode_name(vegas_run_mode mode) {
         case vegas_run_mode::mtp_vegas:  return "mtp-vegas";
         case vegas_run_mode::mtp_hierarchical: return "mtp-hierarchical";
         case vegas_run_mode::mtp_auto:   return "mtp-auto";
+        case vegas_run_mode::same_prefix: return "same-prefix";
     }
     return "unknown";
 }
 
 static bool mode_uses_vegas(vegas_run_mode mode) {
     return mode == vegas_run_mode::vegas || mode == vegas_run_mode::mtp_vegas ||
-            mode == vegas_run_mode::mtp_hierarchical || mode == vegas_run_mode::mtp_auto;
+            mode == vegas_run_mode::mtp_hierarchical || mode == vegas_run_mode::mtp_auto ||
+            mode == vegas_run_mode::same_prefix;
 }
 
 static bool mode_uses_mtp(vegas_run_mode mode) {
@@ -353,6 +427,10 @@ static bool parse_vegas_options(
             options.hierarchical_trace = true;
             continue;
         }
+        if (arg == "--vegas-same-prefix-trace") {
+            options.same_prefix_trace = true;
+            continue;
+        }
 
         if (const char * value = get_value("--vegas-mode")) {
             if (std::strcmp(value, "baseline") == 0) {
@@ -370,6 +448,8 @@ static bool parse_vegas_options(
             } else if (std::strcmp(value, "mtp-auto") == 0) {
                 options.mode = vegas_run_mode::mtp_auto;
                 options.auto_policy = true;
+            } else if (std::strcmp(value, "same-prefix") == 0) {
+                options.mode = vegas_run_mode::same_prefix;
             } else {
                 LOG_ERR("invalid --vegas-mode: %s\n", value);
                 return false;
@@ -664,6 +744,142 @@ static bool run_baseline(
 
         ++n_past;
         ++metrics.n_predict;
+        id_last = next;
+        record_token(ctx, id_last, options.quiet, metrics);
+        has_eog = llama_vocab_is_eog(vocab, id_last);
+    }
+
+    metrics.total_us = ggml_time_us() - start;
+    return true;
+}
+
+static bool run_same_prefix_diagnostic(
+        llama_context * ctx,
+        const llama_vocab * vocab,
+        common_sampler * sampler,
+        llama_token id_last,
+        int32_t n_past,
+        const common_params & params,
+        const vegas_options & options,
+        llama_batch & batch,
+        vegas_metrics & metrics,
+        same_prefix_metrics & diagnostic) {
+    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+    if (n_vocab <= 0) {
+        LOG_ERR("same-prefix diagnostic requires a non-empty vocabulary\n");
+        return false;
+    }
+
+    bool has_eog = false;
+    const int64_t start = ggml_time_us();
+    while (!has_eog && (params.n_predict < 0 || metrics.n_predict < params.n_predict)) {
+        same_prefix_step_trace trace;
+        trace.position = n_past;
+
+        const llama_pos pos_before = llama_memory_seq_pos_max(llama_get_memory(ctx), 0);
+        if (pos_before != n_past - 1) {
+            diagnostic.position_mismatches++;
+            LOG_ERR("same-prefix state mismatch before probe: actual=%d expected=%d\n",
+                    (int) pos_before, n_past - 1);
+            return false;
+        }
+
+        const int64_t checkpoint_start = ggml_time_us();
+        if (!llama_memory_checkpoint_recurrent(ctx, 0)) {
+            diagnostic.snapshot_failures++;
+            LOG_ERR("failed to checkpoint recurrent state before same-prefix sparse probe\n");
+            return false;
+        }
+        trace.state_us += ggml_time_us() - checkpoint_start;
+
+        if (!llama_vegas_resume_draft(ctx)) {
+            LOG_ERR("failed to resume Vegas plan for same-prefix sparse probe\n");
+            return false;
+        }
+
+        const int64_t sparse_start = ggml_time_us();
+        if (!decode_one(ctx, batch, id_last, n_past)) {
+            return false;
+        }
+        llama_synchronize(ctx);
+        trace.sparse_us = ggml_time_us() - sparse_start;
+
+        const float * sparse_data = llama_get_logits_ith(ctx, 0);
+        if (sparse_data == nullptr) {
+            LOG_ERR("same-prefix sparse probe did not produce logits\n");
+            return false;
+        }
+        std::vector<float> sparse_logits(sparse_data, sparse_data + n_vocab);
+
+        llama_vegas_pause(ctx);
+        const int64_t rollback_start = ggml_time_us();
+        const bool removed = remove_after(ctx, n_past);
+        const bool recurrent_restored = llama_memory_restore_recurrent(ctx, 0);
+        trace.rollback_us = ggml_time_us() - rollback_start;
+        if (!removed || !recurrent_restored) {
+            diagnostic.rollback_failures++;
+            LOG_ERR("failed to restore identical prefix after sparse probe: remove=%d recurrent=%d\n",
+                    removed, recurrent_restored);
+            return false;
+        }
+
+        const llama_pos restored_pos = llama_memory_seq_pos_max(llama_get_memory(ctx), 0);
+        if (restored_pos != n_past - 1) {
+            diagnostic.position_mismatches++;
+            LOG_ERR("same-prefix rollback mismatch: actual=%d expected=%d\n",
+                    (int) restored_pos, n_past - 1);
+            return false;
+        }
+
+        llama_vegas_set_mode(ctx, LLAMA_VEGAS_MODE_VERIFY, n_past + 1);
+        const int64_t dense_start = ggml_time_us();
+        if (!decode_one(ctx, batch, id_last, n_past)) {
+            return false;
+        }
+        llama_synchronize(ctx);
+        trace.dense_us = ggml_time_us() - dense_start;
+
+        const float * dense_data = llama_get_logits_ith(ctx, 0);
+        if (dense_data == nullptr) {
+            LOG_ERR("same-prefix dense probe did not produce logits\n");
+            return false;
+        }
+        std::vector<float> dense_logits(dense_data, dense_data + n_vocab);
+
+        const int64_t collect_start = ggml_time_us();
+        if (!llama_vegas_collect_indices(ctx)) {
+            LOG_ERR("failed to refresh Vegas indices after same-prefix dense probe\n");
+            return false;
+        }
+        metrics.collect_us += ggml_time_us() - collect_start;
+
+        const int64_t comparison_start = ggml_time_us();
+        trace.comparison = vegas_same_prefix_compare(dense_logits, sparse_logits, 10);
+        trace.comparison_us = ggml_time_us() - comparison_start;
+
+        const int64_t sample_start = ggml_time_us();
+        const llama_token next = common_sampler_sample(sampler, ctx, 0, true);
+        common_sampler_accept(sampler, next, true);
+        metrics.sample_us += ggml_time_us() - sample_start;
+        trace.sampled_dense_token = next;
+
+        diagnostic.add(trace);
+        if (options.same_prefix_trace) {
+            diagnostic.traces.push_back(trace);
+        }
+        metrics.draft_us += trace.sparse_us;
+        metrics.verify_us += trace.dense_us;
+        metrics.rollback_us += trace.rollback_us;
+        metrics.n_drafted++;
+        if (trace.comparison.top1_match) {
+            metrics.n_accepted++;
+        } else {
+            metrics.n_rejected++;
+        }
+        metrics.n_cycles++;
+        metrics.n_predict++;
+
+        n_past++;
         id_last = next;
         record_token(ctx, id_last, options.quiet, metrics);
         has_eog = llama_vocab_is_eog(vocab, id_last);
@@ -1615,6 +1831,88 @@ static std::string hierarchical_summary_json(
     return out.str();
 }
 
+static std::string same_prefix_summary_json(
+        const vegas_options & options,
+        const same_prefix_metrics & metrics) {
+    const auto mean = [&](double sum) {
+        return metrics.probes > 0 ? sum / metrics.probes : 0.0;
+    };
+
+    std::ostringstream out;
+    out << "\"same_prefix\":true"
+        << ",\"same_prefix_trace_schema\":1"
+        << ",\"same_prefix_distribution\":\"raw_softmax\""
+        << ",\"same_prefix_top_k\":10"
+        << ",\"same_prefix_probes\":" << metrics.probes
+        << ",\"same_prefix_top1_matches\":" << metrics.top1_matches
+        << ",\"same_prefix_top1_agreement\":" << mean(metrics.top1_matches)
+        << ",\"same_prefix_mean_dense_entropy\":" << mean(metrics.dense_entropy_sum)
+        << ",\"same_prefix_mean_sparse_entropy\":" << mean(metrics.sparse_entropy_sum)
+        << ",\"same_prefix_mean_dense_top_probability\":" << mean(metrics.dense_top_probability_sum)
+        << ",\"same_prefix_mean_sparse_top_probability\":" << mean(metrics.sparse_top_probability_sum)
+        << ",\"same_prefix_mean_dense_margin\":" << mean(metrics.dense_margin_sum)
+        << ",\"same_prefix_mean_sparse_margin\":" << mean(metrics.sparse_margin_sum)
+        << ",\"same_prefix_mean_sparse_probability_of_dense_top1\":"
+        << mean(metrics.sparse_probability_of_dense_top1_sum)
+        << ",\"same_prefix_mean_dense_probability_of_sparse_top1\":"
+        << mean(metrics.dense_probability_of_sparse_top1_sum)
+        << ",\"same_prefix_mean_dense_top_rank_in_sparse\":" << mean(metrics.dense_top_rank_in_sparse_sum)
+        << ",\"same_prefix_mean_sparse_top_rank_in_dense\":" << mean(metrics.sparse_top_rank_in_dense_sum)
+        << ",\"same_prefix_mean_kl_dense_sparse\":" << mean(metrics.kl_dense_sparse_sum)
+        << ",\"same_prefix_mean_kl_sparse_dense\":" << mean(metrics.kl_sparse_dense_sum)
+        << ",\"same_prefix_mean_jensen_shannon\":" << mean(metrics.jensen_shannon_sum)
+        << ",\"same_prefix_mean_total_variation\":" << mean(metrics.total_variation_sum)
+        << ",\"same_prefix_mean_top10_overlap\":" << mean(metrics.top_k_overlap_sum)
+        << ",\"same_prefix_sparse_ms\":" << metrics.sparse_us / 1e3
+        << ",\"same_prefix_dense_ms\":" << metrics.dense_us / 1e3
+        << ",\"same_prefix_state_ms\":" << metrics.state_us / 1e3
+        << ",\"same_prefix_rollback_ms\":" << metrics.rollback_us / 1e3
+        << ",\"same_prefix_comparison_ms\":" << metrics.comparison_us / 1e3
+        << ",\"same_prefix_snapshot_failures\":" << metrics.snapshot_failures
+        << ",\"same_prefix_rollback_failures\":" << metrics.rollback_failures
+        << ",\"same_prefix_position_mismatches\":" << metrics.position_mismatches;
+
+    if (options.same_prefix_trace) {
+        out << ",\"same_prefix_trace\":[";
+        for (size_t i = 0; i < metrics.traces.size(); ++i) {
+            if (i > 0) out << ",";
+            const auto & trace = metrics.traces[i];
+            const auto & comparison = trace.comparison;
+            out << "{\"position\":" << trace.position
+                << ",\"sampled_dense_token\":" << trace.sampled_dense_token
+                << ",\"dense_top_token\":" << comparison.dense.top_token
+                << ",\"sparse_top_token\":" << comparison.sparse.top_token
+                << ",\"top1_match\":" << (comparison.top1_match ? "true" : "false")
+                << ",\"dense_entropy\":" << comparison.dense.entropy
+                << ",\"sparse_entropy\":" << comparison.sparse.entropy
+                << ",\"dense_top_probability\":" << comparison.dense.top_probability
+                << ",\"sparse_top_probability\":" << comparison.sparse.top_probability
+                << ",\"dense_margin\":" << comparison.dense.top_margin
+                << ",\"sparse_margin\":" << comparison.sparse.top_margin
+                << ",\"sparse_probability_of_dense_top1\":"
+                << comparison.sparse_probability_of_dense_top1
+                << ",\"dense_probability_of_sparse_top1\":"
+                << comparison.dense_probability_of_sparse_top1
+                << ",\"dense_top_rank_in_sparse\":" << comparison.dense_top_rank_in_sparse
+                << ",\"sparse_top_rank_in_dense\":" << comparison.sparse_top_rank_in_dense
+                << ",\"kl_dense_sparse\":" << comparison.kl_dense_sparse
+                << ",\"kl_sparse_dense\":" << comparison.kl_sparse_dense
+                << ",\"jensen_shannon\":" << comparison.jensen_shannon
+                << ",\"total_variation\":" << comparison.total_variation
+                << ",\"top10_overlap\":" << comparison.top_k_overlap
+                << ",\"sparse_ms\":" << trace.sparse_us / 1e3
+                << ",\"dense_ms\":" << trace.dense_us / 1e3
+                << ",\"state_ms\":" << trace.state_us / 1e3
+                << ",\"rollback_ms\":" << trace.rollback_us / 1e3
+                << ",\"comparison_ms\":" << trace.comparison_us / 1e3
+                << "}";
+        }
+        out << "]";
+    }
+
+    return out.str();
+}
+
 static void print_result(
         const common_params & params,
         const vegas_options & options,
@@ -1629,6 +1927,9 @@ static void print_result(
     }
     if (!metrics.hierarchical_summary.empty()) {
         extra += "," + metrics.hierarchical_summary;
+    }
+    if (!metrics.same_prefix_summary.empty()) {
+        extra += "," + metrics.same_prefix_summary;
     }
 
     std::printf(
@@ -1704,6 +2005,10 @@ int main(int argc, char ** argv) {
         LOG_ERR("--vegas-hier-trace requires --vegas-mode mtp-hierarchical\n");
         return 1;
     }
+    if (options.same_prefix_trace && options.mode != vegas_run_mode::same_prefix) {
+        LOG_ERR("--vegas-same-prefix-trace requires --vegas-mode same-prefix\n");
+        return 1;
+    }
 
     params.sampling.backend_sampling = false;
     if (options.mode == vegas_run_mode::mtp_auto && params.speculative.has_dft()) {
@@ -1745,8 +2050,8 @@ int main(int argc, char ** argv) {
 
     resolve_auto_policy(options, params, model, (int32_t) prompt.size());
     const int32_t draft_capacity = options.mode == vegas_run_mode::mtp_hierarchical ?
-            options.hierarchical.max_tokens :
-            (options.adaptive_gamma ? vegas_adaptive_gamma::max_gamma : options.gamma);
+            options.hierarchical.max_tokens : options.mode == vegas_run_mode::same_prefix ?
+            1 : (options.adaptive_gamma ? vegas_adaptive_gamma::max_gamma : options.gamma);
     // A reused plan can straddle the previous verification block, the current
     // provisional block, and one MTP boundary block. Reserve that full guard
     // block; the runtime still attends only the active recent span.
@@ -1817,7 +2122,8 @@ int main(int argc, char ** argv) {
 
     const int32_t selection_layer = options.selection_layer >= 0 ?
             options.selection_layer : llama_model_n_layer(model) - 1;
-    if (options.mode == vegas_run_mode::mtp_vegas || options.mode == vegas_run_mode::mtp_hierarchical) {
+    if (options.mode == vegas_run_mode::mtp_vegas || options.mode == vegas_run_mode::mtp_hierarchical ||
+            options.mode == vegas_run_mode::same_prefix) {
         options.selection_layer = selection_layer;
         if (!llama_vegas_set_selection_layer(ctx, selection_layer)) {
             LOG_ERR("failed to set Vegas target selection layer\n");
@@ -1882,10 +2188,16 @@ int main(int argc, char ** argv) {
 
     bool ok;
     hierarchical_metrics hierarchical;
+    same_prefix_metrics same_prefix;
     if (options.mode == vegas_run_mode::baseline) {
         ok = run_baseline(
                 ctx, vocab, sampler.get(), id_last, (int32_t) prompt.size(),
                 params, options, batch, metrics);
+    } else if (options.mode == vegas_run_mode::same_prefix) {
+        ok = run_same_prefix_diagnostic(
+                ctx, vocab, sampler.get(), id_last, (int32_t) prompt.size(),
+                params, options, batch, metrics, same_prefix);
+        metrics.same_prefix_summary = same_prefix_summary_json(options, same_prefix);
     } else if (options.mode == vegas_run_mode::mtp_hierarchical) {
         ok = run_mtp_hierarchical(
                 ctx, ctx_dft, spec.get(), vocab, sampler.get(), id_last, (int32_t) prompt.size(),
