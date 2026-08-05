@@ -1747,10 +1747,10 @@ int main(int argc, char ** argv) {
     const int32_t draft_capacity = options.mode == vegas_run_mode::mtp_hierarchical ?
             options.hierarchical.max_tokens :
             (options.adaptive_gamma ? vegas_adaptive_gamma::max_gamma : options.gamma);
-    // Include both MTP boundary positions around the verification and draft
-    // spans. Qwen MoE can reach both extras when an inner round starts after a
-    // fully accepted block.
-    const int32_t recent_capacity = (options.refresh_interval + 1) * (draft_capacity + 1) + 2;
+    // A reused plan can straddle the previous verification block, the current
+    // provisional block, and one MTP boundary block. Reserve that full guard
+    // block; the runtime still attends only the active recent span.
+    const int32_t recent_capacity = (options.refresh_interval + 2) * (draft_capacity + 1);
     params.speculative.draft.n_max = draft_capacity;
 
     common_speculative_init_result_ptr spec_init;
