@@ -7,6 +7,12 @@
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
 
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <mutex>
+#include <unordered_map>
+
 static __global__ void gather_dequant_q8_turbo4_f16(
         const char * __restrict__ K,
         const char * __restrict__ V,
@@ -60,7 +66,33 @@ static __global__ void gather_dequant_q8_turbo4_f16(
     V_f16[i] = __float2half(vval);
 }
 
+static __global__ void sparse_fattn_compare_outputs(
+        const float * __restrict__ reference,
+        const float * __restrict__ candidate,
+        float * __restrict__ error_sums,
+        int * __restrict__ invalid,
+        int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+
+    const float ref = reference[i];
+    const float value = candidate[i];
+    if (!isfinite(ref) || !isfinite(value)) {
+        atomicExch(invalid, 1);
+        return;
+    }
+    const float diff = value - ref;
+    atomicAdd(error_sums + 0, diff * diff);
+    atomicAdd(error_sums + 1, ref * ref);
+}
+
 static void ggml_cuda_flash_attn_ext_sparse_gather(
+        ggml_backend_cuda_context & ctx,
+        ggml_tensor * dst);
+
+static void ggml_cuda_flash_attn_ext_vec(
         ggml_backend_cuda_context & ctx,
         ggml_tensor * dst);
 
@@ -530,6 +562,316 @@ static void ggml_cuda_flash_attn_ext_sparse_mma_q8_turbo4(
             512, 512, 1, 8, GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0>(ctx, dst);
 }
 
+enum class sparse_q8_turbo4_impl : uint8_t {
+    direct,
+    fused_mma,
+    gather_f16,
+};
+
+static const char * sparse_q8_turbo4_impl_name(sparse_q8_turbo4_impl impl) {
+    switch (impl) {
+        case sparse_q8_turbo4_impl::direct:     return "direct";
+        case sparse_q8_turbo4_impl::fused_mma:  return "fused_mma";
+        case sparse_q8_turbo4_impl::gather_f16: return "gather_f16";
+    }
+    GGML_ABORT("invalid q8/Turbo4 sparse implementation");
+}
+
+static void ggml_cuda_flash_attn_ext_sparse_q8_turbo4_launch(
+        ggml_backend_cuda_context & ctx,
+        ggml_tensor * dst,
+        sparse_q8_turbo4_impl impl) {
+    switch (impl) {
+        case sparse_q8_turbo4_impl::direct:
+            ggml_cuda_flash_attn_ext_vec(ctx, dst);
+            return;
+        case sparse_q8_turbo4_impl::fused_mma:
+            ggml_cuda_flash_attn_ext_sparse_mma_q8_turbo4(ctx, dst);
+            return;
+        case sparse_q8_turbo4_impl::gather_f16:
+            ggml_cuda_flash_attn_ext_sparse_gather(ctx, dst);
+            return;
+    }
+    GGML_ABORT("invalid q8/Turbo4 sparse implementation");
+}
+
+struct sparse_q8_turbo4_tune_key {
+    int device;
+    int cc;
+    int dk;
+    int dv;
+    int n_head_kv;
+    int gqa_ratio;
+    int64_t context_bucket;
+    int64_t selected_bucket;
+    int layout;
+
+    bool operator==(const sparse_q8_turbo4_tune_key & other) const {
+        return device == other.device && cc == other.cc && dk == other.dk && dv == other.dv &&
+                n_head_kv == other.n_head_kv && gqa_ratio == other.gqa_ratio &&
+                context_bucket == other.context_bucket && selected_bucket == other.selected_bucket &&
+                layout == other.layout;
+    }
+};
+
+struct sparse_q8_turbo4_tune_key_hash {
+    size_t operator()(const sparse_q8_turbo4_tune_key & key) const {
+        size_t h = 0xcbf29ce484222325ULL;
+        const auto mix = [&h](uint64_t value) {
+            h ^= value + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        };
+        mix((uint64_t) key.device);
+        mix((uint64_t) key.cc);
+        mix((uint64_t) key.dk);
+        mix((uint64_t) key.dv);
+        mix((uint64_t) key.n_head_kv);
+        mix((uint64_t) key.gqa_ratio);
+        mix((uint64_t) key.context_bucket);
+        mix((uint64_t) key.selected_bucket);
+        mix((uint64_t) key.layout);
+        return h;
+    }
+};
+
+struct sparse_q8_turbo4_tune_result {
+    sparse_q8_turbo4_impl selected = sparse_q8_turbo4_impl::fused_mma;
+    uint64_t cache_hits = 0;
+};
+
+static int64_t sparse_fattn_power_of_two_bucket(int64_t value) {
+    int64_t bucket = 1;
+    while (bucket < value && bucket <= INT64_MAX / 2) {
+        bucket *= 2;
+    }
+    return bucket;
+}
+
+static sparse_q8_turbo4_tune_key sparse_q8_turbo4_make_tune_key(const ggml_tensor * dst) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const int n_indices = ggml_get_op_params_i32(dst, 4);
+    const int n_kv = ggml_get_op_params_i32(dst, 5);
+    const int suffix_start = ggml_get_op_params_i32(dst, 6);
+    const int layout = n_indices == suffix_start && n_kv == K->ne[1] ? 2 :
+            (n_kv > n_indices ? 1 : 0);
+    const int device = ggml_cuda_get_device();
+
+    return {
+        device,
+        ggml_cuda_info().devices[device].cc,
+        (int) Q->ne[0],
+        (int) dst->src[2]->ne[0],
+        (int) K->ne[2],
+        (int) (Q->ne[2] / K->ne[2]),
+        sparse_fattn_power_of_two_bucket(K->ne[1]),
+        sparse_fattn_power_of_two_bucket(n_kv),
+        layout,
+    };
+}
+
+static bool sparse_q8_turbo4_forced_impl(sparse_q8_turbo4_impl & impl) {
+    const char * value = getenv("GGML_VEGAS_SPARSE_IMPL");
+    if (value == nullptr || value[0] == '\0' || strcmp(value, "auto") == 0) {
+        return false;
+    }
+    if (strcmp(value, "direct") == 0) {
+        impl = sparse_q8_turbo4_impl::direct;
+        return true;
+    }
+    if (strcmp(value, "fused") == 0 || strcmp(value, "fused_mma") == 0) {
+        impl = sparse_q8_turbo4_impl::fused_mma;
+        return true;
+    }
+    if (strcmp(value, "gather") == 0 || strcmp(value, "gather_f16") == 0) {
+        impl = sparse_q8_turbo4_impl::gather_f16;
+        return true;
+    }
+
+    static std::once_flag warning;
+    std::call_once(warning, [value]() {
+        GGML_LOG_WARN("GGML_VEGAS_SPARSE_IMPL=%s is invalid; using cached autotuning\n", value);
+    });
+    return false;
+}
+
+static float sparse_q8_turbo4_validate_candidate(
+        ggml_backend_cuda_context & ctx,
+        const float * reference,
+        const float * candidate,
+        int64_t n_elements,
+        bool & valid) {
+    ggml_cuda_pool_alloc<float> error_sums(ctx.pool(), 2);
+    ggml_cuda_pool_alloc<int> invalid(ctx.pool(), 1);
+    CUDA_CHECK(cudaMemsetAsync(error_sums.ptr, 0, 2 * sizeof(float), ctx.stream()));
+    CUDA_CHECK(cudaMemsetAsync(invalid.ptr, 0, sizeof(int), ctx.stream()));
+
+    constexpr int threads = 256;
+    const int blocks = (int) ((n_elements + threads - 1) / threads);
+    sparse_fattn_compare_outputs<<<blocks, threads, 0, ctx.stream()>>>(
+            reference, candidate, error_sums.ptr, invalid.ptr, n_elements);
+    CUDA_CHECK(cudaGetLastError());
+
+    float host_sums[2] = {0.0f, 0.0f};
+    int host_invalid = 0;
+    CUDA_CHECK(cudaMemcpyAsync(host_sums, error_sums.ptr, sizeof(host_sums), cudaMemcpyDeviceToHost, ctx.stream()));
+    CUDA_CHECK(cudaMemcpyAsync(&host_invalid, invalid.ptr, sizeof(host_invalid), cudaMemcpyDeviceToHost, ctx.stream()));
+    CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+
+    const float nmse = host_sums[0] / std::max(host_sums[1], 1e-20f);
+    valid = host_invalid == 0 && std::isfinite(nmse) && nmse <= 5e-4f;
+    return nmse;
+}
+
+static float sparse_q8_turbo4_measure_candidate(
+        ggml_backend_cuda_context & ctx,
+        ggml_tensor * dst,
+        sparse_q8_turbo4_impl impl) {
+    constexpr int warmups = 2;
+    constexpr int measurements = 9;
+    for (int i = 0; i < warmups; ++i) {
+        ggml_cuda_flash_attn_ext_sparse_q8_turbo4_launch(ctx, dst, impl);
+    }
+
+    cudaEvent_t start;
+    cudaEvent_t stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+
+    std::array<float, measurements> elapsed_ms;
+    for (int i = 0; i < measurements; ++i) {
+        CUDA_CHECK(cudaEventRecord(start, ctx.stream()));
+        ggml_cuda_flash_attn_ext_sparse_q8_turbo4_launch(ctx, dst, impl);
+        CUDA_CHECK(cudaEventRecord(stop, ctx.stream()));
+        CUDA_CHECK(cudaEventSynchronize(stop));
+        CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms[i], start, stop));
+    }
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+
+    std::sort(elapsed_ms.begin(), elapsed_ms.end());
+    return elapsed_ms[measurements / 2];
+}
+
+static sparse_q8_turbo4_impl sparse_q8_turbo4_autotune(
+        ggml_backend_cuda_context & ctx,
+        ggml_tensor * dst) {
+    sparse_q8_turbo4_impl forced;
+    if (sparse_q8_turbo4_forced_impl(forced)) {
+        return forced;
+    }
+
+    cudaStreamCaptureStatus capture_status;
+    CUDA_CHECK(cudaStreamIsCapturing(ctx.stream(), &capture_status));
+    if (capture_status != cudaStreamCaptureStatusNone) {
+        static std::once_flag warning;
+        std::call_once(warning, []() {
+            GGML_LOG_WARN("Vegas q8/Turbo4 autotune miss during CUDA graph capture; using fused MMA\n");
+        });
+        return sparse_q8_turbo4_impl::fused_mma;
+    }
+
+    static std::mutex cache_mutex;
+    static std::unordered_map<
+            sparse_q8_turbo4_tune_key,
+            sparse_q8_turbo4_tune_result,
+            sparse_q8_turbo4_tune_key_hash> cache;
+
+    const sparse_q8_turbo4_tune_key key = sparse_q8_turbo4_make_tune_key(dst);
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    auto cached = cache.find(key);
+    if (cached != cache.end()) {
+        ++cached->second.cache_hits;
+        return cached->second.selected;
+    }
+
+    const auto calibration_start = std::chrono::steady_clock::now();
+    const int64_t n_elements = ggml_nelements(dst);
+    ggml_cuda_pool_alloc<float> reference(ctx.pool(), n_elements);
+    ggml_cuda_pool_alloc<float> candidate(ctx.pool(), n_elements);
+    ggml_tensor reference_dst = *dst;
+    ggml_tensor candidate_dst = *dst;
+    reference_dst.data = reference.ptr;
+    candidate_dst.data = candidate.ptr;
+
+    ggml_cuda_flash_attn_ext_sparse_gather(ctx, &reference_dst);
+    bool reference_valid = false;
+    const float reference_nmse = sparse_q8_turbo4_validate_candidate(
+            ctx, reference.ptr, reference.ptr, n_elements, reference_valid);
+    if (!reference_valid) {
+        GGML_ABORT("q8/Turbo4 sparse gather reference failed autotune validation");
+    }
+
+    constexpr std::array<sparse_q8_turbo4_impl, 3> implementations = {
+        sparse_q8_turbo4_impl::direct,
+        sparse_q8_turbo4_impl::fused_mma,
+        sparse_q8_turbo4_impl::gather_f16,
+    };
+    std::array<float, implementations.size()> nmse = {INFINITY, INFINITY, reference_nmse};
+    std::array<float, implementations.size()> median_ms = {INFINITY, INFINITY, INFINITY};
+    std::array<bool, implementations.size()> valid = {false, false, true};
+
+    for (size_t i = 0; i < implementations.size(); ++i) {
+        const sparse_q8_turbo4_impl impl = implementations[i];
+        if (impl != sparse_q8_turbo4_impl::gather_f16) {
+            ggml_cuda_flash_attn_ext_sparse_q8_turbo4_launch(ctx, &candidate_dst, impl);
+            nmse[i] = sparse_q8_turbo4_validate_candidate(
+                    ctx, reference.ptr, candidate.ptr, n_elements, valid[i]);
+        }
+        if (valid[i]) {
+            median_ms[i] = sparse_q8_turbo4_measure_candidate(ctx, &candidate_dst, impl);
+        } else {
+            GGML_LOG_WARN("Vegas sparse autotune rejected %s: nmse=%g\n",
+                    sparse_q8_turbo4_impl_name(impl), (double) nmse[i]);
+        }
+    }
+
+    size_t fastest = implementations.size();
+    for (size_t i = 0; i < implementations.size(); ++i) {
+        if (valid[i] && (fastest == implementations.size() || median_ms[i] < median_ms[fastest])) {
+            fastest = i;
+        }
+    }
+    if (fastest == implementations.size()) {
+        GGML_ABORT("all q8/Turbo4 sparse attention candidates failed autotune validation");
+    }
+
+    const int64_t n_kv = ggml_get_op_params_i32(dst, 5);
+    const int64_t n_kv_padded = GGML_PAD(n_kv, (int64_t) FATTN_KQ_STRIDE);
+    const size_t gather_scratch = (size_t) (dst->src[1]->ne[0] + dst->src[2]->ne[0]) *
+            n_kv_padded * dst->src[1]->ne[2] * sizeof(half) + n_kv_padded * sizeof(half);
+    const std::array<size_t, implementations.size()> scratch_bytes = {0, 0, gather_scratch};
+    const std::array<int, implementations.size()> tie_priority = {1, 0, 2};
+
+    size_t selected = fastest;
+    for (size_t i = 0; i < implementations.size(); ++i) {
+        if (!valid[i] || median_ms[i] > 1.03f * median_ms[fastest]) {
+            continue;
+        }
+        if (scratch_bytes[i] < scratch_bytes[selected] ||
+                (scratch_bytes[i] == scratch_bytes[selected] && tie_priority[i] < tie_priority[selected])) {
+            selected = i;
+        }
+    }
+
+    const auto calibration_stop = std::chrono::steady_clock::now();
+    const double calibration_ms = std::chrono::duration<double, std::milli>(
+            calibration_stop - calibration_start).count();
+    const sparse_q8_turbo4_impl selected_impl = implementations[selected];
+    cache.emplace(key, sparse_q8_turbo4_tune_result{selected_impl, 0});
+
+    GGML_LOG_INFO(
+            "vegas_sparse_autotune device=%d cc=%d d=%d gqa=%d context_bucket=%lld selected_bucket=%lld "
+            "layout=%d direct_ms=%.6f direct_nmse=%g fused_ms=%.6f fused_nmse=%g "
+            "gather_ms=%.6f selected=%s calibration_ms=%.3f scratch_bytes=%zu\n",
+            key.device, key.cc, key.dk, key.gqa_ratio,
+            (long long) key.context_bucket, (long long) key.selected_bucket, key.layout,
+            (double) median_ms[0], (double) nmse[0],
+            (double) median_ms[1], (double) nmse[1],
+            (double) median_ms[2], sparse_q8_turbo4_impl_name(selected_impl),
+            calibration_ms, scratch_bytes[selected]);
+    return selected_impl;
+}
+
 #define FATTN_VEC_CASE(D, type_K, type_V)                                                                        \
     {                                                                                                            \
         const bool type_K_okay = K->type == (type_K) || (K->type == GGML_TYPE_F32 && (type_K) == GGML_TYPE_F16); \
@@ -991,7 +1333,8 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             return;
         }
         if (sparse_mode == GGML_SPARSE_FATTN_MODE_AUTO && q8_turbo4) {
-            ggml_cuda_flash_attn_ext_sparse_mma_q8_turbo4(ctx, dst);
+            const sparse_q8_turbo4_impl impl = sparse_q8_turbo4_autotune(ctx, dst);
+            ggml_cuda_flash_attn_ext_sparse_q8_turbo4_launch(ctx, dst, impl);
             return;
         }
         ggml_cuda_flash_attn_ext_vec(ctx, dst);
