@@ -7086,7 +7086,9 @@ struct test_flash_attn_ext : public test_case {
     const ggml_type type_K;
     const ggml_type type_V;
     std::array<int32_t, 4> permute;
-    const int sparse_pattern; // 0=dense, 1=identity, 2=reverse, 3=reverse prefix + contiguous suffix
+    // 0=dense, 1=identity, 2=reverse, 3=identity prefix + suffix,
+    // 4=selected prefix + suffix with an omitted middle span
+    const int sparse_pattern;
     const ggml_sparse_fattn_mode sparse_mode;
 
     std::string vars() override {
@@ -7171,13 +7173,17 @@ struct test_flash_attn_ext : public test_case {
         ggml_flash_attn_ext_add_sinks(out, s);
         ggml_flash_attn_ext_set_prec (out, prec);
         if (sparse_pattern != 0) {
-            GGML_ASSERT(nb == 1 && nr23[1] == 1 && !sinks && max_bias == 0.0f);
-            const int64_t n_indices = sparse_pattern == 3 ? kv / 2 : kv;
+            GGML_ASSERT(nr23[1] == 1 && !sinks && max_bias == 0.0f);
+            GGML_ASSERT(sparse_mode == GGML_SPARSE_FATTN_MODE_GATHER || nb == 1);
+            const int64_t n_indices = sparse_pattern == 4 ? kv / 4 :
+                    sparse_pattern == 3 ? kv / 2 : kv;
             const int32_t suffix_start = sparse_pattern == 2 ? 0 :
-                    sparse_pattern == 3 ? (int32_t) n_indices : (int32_t) kv;
+                    sparse_pattern == 3 ? (int32_t) n_indices :
+                    sparse_pattern == 4 ? (int32_t) (kv / 2) : (int32_t) kv;
+            const int32_t sparse_n_kv = (int32_t) n_indices + (int32_t) kv - suffix_start;
             ggml_tensor * indices = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_indices);
             ggml_set_name(indices, "sparse_indices");
-            ggml_flash_attn_ext_set_sparse_kv(out, indices, n_indices, suffix_start, kv);
+            ggml_flash_attn_ext_set_sparse_kv(out, indices, n_indices, suffix_start, sparse_n_kv);
             ggml_flash_attn_ext_set_sparse_mode(out, sparse_mode);
         }
         ggml_set_name(out, "out");
@@ -7194,8 +7200,24 @@ struct test_flash_attn_ext : public test_case {
                 if (sparse_pattern == 0) {
                     init_tensor_kq_mask(t);
                 } else {
-                    std::vector<ggml_fp16_t> zeros(ggml_nelements(t), ggml_fp32_to_fp16(0.0f));
-                    ggml_backend_tensor_set(t, zeros.data(), 0, zeros.size() * sizeof(zeros[0]));
+                    GGML_ASSERT(t->ne[0] >= t->ne[1]);
+                    std::vector<ggml_fp16_t> causal(
+                            ggml_nelements(t), ggml_fp32_to_fp16(-INFINITY));
+                    for (int64_t i3 = 0; i3 < t->ne[3]; ++i3) {
+                        for (int64_t i2 = 0; i2 < t->ne[2]; ++i2) {
+                            for (int64_t iq = 0; iq < t->ne[1]; ++iq) {
+                                const int64_t visible_end = t->ne[0] - t->ne[1] + iq;
+                                for (int64_t ikv = 0; ikv <= visible_end; ++ikv) {
+                                    if (sparse_pattern == 4 && ikv >= kv / 4 && ikv < kv / 2) {
+                                        continue;
+                                    }
+                                    const int64_t index = ikv + t->ne[0] * (iq + t->ne[1] * (i2 + t->ne[2] * i3));
+                                    causal[index] = ggml_fp32_to_fp16(0.0f);
+                                }
+                            }
+                        }
+                    }
+                    ggml_backend_tensor_set(t, causal.data(), 0, causal.size() * sizeof(causal[0]));
                 }
             } else if (strcmp(t->name, "sparse_indices") == 0) {
                 std::vector<int32_t> indices(t->ne[0]);
@@ -9955,11 +9977,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 256, 1, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0));
 
     // 100%-retention Vegas sparse attention must reproduce dense attention.
-    // Q is a single decode token and the mask is all zero, so reordering all KV
-    // rows is mathematically invariant. Pattern 2 forces all rows through the
-    // indexed path in reverse order. Pattern 3 exercises the exact full-retention
-    // Vegas representation: an identity historical prefix followed by a recent
-    // suffix, which is eligible for the identity fast path.
+    // Pattern 2 forces all rows through the indexed path in reverse order.
+    // Pattern 3 exercises the exact full-retention Vegas representation: an
+    // identity historical prefix followed by a recent suffix.
     for (int sparse_pattern : {1, 2, 3}) {
         test_cases.emplace_back(new test_flash_attn_ext(
                 256, 256, 4, {4, 1}, 512, 1, true, false, 0, 0,
@@ -10000,6 +10020,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                 GGML_PREC_F32, type_K, type_V,
                                 {0, 1, 2, 3}, sparse_pattern, sparse_mode));
                     }
+                }
+            }
+        }
+    }
+
+    // Multi-query sparse verification uses one shared selected prefix and a
+    // gathered causal mask. Dense comparison proves both numerical agreement
+    // and that an earlier query cannot attend to later candidate tokens.
+    for (int sparse_pattern : {1, 2, 3, 4}) {
+        for (int nb : {2, 4, 8, 21}) {
+            for (int hs : {256, 512}) {
+                const int gqa = hs == 256 ? 4 : 8;
+                for (const auto cache_types : {
+                        std::pair<ggml_type, ggml_type>{GGML_TYPE_Q4_0, GGML_TYPE_Q4_0},
+                        std::pair<ggml_type, ggml_type>{GGML_TYPE_Q8_0, GGML_TYPE_Q4_0},
+                        std::pair<ggml_type, ggml_type>{GGML_TYPE_Q8_0, GGML_TYPE_Q8_0}}) {
+                    test_cases.emplace_back(new test_flash_attn_ext(
+                            hs, hs, 4, {gqa, 1}, 512, nb, true, false, 0, 0,
+                            GGML_PREC_F32, cache_types.first, cache_types.second,
+                            {0, 1, 2, 3}, sparse_pattern, GGML_SPARSE_FATTN_MODE_GATHER));
                 }
             }
         }
