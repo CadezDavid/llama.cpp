@@ -9,6 +9,7 @@
 - Run the relevant checks before committing when practical. If a milestone cannot be fully verified, record that clearly in the commit body or task handoff.
 - Do not rewrite, squash, amend, revert, or discard existing commits or worktree changes unless the user explicitly asks.
 - Treat local commits as part of normal implementation work. Push only when the user explicitly requests it.
+- Avoid having dirty
 
 ### Commit messages
 
