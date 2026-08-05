@@ -1,0 +1,47 @@
+{
+  "configuration": "gemma4-q8-turbo4-64k",
+  "sparse_ratio": 0.2,
+  "selection_layer": 59,
+  "anchor_tokens": 0,
+  "prompt_tokens": 65536,
+  "generated_tokens": 128,
+  "same_prefix_probes": 127,
+  "same_prefix_top1_matches": 119,
+  "same_prefix_top1_agreement": 0.937008,
+  "first_10_probes": {
+    "top1_matches": 2,
+    "top1_agreement": 0.2
+  },
+  "dominant_generated_token": {
+    "token_id": 715,
+    "count": 122,
+    "fraction": 0.96063
+  },
+  "distribution": {
+    "mean_dense_entropy": 1.33601,
+    "mean_sparse_entropy": 2.04935,
+    "mean_dense_top_probability": 0.820748,
+    "mean_sparse_top_probability": 0.686759,
+    "mean_sparse_probability_of_dense_top1": 0.672866,
+    "mean_dense_top_rank_in_sparse": 1.33858,
+    "mean_sparse_top_rank_in_dense": 137.874,
+    "mean_kl_dense_sparse": 0.464139,
+    "mean_kl_sparse_dense": 0.899272,
+    "mean_jensen_shannon": 0.0976501,
+    "mean_total_variation": 0.244172,
+    "mean_top10_overlap": 0.444094
+  },
+  "mismatches": {
+    "count": 8,
+    "mean_dense_top_probability": 0.562822,
+    "mean_sparse_probability_of_dense_top1": 0.0839416,
+    "mean_jensen_shannon": 0.408687,
+    "mean_total_variation": 0.762456,
+    "mean_top10_overlap": 0.3375
+  },
+  "same_prefix_output_hash": "8bf80a66542aebae",
+  "dense_baseline_output_hash": "8bf80a66542aebae",
+  "snapshot_failures": 0,
+  "rollback_failures": 0,
+  "position_mismatches": 0
+}
