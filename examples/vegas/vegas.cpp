@@ -363,6 +363,10 @@ static const char * mode_name(vegas_run_mode mode) {
     return "unknown";
 }
 
+static const char * sparse_kernel_name(int32_t mode) {
+    return mode == LLAMA_VEGAS_SPARSE_KERNEL_GATHER ? "gather" : "direct";
+}
+
 static bool mode_uses_vegas(vegas_run_mode mode) {
     return mode == vegas_run_mode::vegas || mode == vegas_run_mode::mtp_vegas ||
             mode == vegas_run_mode::mtp_hierarchical || mode == vegas_run_mode::mtp_auto ||
@@ -1948,6 +1952,7 @@ static void print_result(
         "\nVEGAS_RESULT {\"mode\":\"%s\",\"model\":\"%s\","
         "\"n_prompt\":%d,\"n_predict\":%d,\"gamma\":%d,\"auto_policy\":%s,"
         "\"selection_layer\":%d,\"anchor_tokens\":%d,\"refresh_interval\":%d,"
+        "\"sparse_kernel\":\"%s\","
         "\"sparse_ratio\":%.6f,"
         "\"min_tokens\":%d,\"max_tokens\":%d,"
         "\"cache_type_k\":\"%s\",\"cache_type_v\":\"%s\","
@@ -1961,6 +1966,7 @@ static void print_result(
         mode_name(options.mode), params.model.path.c_str(),
         metrics.n_prompt, metrics.n_predict, options.gamma, options.auto_policy ? "true" : "false",
         options.selection_layer, options.anchor_tokens, options.refresh_interval,
+        sparse_kernel_name(options.sparse_kernel),
         options.sparse_ratio,
         options.min_tokens, options.max_tokens,
         ggml_type_name(params.cache_type_k), ggml_type_name(params.cache_type_v),

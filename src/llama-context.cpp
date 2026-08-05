@@ -1269,11 +1269,6 @@ bool llama_context::vegas_enable(
         return false;
     }
 
-    if (vegas.sparse_kernel == llama_vegas_sparse_kernel::gather) {
-        LLAMA_LOG_ERROR("%s: Vegas gather sparse attention is not implemented yet\n", __func__);
-        return false;
-    }
-
     if (vegas.sparse_kernel == llama_vegas_sparse_kernel::direct &&
             cparams.type_k == GGML_TYPE_Q8_0 && cparams.type_v == GGML_TYPE_TURBO4_0) {
         LLAMA_LOG_ERROR(
@@ -1281,6 +1276,26 @@ bool llama_context::vegas_enable(
                 "the mixed-cache vector kernel does not pass the 100%%-retention correctness gate\n",
                 __func__);
         return false;
+    }
+
+    if (vegas.sparse_kernel == llama_vegas_sparse_kernel::gather) {
+        if (cparams.type_k != GGML_TYPE_Q8_0 || cparams.type_v != GGML_TYPE_TURBO4_0) {
+            LLAMA_LOG_ERROR("%s: gather sparse attention currently requires K=q8_0 V=turbo4\n", __func__);
+            return false;
+        }
+        for (uint32_t il = 0; il < model.hparams.n_layer_all; ++il) {
+            if (model.hparams.is_recr(il) || model.hparams.is_swa(il)) {
+                continue;
+            }
+            const uint32_t head_k = model.hparams.n_embd_head_k(il);
+            const uint32_t head_v = model.hparams.n_embd_head_v(il);
+            if (head_k != head_v || (head_k != 256 && head_k != 512)) {
+                LLAMA_LOG_ERROR(
+                        "%s: gather sparse attention supports equal K/V head dimensions 256 or 512, got %u/%u at layer %u\n",
+                        __func__, head_k, head_v, il);
+                return false;
+            }
+        }
     }
 
     const int32_t plan_capacity = [&]() {
