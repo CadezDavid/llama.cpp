@@ -9992,10 +9992,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                     if (type_K == GGML_TYPE_Q4_0 && type_V == GGML_TYPE_Q8_0) {
                         continue;
                     }
-                    test_cases.emplace_back(new test_flash_attn_ext(
-                            hs, hs, 4, {gqa, 1}, 512, 1, true, false, 0, 0,
-                            GGML_PREC_F32, type_K, type_V,
-                            {0, 1, 2, 3}, sparse_pattern));
+                    for (ggml_sparse_fattn_mode sparse_mode : {
+                            GGML_SPARSE_FATTN_MODE_DIRECT,
+                            GGML_SPARSE_FATTN_MODE_GATHER}) {
+                        test_cases.emplace_back(new test_flash_attn_ext(
+                                hs, hs, 4, {gqa, 1}, 512, 1, true, false, 0, 0,
+                                GGML_PREC_F32, type_K, type_V,
+                                {0, 1, 2, 3}, sparse_pattern, sparse_mode));
+                    }
                 }
             }
         }

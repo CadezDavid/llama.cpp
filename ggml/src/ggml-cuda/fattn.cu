@@ -13,7 +13,31 @@
 #include <mutex>
 #include <unordered_map>
 
-static __global__ void gather_dequant_q8_turbo4_f16(
+template <ggml_type type>
+static __device__ __forceinline__ float sparse_gather_dequant_element(
+        const char * __restrict__ row,
+        int64_t i0) {
+    if constexpr (type == GGML_TYPE_Q4_0) {
+        const block_q4_0 * block = (const block_q4_0 *) row + i0 / QK4_0;
+        const int j = i0 % QK4_0;
+        const int q = j < QK4_0 / 2 ? block->qs[j] & 0x0f : block->qs[j - QK4_0 / 2] >> 4;
+        return __half2float(block->d) * (q - 8);
+    } else if constexpr (type == GGML_TYPE_Q8_0) {
+        const block_q8_0 * block = (const block_q8_0 *) row + i0 / QK8_0;
+        return __half2float(block->d) * block->qs[i0 % QK8_0];
+    } else if constexpr (type == GGML_TYPE_TURBO4_0) {
+        const block_turbo4_0 * block = (const block_turbo4_0 *) row + i0 / QK_TURBO4;
+        const float norm = __half2float(block->norm);
+        return turbo4_dequant_element(block, i0 % QK_TURBO4, norm);
+    } else {
+        static_assert(type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q8_0 || type == GGML_TYPE_TURBO4_0,
+                "unsupported sparse gather type");
+        return 0.0f;
+    }
+}
+
+template <ggml_type type_K, ggml_type type_V>
+static __global__ void gather_dequant_sparse_f16(
         const char * __restrict__ K,
         const char * __restrict__ V,
         const int *  __restrict__ indices,
@@ -55,15 +79,8 @@ static __global__ void gather_dequant_q8_turbo4_f16(
     const char * K_row = K + i_head * nb12 + i_actual * nb11;
     const char * V_row = V + i_head * nb22 + i_actual * nb21;
 
-    const block_q8_0 * kb = (const block_q8_0 *) K_row + i0 / QK8_0;
-    const float kval = __half2float(kb->d) * kb->qs[i0 % QK8_0];
-
-    const block_turbo4_0 * vb = (const block_turbo4_0 *) V_row + i0 / QK_TURBO4;
-    const float vnorm = __half2float(vb->norm);
-    const float vval = turbo4_dequant_element(vb, i0 % QK_TURBO4, vnorm);
-
-    K_f16[i] = __float2half(kval);
-    V_f16[i] = __float2half(vval);
+    K_f16[i] = __float2half(sparse_gather_dequant_element<type_K>(K_row, i0));
+    V_f16[i] = __float2half(sparse_gather_dequant_element<type_V>(V_row, i0));
 }
 
 static __global__ void sparse_fattn_compare_outputs(
@@ -431,7 +448,8 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
     }
 }
 
-static void ggml_cuda_flash_attn_ext_q8_turbo4_f16(
+template <ggml_type type_K, ggml_type type_V>
+static void ggml_cuda_flash_attn_ext_gather_f16_case(
         ggml_backend_cuda_context & ctx,
         ggml_tensor * dst) {
     ggml_tensor * Q = dst->src[0];
@@ -441,7 +459,7 @@ static void ggml_cuda_flash_attn_ext_q8_turbo4_f16(
 
     GGML_ASSERT(Q->ne[1] == 1 && Q->ne[3] == 1);
     GGML_ASSERT((Q->ne[0] == 256 || Q->ne[0] == 512) && V->ne[0] == Q->ne[0]);
-    GGML_ASSERT(K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_TURBO4_0);
+    GGML_ASSERT(K->type == type_K && V->type == type_V);
     GGML_ASSERT(indices == nullptr || indices->type == GGML_TYPE_I32);
 
     const int32_t n_indices = indices ? ggml_get_op_params_i32(dst, 4) : 0;
@@ -456,7 +474,7 @@ static void ggml_cuda_flash_attn_ext_q8_turbo4_f16(
 
     const int threads = 256;
     const int blocks = (int) ((std::max(n_elements, n_kv_padded) + threads - 1) / threads);
-    gather_dequant_q8_turbo4_f16<<<blocks, threads, 0, ctx.stream()>>>(
+    gather_dequant_sparse_f16<type_K, type_V><<<blocks, threads, 0, ctx.stream()>>>(
             (const char *) K->data,
             (const char *) V->data,
             indices == nullptr ? nullptr : (const int *) indices->data,
@@ -518,6 +536,12 @@ static void ggml_cuda_flash_attn_ext_q8_turbo4_f16(
     ggml_cuda_flash_attn_ext_mma_f16(ctx, &gathered_dst);
 }
 
+static void ggml_cuda_flash_attn_ext_q8_turbo4_f16(
+        ggml_backend_cuda_context & ctx,
+        ggml_tensor * dst) {
+    ggml_cuda_flash_attn_ext_gather_f16_case<GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0>(ctx, dst);
+}
+
 static void ggml_cuda_flash_attn_ext_sparse_gather(
         ggml_backend_cuda_context & ctx,
         ggml_tensor * dst) {
@@ -528,13 +552,29 @@ static void ggml_cuda_flash_attn_ext_sparse_gather(
 
     GGML_ASSERT(Q->ne[1] == 1 && Q->ne[3] == 1);
     GGML_ASSERT((Q->ne[0] == 256 || Q->ne[0] == 512) && V->ne[0] == Q->ne[0]);
-    GGML_ASSERT(K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_TURBO4_0);
     GGML_ASSERT(indices != nullptr && indices->type == GGML_TYPE_I32);
 
     // Gather and dequantize only the selected rows, then run the validated f16
     // MMA kernel. Avoiding an intermediate compressed gather removes one full
     // read/write pass and reduces peak temporary storage.
-    ggml_cuda_flash_attn_ext_q8_turbo4_f16(ctx, dst);
+    if (K->type == GGML_TYPE_Q4_0 && V->type == GGML_TYPE_Q4_0) {
+        ggml_cuda_flash_attn_ext_gather_f16_case<GGML_TYPE_Q4_0, GGML_TYPE_Q4_0>(ctx, dst);
+        return;
+    }
+    if (K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q4_0) {
+        ggml_cuda_flash_attn_ext_gather_f16_case<GGML_TYPE_Q8_0, GGML_TYPE_Q4_0>(ctx, dst);
+        return;
+    }
+    if (K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0) {
+        ggml_cuda_flash_attn_ext_gather_f16_case<GGML_TYPE_Q8_0, GGML_TYPE_Q8_0>(ctx, dst);
+        return;
+    }
+    if (K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_TURBO4_0) {
+        ggml_cuda_flash_attn_ext_q8_turbo4_f16(ctx, dst);
+        return;
+    }
+    GGML_ABORT("unsupported sparse gather attention: K=%s, V=%s",
+            ggml_type_name(K->type), ggml_type_name(V->type));
 }
 
 static void ggml_cuda_flash_attn_ext_sparse_mma_q8_turbo4(
@@ -1410,9 +1450,13 @@ bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
         const ggml_tensor * K = dst->src[1];
         const ggml_tensor * V = dst->src[2];
         const bool q8_turbo4 = K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_TURBO4_0;
+        const bool gather_types = q8_turbo4 ||
+                (K->type == GGML_TYPE_Q4_0 && V->type == GGML_TYPE_Q4_0) ||
+                (K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q4_0) ||
+                (K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0);
         if (sparse_mode == GGML_SPARSE_FATTN_MODE_GATHER) {
             return (Q->ne[0] == 256 || Q->ne[0] == 512) && V->ne[0] == Q->ne[0] &&
-                    Q->ne[1] == 1 && Q->ne[3] == 1 && q8_turbo4 &&
+                    Q->ne[1] == 1 && Q->ne[3] == 1 && gather_types &&
                     turing_mma_available(ggml_cuda_info().devices[device].cc);
         }
         if (sparse_mode == GGML_SPARSE_FATTN_MODE_AUTO && q8_turbo4) {

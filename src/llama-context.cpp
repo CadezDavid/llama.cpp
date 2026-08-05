@@ -1272,8 +1272,15 @@ bool llama_context::vegas_enable(
     if (vegas.sparse_kernel == llama_vegas_sparse_kernel::gather ||
             (vegas.sparse_kernel == llama_vegas_sparse_kernel::auto_select &&
              cparams.type_k == GGML_TYPE_Q8_0 && cparams.type_v == GGML_TYPE_TURBO4_0)) {
-        if (cparams.type_k != GGML_TYPE_Q8_0 || cparams.type_v != GGML_TYPE_TURBO4_0) {
-            LLAMA_LOG_ERROR("%s: gather sparse attention currently requires K=q8_0 V=turbo4\n", __func__);
+        const bool gather_cache =
+            (cparams.type_k == GGML_TYPE_Q4_0 && cparams.type_v == GGML_TYPE_Q4_0) ||
+            (cparams.type_k == GGML_TYPE_Q8_0 && cparams.type_v == GGML_TYPE_Q4_0) ||
+            (cparams.type_k == GGML_TYPE_Q8_0 && cparams.type_v == GGML_TYPE_Q8_0) ||
+            (cparams.type_k == GGML_TYPE_Q8_0 && cparams.type_v == GGML_TYPE_TURBO4_0);
+        if (!gather_cache) {
+            LLAMA_LOG_ERROR(
+                    "%s: gather sparse attention requires q4_0/q4_0, q8_0/q4_0, q8_0/q8_0, or q8_0/turbo4 KV cache\n",
+                    __func__);
             return false;
         }
         for (uint32_t il = 0; il < model.hparams.n_layer_all; ++il) {
