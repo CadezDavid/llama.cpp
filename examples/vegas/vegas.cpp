@@ -89,6 +89,7 @@ struct vegas_metrics {
     int32_t n_predict = 0;
     int32_t n_cycles = 0;
     int32_t n_drafted = 0;
+    int32_t n_verified = 0;
     int32_t n_accepted = 0;
     int32_t n_rejected = 0;
     int32_t n_reused = 0;
@@ -226,6 +227,10 @@ struct hierarchical_round_trace {
     int32_t requested = 0;
     int32_t drafted = 0;
     int32_t sparse_accepted = 0;
+    int32_t sparse_batch_inputs = 0;
+    int32_t sparse_valid_inputs = 0;
+    int32_t sparse_discarded_inputs = 0;
+    int32_t sparse_mismatch_index = -1;
     bool correction = false;
     bool extension = false;
     int32_t provisional_after = 0;
@@ -273,6 +278,10 @@ struct hierarchical_metrics {
     int64_t inner_rounds = 0;
     int64_t mtp_drafted = 0;
     int64_t sparse_decodes = 0;
+    int64_t sparse_batches = 0;
+    int64_t sparse_batch_input_tokens = 0;
+    int64_t sparse_valid_input_tokens = 0;
+    int64_t sparse_discarded_input_tokens = 0;
     int64_t sparse_checked = 0;
     int64_t sparse_accepted = 0;
     int64_t sparse_corrections = 0;
@@ -289,10 +298,11 @@ struct hierarchical_metrics {
     int64_t snapshot_failures = 0;
     int64_t empty_drafts = 0;
 
-    std::array<int64_t, 4> round_histogram {};
-    std::array<int64_t, 11> provisional_histogram {};
+    std::array<int64_t, 7> round_histogram {};
+    std::array<int64_t, 21> provisional_histogram {};
     std::array<int64_t, 11> sparse_prefix_histogram {};
-    std::array<int64_t, 11> dense_prefix_histogram {};
+    std::array<int64_t, 21> dense_prefix_histogram {};
+    std::array<int64_t, 12> sparse_mismatch_histogram {};
     std::array<int64_t, 3> correction_histogram {};
     std::array<int64_t, 8> stop_histogram {};
     std::array<int64_t, 3> proposed_by_source {};
@@ -1600,40 +1610,42 @@ static bool run_mtp_hierarchical(
                     return false;
                 }
 
+                const int32_t sparse_batch_start = provisional_n_past;
+                common_batch_clear(batch);
+                common_batch_add(batch, provisional_last, sparse_batch_start, { 0 }, true);
+                for (size_t i = 0; i < draft.size(); ++i) {
+                    common_batch_add(
+                            batch, draft[i], sparse_batch_start + (int32_t) i + 1, { 0 }, true);
+                }
+
+                round.sparse_batch_inputs = batch.n_tokens;
+                hierarchical.sparse_batches++;
+                hierarchical.sparse_decodes++;
+                hierarchical.sparse_batch_input_tokens += batch.n_tokens;
+
+                const int64_t sparse_start = ggml_time_us();
+                if (llama_decode(ctx, batch) != 0) {
+                    LOG_ERR("failed to decode batched sparse-target verification\n");
+                    return false;
+                }
+                llama_synchronize(ctx);
+                round.sparse_us = ggml_time_us() - sparse_start;
+                hierarchical.sparse_us += round.sparse_us;
+
                 bool mismatch = false;
                 for (size_t i = 0; i < draft.size(); ++i) {
-                    const int64_t sparse_start = ggml_time_us();
-                    if (!decode_one(ctx, batch, provisional_last, provisional_n_past)) {
-                        return false;
-                    }
-                    llama_synchronize(ctx);
-                    const int64_t sparse_decode_us = ggml_time_us() - sparse_start;
-                    round.sparse_us += sparse_decode_us;
-                    hierarchical.sparse_us += sparse_decode_us;
-                    hierarchical.sparse_decodes++;
-
-                    const auto entropy = hierarchical_entropy(ctx, 0);
+                    const auto entropy = hierarchical_entropy(ctx, (int32_t) i);
                     round.sparse_entropy.push_back(entropy.entropy);
                     round.sparse_top_probability.push_back(entropy.top_probability);
                     if (entropy.on_device) hierarchical.device_entropy_samples++;
                     else hierarchical.fallback_entropy_samples++;
 
-                    const int64_t process_start = ggml_time_us();
-                    if (!common_speculative_process(spec, batch)) {
-                        LOG_ERR("failed to process sparse-target token for MTP\n");
-                        return false;
-                    }
-                    llama_synchronize(ctx_dft);
-                    const int64_t process_us = ggml_time_us() - process_start;
-                    round.mtp_process_us += process_us;
-                    hierarchical.mtp_process_us += process_us;
-
                     const int64_t sample_start = ggml_time_us();
-                    const llama_token sparse_token = common_sampler_sample(provisional_sampler.get(), ctx, 0, true);
+                    const llama_token sparse_token = common_sampler_sample(
+                            provisional_sampler.get(), ctx, (int32_t) i, true);
                     round.sparse_sample_us += ggml_time_us() - sample_start;
                     round.sparse_tokens.push_back(sparse_token);
                     hierarchical.sparse_checked++;
-
                     if (sparse_token == draft[i]) {
                         common_sampler_accept(provisional_sampler.get(), draft[i], true);
                         provisional.push_back(draft[i]);
@@ -1665,39 +1677,22 @@ static bool run_mtp_hierarchical(
                     hierarchical.sparse_correction_entropy.add(entropy.entropy, entropy.top_probability);
                     provisional_eog = llama_vocab_is_eog(vocab, sparse_token);
                     mismatch = true;
+                    round.sparse_mismatch_index = (int32_t) i;
                     break;
                 }
 
                 if (!mismatch && !provisional_eog && round.sparse_accepted == (int32_t) draft.size() &&
                         (int32_t) provisional.size() < outer_capacity) {
-                    const int64_t sparse_start = ggml_time_us();
-                    if (!decode_one(ctx, batch, provisional_last, provisional_n_past)) {
-                        return false;
-                    }
-                    llama_synchronize(ctx);
-                    const int64_t sparse_decode_us = ggml_time_us() - sparse_start;
-                    round.sparse_us += sparse_decode_us;
-                    hierarchical.sparse_us += sparse_decode_us;
-                    hierarchical.sparse_decodes++;
-
-                    const auto entropy = hierarchical_entropy(ctx, 0);
+                    const int32_t extension_row = (int32_t) draft.size();
+                    const auto entropy = hierarchical_entropy(ctx, extension_row);
                     round.sparse_entropy.push_back(entropy.entropy);
                     round.sparse_top_probability.push_back(entropy.top_probability);
                     if (entropy.on_device) hierarchical.device_entropy_samples++;
                     else hierarchical.fallback_entropy_samples++;
 
-                    const int64_t process_start = ggml_time_us();
-                    if (!common_speculative_process(spec, batch)) {
-                        LOG_ERR("failed to process sparse-target extension for MTP\n");
-                        return false;
-                    }
-                    llama_synchronize(ctx_dft);
-                    const int64_t process_us = ggml_time_us() - process_start;
-                    round.mtp_process_us += process_us;
-                    hierarchical.mtp_process_us += process_us;
-
                     const int64_t sample_start = ggml_time_us();
-                    const llama_token extension = common_sampler_sample(provisional_sampler.get(), ctx, 0, true);
+                    const llama_token extension = common_sampler_sample(
+                            provisional_sampler.get(), ctx, extension_row, true);
                     round.sparse_sample_us += ggml_time_us() - sample_start;
                     round.sparse_tokens.push_back(extension);
                     common_sampler_accept(provisional_sampler.get(), extension, true);
@@ -1710,6 +1705,58 @@ static bool run_mtp_hierarchical(
                     hierarchical.sparse_extensions++;
                     hierarchical.proposed_by_source[(int) hierarchical_token_source::sparse_extension]++;
                     provisional_eog = llama_vocab_is_eog(vocab, extension);
+                }
+
+                const int32_t valid_inputs = vegas_hierarchical_valid_batch_inputs(
+                        round.sparse_accepted, round.correction, round.extension);
+                if (valid_inputs < 0 || valid_inputs > batch.n_tokens) {
+                    LOG_ERR("invalid batched sparse prefix: accepted=%d correction=%d extension=%d "
+                            "batch_tokens=%d valid_inputs=%d\n",
+                            round.sparse_accepted, round.correction, round.extension,
+                            batch.n_tokens, valid_inputs);
+                    return false;
+                }
+
+                round.sparse_valid_inputs = valid_inputs;
+                round.sparse_discarded_inputs = batch.n_tokens - valid_inputs;
+                hierarchical.sparse_valid_input_tokens += valid_inputs;
+                hierarchical.sparse_discarded_input_tokens += round.sparse_discarded_inputs;
+                hierarchical.sparse_mismatch_histogram[
+                        mismatch ? std::min<int32_t>(round.sparse_mismatch_index, 10) : 11]++;
+
+                const int64_t process_start = ggml_time_us();
+                const int32_t sparse_batch_tokens = batch.n_tokens;
+                batch.n_tokens = valid_inputs;
+                const bool processed = common_speculative_process(spec, batch);
+                batch.n_tokens = sparse_batch_tokens;
+                if (!processed) {
+                    LOG_ERR("failed to process valid sparse-target batch prefix for MTP\n");
+                    return false;
+                }
+                llama_synchronize(ctx_dft);
+                round.mtp_process_us = ggml_time_us() - process_start;
+                hierarchical.mtp_process_us += round.mtp_process_us;
+
+                const int64_t sparse_rollback_start = ggml_time_us();
+                if (!remove_after(ctx, sparse_batch_start + valid_inputs)) {
+                    hierarchical.rollback_failures++;
+                    LOG_ERR("failed to remove invalid sparse-target batch suffix\n");
+                    return false;
+                }
+                const int64_t sparse_rollback_us = ggml_time_us() - sparse_rollback_start;
+                hierarchical.rollback_us += sparse_rollback_us;
+                metrics.rollback_us += sparse_rollback_us;
+
+                const llama_pos sparse_target_pos = llama_memory_seq_pos_max(llama_get_memory(ctx), 0);
+                const llama_pos sparse_draft_pos = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), 0);
+                if (sparse_target_pos != provisional_n_past - 1 ||
+                        sparse_draft_pos != provisional_n_past - 1) {
+                    hierarchical.position_mismatches++;
+                    LOG_ERR("batched sparse state mismatch: target=%d draft=%d expected=%d "
+                            "batch_start=%d valid_inputs=%d\n",
+                            (int) sparse_target_pos, (int) sparse_draft_pos, provisional_n_past - 1,
+                            sparse_batch_start, valid_inputs);
+                    return false;
                 }
 
                 hierarchical.sparse_sample_us += round.sparse_sample_us;
@@ -1789,6 +1836,7 @@ static bool run_mtp_hierarchical(
             return false;
         }
         llama_synchronize(ctx);
+        metrics.n_verified += (int32_t) provisional.size();
         cycle.dense_us = ggml_time_us() - dense_start;
         hierarchical.dense_us += cycle.dense_us;
         metrics.verify_us += cycle.dense_us;
@@ -1889,9 +1937,12 @@ static bool run_mtp_hierarchical(
         metrics.n_cycles++;
         hierarchical.outer_cycles++;
 
-        hierarchical.round_histogram[std::min<size_t>(cycle.rounds.size(), 3)]++;
-        hierarchical.provisional_histogram[std::min<size_t>(provisional.size(), 10)]++;
-        hierarchical.dense_prefix_histogram[std::min(accepted, 10)]++;
+        hierarchical.round_histogram[
+                std::min<size_t>(cycle.rounds.size(), hierarchical.round_histogram.size() - 1)]++;
+        hierarchical.provisional_histogram[
+                std::min<size_t>(provisional.size(), hierarchical.provisional_histogram.size() - 1)]++;
+        hierarchical.dense_prefix_histogram[
+                std::min<size_t>(accepted, hierarchical.dense_prefix_histogram.size() - 1)]++;
         hierarchical.correction_histogram[std::min(corrections, 2)]++;
         hierarchical.stop_histogram[(int) stop]++;
         for (const auto & round : cycle.rounds) {
@@ -1934,7 +1985,7 @@ static std::string hierarchical_summary_json(
         const hierarchical_metrics & metrics) {
     std::ostringstream out;
     out << "\"hierarchical\":true"
-        << ",\"hierarchical_trace_schema\":1"
+        << ",\"hierarchical_trace_schema\":2"
         << ",\"hierarchical_target\":" << options.hierarchical.target_tokens
         << ",\"hierarchical_max_tokens\":" << options.hierarchical.max_tokens
         << ",\"hierarchical_max_rounds\":" << options.hierarchical.max_rounds
@@ -1943,6 +1994,10 @@ static std::string hierarchical_summary_json(
         << ",\"hierarchical_inner_rounds\":" << metrics.inner_rounds
         << ",\"hierarchical_mtp_drafted\":" << metrics.mtp_drafted
         << ",\"hierarchical_sparse_decodes\":" << metrics.sparse_decodes
+        << ",\"hierarchical_sparse_batches\":" << metrics.sparse_batches
+        << ",\"hierarchical_sparse_batch_input_tokens\":" << metrics.sparse_batch_input_tokens
+        << ",\"hierarchical_sparse_valid_input_tokens\":" << metrics.sparse_valid_input_tokens
+        << ",\"hierarchical_sparse_discarded_input_tokens\":" << metrics.sparse_discarded_input_tokens
         << ",\"hierarchical_sparse_checked\":" << metrics.sparse_checked
         << ",\"hierarchical_sparse_accepted\":" << metrics.sparse_accepted
         << ",\"hierarchical_sparse_corrections\":" << metrics.sparse_corrections
@@ -1982,6 +2037,8 @@ static std::string hierarchical_summary_json(
     json_array(out, metrics.sparse_prefix_histogram);
     out << ",\"hierarchical_dense_prefix_histogram\":";
     json_array(out, metrics.dense_prefix_histogram);
+    out << ",\"hierarchical_sparse_mismatch_histogram\":";
+    json_array(out, metrics.sparse_mismatch_histogram);
     out << ",\"hierarchical_correction_histogram\":";
     json_array(out, metrics.correction_histogram);
     out << ",\"hierarchical_stop_histogram\":";
@@ -2032,6 +2089,10 @@ static std::string hierarchical_summary_json(
                     << ",\"requested\":" << round.requested
                     << ",\"drafted\":" << round.drafted
                     << ",\"sparse_accepted\":" << round.sparse_accepted
+                    << ",\"sparse_batch_inputs\":" << round.sparse_batch_inputs
+                    << ",\"sparse_valid_inputs\":" << round.sparse_valid_inputs
+                    << ",\"sparse_discarded_inputs\":" << round.sparse_discarded_inputs
+                    << ",\"sparse_mismatch_index\":" << round.sparse_mismatch_index
                     << ",\"correction\":" << (round.correction ? "true" : "false")
                     << ",\"extension\":" << (round.extension ? "true" : "false")
                     << ",\"provisional_after\":" << round.provisional_after
@@ -2215,8 +2276,10 @@ static void print_result(
         const vegas_metrics & metrics) {
     const double seconds = metrics.total_us / 1e6;
     const double tps = seconds > 0.0 ? metrics.n_predict / seconds : 0.0;
-    const double accept = metrics.n_drafted > 0 ?
-        (double) metrics.n_accepted / metrics.n_drafted : 0.0;
+    const int32_t acceptance_denominator = options.mode == vegas_run_mode::mtp_hierarchical ?
+            metrics.n_verified : metrics.n_drafted;
+    const double accept = acceptance_denominator > 0 ?
+        (double) metrics.n_accepted / acceptance_denominator : 0.0;
     std::string extra;
     if (!metrics.adaptive_summary.empty()) {
         extra += "," + metrics.adaptive_summary;
@@ -2240,7 +2303,7 @@ static void print_result(
         "\"min_tokens\":%d,\"max_tokens\":%d,"
         "\"cache_type_k\":\"%s\",\"cache_type_v\":\"%s\","
         "\"draft_cache_type_k\":\"%s\",\"draft_cache_type_v\":\"%s\","
-        "\"cycles\":%d,\"drafted\":%d,\"accepted\":%d,\"rejected\":%d,\"graphs_reused\":%d,"
+        "\"cycles\":%d,\"drafted\":%d,\"verified\":%d,\"accepted\":%d,\"rejected\":%d,\"graphs_reused\":%d,"
         "\"output_hash\":\"%016" PRIx64 "\","
         "\"accept_rate\":%.6f,\"total_ms\":%.3f,\"tokens_per_second\":%.6f,"
         "\"prompt_ms\":%.3f,\"initial_select_ms\":%.3f,\"draft_ms\":%.3f,"
@@ -2255,7 +2318,8 @@ static void print_result(
         ggml_type_name(params.cache_type_k), ggml_type_name(params.cache_type_v),
         ggml_type_name(params.speculative.draft.cache_type_k),
         ggml_type_name(params.speculative.draft.cache_type_v),
-        metrics.n_cycles, metrics.n_drafted, metrics.n_accepted, metrics.n_rejected, metrics.n_reused,
+        metrics.n_cycles, metrics.n_drafted, metrics.n_verified,
+        metrics.n_accepted, metrics.n_rejected, metrics.n_reused,
         metrics.output_hash,
         accept, metrics.total_us / 1e3, tps,
         metrics.prompt_us / 1e3, metrics.initial_select_us / 1e3,
@@ -2297,6 +2361,24 @@ int main(int argc, char ** argv) {
     if (!mode_uses_vegas(options.mode) && options.sparse_kernel != LLAMA_VEGAS_SPARSE_KERNEL_AUTO) {
         LOG_ERR("--vegas-sparse-kernel requires a Vegas mode\n");
         return 1;
+    }
+    if (options.mode == vegas_run_mode::mtp_hierarchical) {
+        const auto normal_cache = [](ggml_type type_k, ggml_type type_v) {
+            return (type_k == GGML_TYPE_Q4_0 && type_v == GGML_TYPE_Q4_0) ||
+                    (type_k == GGML_TYPE_Q8_0 && type_v == GGML_TYPE_Q4_0) ||
+                    (type_k == GGML_TYPE_Q8_0 && type_v == GGML_TYPE_Q8_0);
+        };
+        if (!normal_cache(params.cache_type_k, params.cache_type_v) ||
+                !normal_cache(params.speculative.draft.cache_type_k, params.speculative.draft.cache_type_v)) {
+            LOG_ERR("batched hierarchical verification currently requires q4_0/q4_0, "
+                    "q8_0/q4_0, or q8_0/q8_0 target and draft KV caches\n");
+            return 1;
+        }
+        if (options.sparse_kernel == LLAMA_VEGAS_SPARSE_KERNEL_DIRECT) {
+            LOG_ERR("batched hierarchical verification requires --vegas-sparse-kernel gather\n");
+            return 1;
+        }
+        options.sparse_kernel = LLAMA_VEGAS_SPARSE_KERNEL_GATHER;
     }
     if (params.sampling.mirostat != 0 || params.sampling.xtc_probability != 0.0f) {
         LOG_ERR("Vegas does not support stateful or randomized probability transforms\n");

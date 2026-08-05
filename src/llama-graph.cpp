@@ -162,10 +162,10 @@ void llm_graph_input_sparse_kv_plan::set_input(const llama_ubatch * ubatch) {
 
     const llama_pos first_pos = ubatch->pos[0];
     for (uint32_t i = 1; i < ubatch->n_tokens; ++i) {
-        GGML_ASSERT(ubatch->pos[i * ubatch->n_pos] == first_pos + (llama_pos) i);
+        GGML_ASSERT(ubatch->pos[i] == first_pos + (llama_pos) i);
     }
 
-    const llama_pos last_pos = ubatch->pos[(ubatch->n_tokens - 1) * ubatch->n_pos];
+    const llama_pos last_pos = ubatch->pos[ubatch->n_tokens - 1];
     const int32_t active_n_kv = vegas.top_k + std::min(n_kv, last_pos + 1) - vegas.prefix_len;
     if (active_n_kv > vegas.top_k + vegas.max_recent_tokens) {
         LLAMA_LOG_ERROR("%s: sparse KV plan overflow: active=%d top_k=%d recent_max=%d n_kv=%d pos=%d prefix=%d\n",
@@ -2626,8 +2626,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     } else if (use_vegas && vegas->mode == llama_vegas_mode::draft &&
             q->ne[3] == 1 && k->ne[3] == 1 &&
             ubatch.pos != nullptr && ubatch.n_tokens > 0 &&
-            std::min<int32_t>(
-                    k->ne[1], ubatch.pos[(ubatch.n_tokens - 1) * ubatch.n_pos] + 1) >= vegas->prefix_len) {
+            std::min<int32_t>(k->ne[1], ubatch.pos[ubatch.n_tokens - 1] + 1) >= vegas->prefix_len) {
         GGML_ASSERT(cparams.flash_attn);
         if (q->ne[1] > 1 && vegas->sparse_kernel != llama_vegas_sparse_kernel::gather) {
             GGML_ABORT("batched Vegas sparse attention requires the gather kernel");

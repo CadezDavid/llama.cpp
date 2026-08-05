@@ -1,5 +1,15 @@
 #include "hierarchical-policy.h"
 
+int32_t vegas_hierarchical_valid_batch_inputs(
+        int32_t accepted_draft_tokens,
+        bool correction,
+        bool extension) {
+    if (accepted_draft_tokens < 0 || (correction && extension)) {
+        return -1;
+    }
+    return accepted_draft_tokens + (correction || extension ? 1 : 0);
+}
+
 vegas_hierarchical_stop vegas_hierarchical_should_stop(
         const vegas_hierarchical_limits & limits,
         int32_t provisional_tokens,
