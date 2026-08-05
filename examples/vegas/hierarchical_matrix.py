@@ -9,7 +9,7 @@ from benchmark import run_one
 from opencode_prompt import ensure_prompt
 
 
-PROMPT = "/tmp/opencode-vegas-technical-conversations.txt"
+PROMPT = "/tmp/opencode-vegas-technical-conversations.json"
 
 CONFIGURATIONS = {
     "qwen27-q8-turbo4-64k": {
@@ -67,8 +67,10 @@ def make_args(args, config):
         binary=args.binary,
         model=config["model"],
         draft_model=config["draft_model"],
-        prompt=PROMPT,
+        prompt=None,
+        conversation_file=PROMPT,
         prompt_tokens=65536,
+        reference_tokens=0,
         context=config["context"],
         predict=args.predict,
         repetitions=args.repetitions,
@@ -95,6 +97,7 @@ def make_args(args, config):
         temperature=0.0,
         cache_type_k=config["cache_k"],
         cache_type_v=config["cache_v"],
+        sparse_kernel="gather" if config["cache_v"] == "turbo4" else "direct",
         draft_cache_type_k=config["cache_k"],
         draft_cache_type_v=config["cache_v"],
         output=args.output_dir / "results.jsonl",

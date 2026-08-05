@@ -96,7 +96,8 @@ std::vector<int32_t> top_tokens(const std::vector<float> & logits, int32_t top_k
 vegas_same_prefix_comparison vegas_same_prefix_compare(
         const std::vector<float> & dense_logits,
         const std::vector<float> & sparse_logits,
-        int32_t top_k) {
+        int32_t top_k,
+        int32_t reference_token) {
     assert(!dense_logits.empty());
     assert(dense_logits.size() == sparse_logits.size());
     assert(top_k > 0);
@@ -112,6 +113,15 @@ vegas_same_prefix_comparison vegas_same_prefix_compare(
     result.sparse_top_rank_in_dense = rank_of(dense_logits, sparse.summary.top_token);
     result.sparse_probability_of_dense_top1 = sparse.probabilities[dense.summary.top_token];
     result.dense_probability_of_sparse_top1 = dense.probabilities[sparse.summary.top_token];
+    if (reference_token >= 0 && reference_token < (int32_t) dense_logits.size()) {
+        result.reference_token = reference_token;
+        result.dense_reference_rank = rank_of(dense_logits, reference_token);
+        result.sparse_reference_rank = rank_of(sparse_logits, reference_token);
+        result.dense_reference_probability = dense.probabilities[reference_token];
+        result.sparse_reference_probability = sparse.probabilities[reference_token];
+        result.dense_reference_nll = -dense.log_probabilities[reference_token];
+        result.sparse_reference_nll = -sparse.log_probabilities[reference_token];
+    }
 
     for (size_t i = 0; i < dense_logits.size(); ++i) {
         const double p = dense.probabilities[i];

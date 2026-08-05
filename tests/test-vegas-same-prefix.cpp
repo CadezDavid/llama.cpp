@@ -41,7 +41,7 @@ int main() {
         const std::vector<float> dense  { 5.0f, 2.0f, 0.0f, -1.0f };
         const std::vector<float> sparse { 0.0f, 2.0f, 5.0f, -1.0f };
 
-        const auto result = vegas_same_prefix_compare(dense, sparse, 2);
+        const auto result = vegas_same_prefix_compare(dense, sparse, 2, 1);
 
         REQUIRE(!result.top1_match);
         REQUIRE(result.dense.top_token == 0);
@@ -55,6 +55,11 @@ int main() {
         REQUIRE(result.jensen_shannon > 0.1);
         REQUIRE(result.total_variation > 0.5);
         REQUIRE(near(result.top_k_overlap, 0.5));
+        REQUIRE(result.reference_token == 1);
+        REQUIRE(result.dense_reference_rank == 2);
+        REQUIRE(result.sparse_reference_rank == 2);
+        REQUIRE(near(result.dense_reference_probability, result.sparse_reference_probability));
+        REQUIRE(near(result.dense_reference_nll, result.sparse_reference_nll));
     }
 
     return 0;

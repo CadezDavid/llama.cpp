@@ -10,7 +10,7 @@ from benchmark import run_one
 from opencode_prompt import ensure_prompt
 
 
-PROMPT = "/tmp/opencode-vegas-technical-conversations.txt"
+PROMPT = "/tmp/opencode-vegas-technical-conversations.json"
 
 
 CONFIGURATIONS = {
@@ -105,8 +105,10 @@ def make_args(args, configuration_name, configuration, context_name):
         binary=args.binary,
         model=configuration["model"],
         draft_model=configuration["draft_model"],
-        prompt=configuration["prompt"],
+        prompt=None,
+        conversation_file=configuration["prompt"],
         prompt_tokens=prompt_tokens,
+        reference_tokens=0,
         context=context,
         predict=args.predict,
         repetitions=args.repetitions,
@@ -133,6 +135,7 @@ def make_args(args, configuration_name, configuration, context_name):
         temperature=0.0,
         cache_type_k=configuration["cache_k"],
         cache_type_v=configuration["cache_v"],
+        sparse_kernel="gather" if configuration["cache_v"] == "turbo4" else "direct",
         draft_cache_type_k=configuration["cache_k"],
         draft_cache_type_v=configuration["cache_v"],
         output=args.output_dir / "results.jsonl",

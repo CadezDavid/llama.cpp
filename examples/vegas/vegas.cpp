@@ -1,4 +1,5 @@
 #include "arg.h"
+#include "chat.h"
 #include "common.h"
 #include "log.h"
 #include "sampling.h"
@@ -8,6 +9,7 @@
 #include "same-prefix.h"
 #include "llama-ext.h"
 #include "llama.h"
+#include "nlohmann/json.hpp"
 
 #include <algorithm>
 #include <array>
@@ -16,6 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <inttypes.h>
 #include <memory>
 #include <random>
@@ -46,6 +49,8 @@ struct vegas_options {
     int32_t refresh_interval = 1;
     int32_t mtp_ubatch = 128;
     int32_t prompt_tokens = 0;
+    int32_t reference_tokens = 0;
+    std::string conversation_file;
     bool auto_policy = false;
     bool adaptive_gamma = false;
     float adaptive_beta = 0.9f;
@@ -91,11 +96,13 @@ struct vegas_metrics {
     std::string adaptive_summary;
     std::string hierarchical_summary;
     std::string same_prefix_summary;
+    std::string prompt_summary;
 };
 
 struct same_prefix_step_trace {
     int32_t position = 0;
     int32_t sampled_dense_token = -1;
+    int32_t reference_token = -1;
     vegas_same_prefix_comparison comparison;
     int64_t sparse_us = 0;
     int64_t dense_us = 0;
@@ -131,6 +138,12 @@ struct same_prefix_metrics {
     double jensen_shannon_sum = 0.0;
     double total_variation_sum = 0.0;
     double top_k_overlap_sum = 0.0;
+    double dense_reference_nll_sum = 0.0;
+    double sparse_reference_nll_sum = 0.0;
+
+    std::vector<double> total_variations;
+    std::vector<double> dense_reference_nlls;
+    std::vector<double> sparse_reference_nlls;
 
     std::vector<same_prefix_step_trace> traces;
 
@@ -158,7 +171,33 @@ struct same_prefix_metrics {
         jensen_shannon_sum += comparison.jensen_shannon;
         total_variation_sum += comparison.total_variation;
         top_k_overlap_sum += comparison.top_k_overlap;
+        if (comparison.reference_token >= 0) {
+            dense_reference_nll_sum += comparison.dense_reference_nll;
+            sparse_reference_nll_sum += comparison.sparse_reference_nll;
+            dense_reference_nlls.push_back(comparison.dense_reference_nll);
+            sparse_reference_nlls.push_back(comparison.sparse_reference_nll);
+        }
+        total_variations.push_back(comparison.total_variation);
     }
+};
+
+struct vegas_conversation_fixture {
+    std::vector<common_chat_msg> messages;
+    std::vector<std::string> message_session_ids;
+    std::vector<std::string> message_session_titles;
+    std::string reference;
+};
+
+struct vegas_conversation_prompt {
+    std::vector<llama_token> prompt;
+    std::vector<llama_token> reference;
+    int32_t message_start = 0;
+    int32_t message_count = 0;
+    int32_t token_budget = 0;
+    uint64_t prompt_hash = UINT64_C(1469598103934665603);
+    uint64_t reference_hash = UINT64_C(1469598103934665603);
+    std::vector<std::string> session_ids;
+    std::vector<std::string> session_titles;
 };
 
 enum class hierarchical_token_source : int32_t {
@@ -373,6 +412,154 @@ static bool mode_uses_vegas(vegas_run_mode mode) {
             mode == vegas_run_mode::same_prefix;
 }
 
+static uint64_t hash_tokens(const std::vector<llama_token> & tokens) {
+    uint64_t hash = UINT64_C(1469598103934665603);
+    for (llama_token token : tokens) {
+        hash ^= (uint32_t) token;
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static bool load_conversation_fixture(
+        const std::string & path,
+        vegas_conversation_fixture & fixture) {
+    try {
+        std::ifstream input(path);
+        if (!input) {
+            LOG_ERR("failed to open Vegas conversation fixture: %s\n", path.c_str());
+            return false;
+        }
+
+        nlohmann::ordered_json data;
+        input >> data;
+        if (data.value("schema_version", 0) != 1 || data.value("source", "") != "opencode") {
+            LOG_ERR("unsupported Vegas conversation fixture schema or source: %s\n", path.c_str());
+            return false;
+        }
+
+        for (const auto & message : data.at("messages")) {
+            const std::string role = message.at("role").get<std::string>();
+            if (role != "user" && role != "assistant") {
+                LOG_ERR("unsupported role in Vegas conversation fixture: %s\n", role.c_str());
+                return false;
+            }
+            common_chat_msg parsed;
+            parsed.role = role;
+            parsed.content = message.at("content").get<std::string>();
+            fixture.messages.push_back(std::move(parsed));
+            fixture.message_session_ids.push_back(message.at("source_session_id").get<std::string>());
+            fixture.message_session_titles.push_back(message.at("source_title").get<std::string>());
+        }
+        const auto & reference = data.at("reference");
+        if (reference.at("role").get<std::string>() != "assistant") {
+            LOG_ERR("Vegas conversation reference must be an assistant message\n");
+            return false;
+        }
+        fixture.reference = reference.at("content").get<std::string>();
+    } catch (const std::exception & error) {
+        LOG_ERR("failed to parse Vegas conversation fixture %s: %s\n", path.c_str(), error.what());
+        return false;
+    }
+
+    if (fixture.messages.empty() || fixture.messages.back().role != "user" || fixture.reference.empty()) {
+        LOG_ERR("Vegas conversation fixture must end in a user message followed by a non-empty reference\n");
+        return false;
+    }
+    return true;
+}
+
+static bool prepare_conversation_prompt(
+        llama_context * ctx,
+        llama_model * model,
+        const common_params & params,
+        const vegas_options & options,
+        vegas_conversation_prompt & result) {
+    vegas_conversation_fixture fixture;
+    if (!load_conversation_fixture(options.conversation_file, fixture)) {
+        return false;
+    }
+
+    auto templates = common_chat_templates_init(model, params.chat_template);
+    if (!templates) {
+        LOG_ERR("failed to initialize the model's native chat template\n");
+        return false;
+    }
+
+    auto format = [&](int32_t start) {
+        common_chat_templates_inputs inputs;
+        inputs.messages.assign(fixture.messages.begin() + start, fixture.messages.end());
+        inputs.add_generation_prompt = true;
+        inputs.use_jinja = params.use_jinja;
+        inputs.reasoning_format = params.reasoning_format;
+        inputs.enable_thinking = params.enable_reasoning != 0;
+        return common_chat_templates_apply(templates.get(), inputs).prompt;
+    };
+
+    std::vector<int32_t> starts;
+    for (int32_t i = 0; i < (int32_t) fixture.messages.size(); ++i) {
+        if (fixture.messages[i].role == "user") {
+            starts.push_back(i);
+        }
+    }
+    if (starts.empty()) {
+        LOG_ERR("Vegas conversation fixture contains no user turn\n");
+        return false;
+    }
+
+    const int32_t budget = options.prompt_tokens > 0 ? options.prompt_tokens : INT32_MAX;
+    int32_t low = 0;
+    int32_t high = (int32_t) starts.size() - 1;
+    int32_t chosen = -1;
+    std::string chosen_text;
+    std::vector<llama_token> chosen_tokens;
+    while (low <= high) {
+        const int32_t middle = low + (high - low) / 2;
+        std::string text = format(starts[middle]);
+        auto tokens = common_tokenize(ctx, text, false, true);
+        if ((int32_t) tokens.size() <= budget) {
+            chosen = starts[middle];
+            chosen_text = std::move(text);
+            chosen_tokens = std::move(tokens);
+            high = middle - 1;
+        } else {
+            low = middle + 1;
+        }
+    }
+    if (chosen < 0 || chosen_tokens.size() < 2) {
+        LOG_ERR("no complete conversation suffix fits the %d-token prompt budget\n", budget);
+        return false;
+    }
+
+    result.prompt = std::move(chosen_tokens);
+    result.message_start = chosen;
+    result.message_count = (int32_t) fixture.messages.size() - chosen;
+    result.token_budget = options.prompt_tokens;
+    result.prompt_hash = hash_tokens(result.prompt);
+    for (int32_t i = chosen; i < (int32_t) fixture.messages.size(); ++i) {
+        const std::string & session_id = fixture.message_session_ids[i];
+        if (result.session_ids.empty() || result.session_ids.back() != session_id) {
+            result.session_ids.push_back(session_id);
+            result.session_titles.push_back(fixture.message_session_titles[i]);
+        }
+    }
+
+    if (options.reference_tokens > 0) {
+        auto with_reference = common_tokenize(ctx, chosen_text + fixture.reference, false, true);
+        if (with_reference.size() <= result.prompt.size() ||
+                !std::equal(result.prompt.begin(), result.prompt.end(), with_reference.begin())) {
+            LOG_ERR("reference answer is not token-prefix-compatible with the model's native generation prompt\n");
+            return false;
+        }
+        result.reference.assign(with_reference.begin() + result.prompt.size(), with_reference.end());
+        if ((int32_t) result.reference.size() > options.reference_tokens) {
+            result.reference.resize(options.reference_tokens);
+        }
+        result.reference_hash = hash_tokens(result.reference);
+    }
+    return true;
+}
+
 static bool mode_uses_mtp(vegas_run_mode mode) {
     return mode == vegas_run_mode::mtp || mode == vegas_run_mode::mtp_vegas ||
             mode == vegas_run_mode::mtp_hierarchical || mode == vegas_run_mode::mtp_auto;
@@ -565,6 +752,17 @@ static bool parse_vegas_options(
             }
             continue;
         }
+        if (const char * value = get_value("--vegas-reference-tokens")) {
+            if (!parse_i32(value, options.reference_tokens)) {
+                LOG_ERR("invalid --vegas-reference-tokens: %s\n", value);
+                return false;
+            }
+            continue;
+        }
+        if (const char * value = get_value("--vegas-conversation-file")) {
+            options.conversation_file = value;
+            continue;
+        }
         if (const char * value = get_value("--vegas-mtp-ubatch")) {
             if (!parse_i32(value, options.mtp_ubatch)) {
                 LOG_ERR("invalid --vegas-mtp-ubatch: %s\n", value);
@@ -580,6 +778,7 @@ static bool parse_vegas_options(
             options.min_tokens < 1 || options.max_tokens < 0 || options.gamma < 1 ||
             options.anchor_tokens < 0 || options.refresh_interval < 1 ||
             options.mtp_ubatch < 1 || options.prompt_tokens < 0 || options.prompt_tokens == 1 ||
+            options.reference_tokens < 0 ||
             !(options.adaptive_beta >= 0.0f && options.adaptive_beta < 1.0f) ||
             options.hierarchical.target_tokens < 1 || options.hierarchical.max_tokens < 1 ||
             options.hierarchical.target_tokens > options.hierarchical.max_tokens ||
@@ -779,7 +978,8 @@ static bool run_same_prefix_diagnostic(
         const vegas_options & options,
         llama_batch & batch,
         vegas_metrics & metrics,
-        same_prefix_metrics & diagnostic) {
+        same_prefix_metrics & diagnostic,
+        const std::vector<llama_token> & reference) {
     const int32_t n_vocab = llama_vocab_n_tokens(vocab);
     if (n_vocab <= 0) {
         LOG_ERR("same-prefix diagnostic requires a non-empty vocabulary\n");
@@ -788,7 +988,9 @@ static bool run_same_prefix_diagnostic(
 
     bool has_eog = false;
     const int64_t start = ggml_time_us();
-    while (!has_eog && (params.n_predict < 0 || metrics.n_predict < params.n_predict)) {
+    while (!has_eog &&
+            (params.n_predict < 0 || metrics.n_predict < params.n_predict) &&
+            (reference.empty() || metrics.n_predict < (int32_t) reference.size())) {
         same_prefix_step_trace trace;
         trace.position = n_past;
 
@@ -870,14 +1072,19 @@ static bool run_same_prefix_diagnostic(
         metrics.collect_us += ggml_time_us() - collect_start;
 
         const int64_t comparison_start = ggml_time_us();
-        trace.comparison = vegas_same_prefix_compare(dense_logits, sparse_logits, 10);
+        trace.reference_token = reference.empty() ? -1 : reference[metrics.n_predict];
+        trace.comparison = vegas_same_prefix_compare(
+                dense_logits, sparse_logits, 10, trace.reference_token);
         trace.comparison_us = ggml_time_us() - comparison_start;
 
         const int64_t sample_start = ggml_time_us();
-        const llama_token next = common_sampler_sample(sampler, ctx, 0, true);
+        const llama_token next = reference.empty() ?
+                common_sampler_sample(sampler, ctx, 0, true) : trace.reference_token;
         common_sampler_accept(sampler, next, true);
         metrics.sample_us += ggml_time_us() - sample_start;
-        trace.sampled_dense_token = next;
+        if (reference.empty()) {
+            trace.sampled_dense_token = next;
+        }
 
         diagnostic.add(trace);
         if (options.same_prefix_trace) {
@@ -1853,10 +2060,31 @@ static std::string same_prefix_summary_json(
     const auto mean = [&](double sum) {
         return metrics.probes > 0 ? sum / metrics.probes : 0.0;
     };
+    const auto prefix_mean = [](const std::vector<double> & values, size_t count) {
+        const size_t n = std::min(values.size(), count);
+        double sum = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            sum += values[i];
+        }
+        return n > 0 ? sum / n : 0.0;
+    };
+    const auto percentile = [](std::vector<double> values, double p) {
+        if (values.empty()) {
+            return 0.0;
+        }
+        std::sort(values.begin(), values.end());
+        const size_t index = (size_t) std::ceil(p * values.size()) - 1;
+        return values[std::min(index, values.size() - 1)];
+    };
+    const int64_t n_reference = metrics.dense_reference_nlls.size();
+    const double mean_dense_reference_nll = n_reference > 0 ?
+            metrics.dense_reference_nll_sum / n_reference : 0.0;
+    const double mean_sparse_reference_nll = n_reference > 0 ?
+            metrics.sparse_reference_nll_sum / n_reference : 0.0;
 
     std::ostringstream out;
     out << "\"same_prefix\":true"
-        << ",\"same_prefix_trace_schema\":1"
+        << ",\"same_prefix_trace_schema\":2"
         << ",\"same_prefix_distribution\":\"raw_softmax\""
         << ",\"same_prefix_top_k\":10"
         << ",\"same_prefix_probes\":" << metrics.probes
@@ -1878,7 +2106,23 @@ static std::string same_prefix_summary_json(
         << ",\"same_prefix_mean_kl_sparse_dense\":" << mean(metrics.kl_sparse_dense_sum)
         << ",\"same_prefix_mean_jensen_shannon\":" << mean(metrics.jensen_shannon_sum)
         << ",\"same_prefix_mean_total_variation\":" << mean(metrics.total_variation_sum)
+        << ",\"same_prefix_p95_total_variation\":" << percentile(metrics.total_variations, 0.95)
         << ",\"same_prefix_mean_top10_overlap\":" << mean(metrics.top_k_overlap_sum)
+        << ",\"same_prefix_teacher_forced\":" << (n_reference > 0 ? "true" : "false")
+        << ",\"same_prefix_reference_probes\":" << n_reference
+        << ",\"same_prefix_mean_dense_reference_nll\":" << mean_dense_reference_nll
+        << ",\"same_prefix_mean_sparse_reference_nll\":" << mean_sparse_reference_nll
+        << ",\"same_prefix_mean_reference_nll_delta\":"
+        << mean_sparse_reference_nll - mean_dense_reference_nll
+        << ",\"same_prefix_first16_mean_total_variation\":" << prefix_mean(metrics.total_variations, 16)
+        << ",\"same_prefix_first32_mean_total_variation\":" << prefix_mean(metrics.total_variations, 32)
+        << ",\"same_prefix_first128_mean_total_variation\":" << prefix_mean(metrics.total_variations, 128)
+        << ",\"same_prefix_first16_reference_nll_delta\":"
+        << prefix_mean(metrics.sparse_reference_nlls, 16) - prefix_mean(metrics.dense_reference_nlls, 16)
+        << ",\"same_prefix_first32_reference_nll_delta\":"
+        << prefix_mean(metrics.sparse_reference_nlls, 32) - prefix_mean(metrics.dense_reference_nlls, 32)
+        << ",\"same_prefix_first128_reference_nll_delta\":"
+        << prefix_mean(metrics.sparse_reference_nlls, 128) - prefix_mean(metrics.dense_reference_nlls, 128)
         << ",\"same_prefix_sparse_ms\":" << metrics.sparse_us / 1e3
         << ",\"same_prefix_dense_ms\":" << metrics.dense_us / 1e3
         << ",\"same_prefix_state_ms\":" << metrics.state_us / 1e3
@@ -1896,6 +2140,7 @@ static std::string same_prefix_summary_json(
             const auto & comparison = trace.comparison;
             out << "{\"position\":" << trace.position
                 << ",\"sampled_dense_token\":" << trace.sampled_dense_token
+                << ",\"reference_token\":" << trace.reference_token
                 << ",\"dense_top_token\":" << comparison.dense.top_token
                 << ",\"sparse_top_token\":" << comparison.sparse.top_token
                 << ",\"top1_match\":" << (comparison.top1_match ? "true" : "false")
@@ -1916,6 +2161,12 @@ static std::string same_prefix_summary_json(
                 << ",\"jensen_shannon\":" << comparison.jensen_shannon
                 << ",\"total_variation\":" << comparison.total_variation
                 << ",\"top10_overlap\":" << comparison.top_k_overlap
+                << ",\"dense_reference_probability\":" << comparison.dense_reference_probability
+                << ",\"sparse_reference_probability\":" << comparison.sparse_reference_probability
+                << ",\"dense_reference_rank\":" << comparison.dense_reference_rank
+                << ",\"sparse_reference_rank\":" << comparison.sparse_reference_rank
+                << ",\"dense_reference_nll\":" << comparison.dense_reference_nll
+                << ",\"sparse_reference_nll\":" << comparison.sparse_reference_nll
                 << ",\"sparse_ms\":" << trace.sparse_us / 1e3
                 << ",\"dense_ms\":" << trace.dense_us / 1e3
                 << ",\"state_ms\":" << trace.state_us / 1e3
@@ -1927,6 +2178,28 @@ static std::string same_prefix_summary_json(
     }
 
     return out.str();
+}
+
+static std::string conversation_prompt_summary_json(
+        const vegas_options & options,
+        const vegas_conversation_prompt & prompt) {
+    nlohmann::ordered_json data = {
+        { "conversation_fixture", options.conversation_file },
+        { "conversation_schema", 1 },
+        { "conversation_native_chat", true },
+        { "conversation_message_start", prompt.message_start },
+        { "conversation_message_count", prompt.message_count },
+        { "conversation_token_budget", prompt.token_budget },
+        { "conversation_budget_gap", prompt.token_budget > 0 ?
+                prompt.token_budget - (int32_t) prompt.prompt.size() : 0 },
+        { "conversation_prompt_hash", string_format("%016" PRIx64, prompt.prompt_hash) },
+        { "conversation_reference_tokens", prompt.reference.size() },
+        { "conversation_reference_hash", string_format("%016" PRIx64, prompt.reference_hash) },
+        { "conversation_session_ids", prompt.session_ids },
+        { "conversation_session_titles", prompt.session_titles },
+    };
+    std::string serialized = data.dump();
+    return serialized.substr(1, serialized.size() - 2);
 }
 
 static void print_result(
@@ -1946,6 +2219,9 @@ static void print_result(
     }
     if (!metrics.same_prefix_summary.empty()) {
         extra += "," + metrics.same_prefix_summary;
+    }
+    if (!metrics.prompt_summary.empty()) {
+        extra += "," + metrics.prompt_summary;
     }
 
     std::printf(
@@ -2031,6 +2307,15 @@ int main(int argc, char ** argv) {
         LOG_ERR("--vegas-same-prefix-trace requires --vegas-mode same-prefix\n");
         return 1;
     }
+    if (options.reference_tokens > 0 &&
+            (options.mode != vegas_run_mode::same_prefix || options.conversation_file.empty())) {
+        LOG_ERR("--vegas-reference-tokens requires same-prefix mode and --vegas-conversation-file\n");
+        return 1;
+    }
+    if (!options.conversation_file.empty() && !params.prompt.empty()) {
+        LOG_ERR("--vegas-conversation-file cannot be combined with a raw prompt or prompt file\n");
+        return 1;
+    }
 
     params.sampling.backend_sampling = false;
     if (options.mode == vegas_run_mode::mtp_auto && params.speculative.has_dft()) {
@@ -2055,19 +2340,24 @@ int main(int argc, char ** argv) {
     llama_context * ctx = init->context();
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
-    std::vector<llama_token> prompt = common_tokenize(ctx, params.prompt, true, true);
+    vegas_conversation_prompt conversation;
+    std::vector<llama_token> prompt;
+    if (!options.conversation_file.empty()) {
+        if (!prepare_conversation_prompt(ctx, model, params, options, conversation)) {
+            return 1;
+        }
+        prompt = conversation.prompt;
+    } else {
+        prompt = common_tokenize(ctx, params.prompt, true, true);
+        if (options.prompt_tokens > 0 && options.prompt_tokens != (int32_t) prompt.size()) {
+            LOG_ERR("raw prompt has %zu tokens; --vegas-prompt-tokens no longer repeats or truncates it\n",
+                    prompt.size());
+            return 1;
+        }
+    }
     if (prompt.size() < 2) {
         LOG_ERR("prompt must contain at least two tokens\n");
         return 1;
-    }
-    if (options.prompt_tokens > 0 && options.prompt_tokens != (int32_t) prompt.size()) {
-        std::vector<llama_token> resized;
-        resized.reserve(options.prompt_tokens);
-        resized.push_back(prompt.front());
-        for (int32_t i = 1; i < options.prompt_tokens; ++i) {
-            resized.push_back(prompt[1 + (i - 1) % (prompt.size() - 1)]);
-        }
-        prompt = std::move(resized);
     }
 
     resolve_auto_policy(options, params, model, (int32_t) prompt.size());
@@ -2171,6 +2461,9 @@ int main(int argc, char ** argv) {
 
     vegas_metrics metrics;
     metrics.n_prompt = (int32_t) prompt.size();
+    if (!options.conversation_file.empty()) {
+        metrics.prompt_summary = conversation_prompt_summary_json(options, conversation);
+    }
     const int64_t prompt_start = ggml_time_us();
 
     if (!decode_prompt(ctx, prompt, (int32_t) prompt.size() - 1, spec.get())) {
@@ -2209,7 +2502,8 @@ int main(int argc, char ** argv) {
     common_speculative_begin(spec.get(), 0, history);
 
     common_sampler_ptr sampler(common_sampler_init(model, params.sampling));
-    llama_token id_last = common_sampler_sample(sampler.get(), ctx, 0, true);
+    llama_token id_last = conversation.reference.empty() ?
+            common_sampler_sample(sampler.get(), ctx, 0, true) : conversation.reference.front();
     common_sampler_accept(sampler.get(), id_last, true);
     history.push_back(id_last);
     record_token(ctx, id_last, options.quiet, metrics);
@@ -2229,7 +2523,7 @@ int main(int argc, char ** argv) {
     } else if (options.mode == vegas_run_mode::same_prefix) {
         ok = run_same_prefix_diagnostic(
                 ctx, vocab, sampler.get(), id_last, (int32_t) prompt.size(),
-                params, options, batch, metrics, same_prefix);
+                params, options, batch, metrics, same_prefix, conversation.reference);
         metrics.same_prefix_summary = same_prefix_summary_json(options, same_prefix);
     } else if (options.mode == vegas_run_mode::mtp_hierarchical) {
         ok = run_mtp_hierarchical(

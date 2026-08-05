@@ -23,9 +23,17 @@ struct vegas_same_prefix_comparison {
     double jensen_shannon = 0.0;
     double total_variation = 0.0;
     double top_k_overlap = 0.0;
+    int32_t reference_token = -1;
+    int32_t dense_reference_rank = 0;
+    int32_t sparse_reference_rank = 0;
+    double dense_reference_probability = 0.0;
+    double sparse_reference_probability = 0.0;
+    double dense_reference_nll = 0.0;
+    double sparse_reference_nll = 0.0;
 };
 
 vegas_same_prefix_comparison vegas_same_prefix_compare(
         const std::vector<float> & dense_logits,
         const std::vector<float> & sparse_logits,
-        int32_t top_k = 10);
+        int32_t top_k = 10,
+        int32_t reference_token = -1);

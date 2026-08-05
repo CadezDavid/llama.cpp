@@ -32,8 +32,11 @@ def parse_args():
     parser.add_argument("--binary", required=True)
     parser.add_argument("--model", required=True)
     parser.add_argument("--draft-model")
-    parser.add_argument("--prompt", required=True)
+    prompt = parser.add_mutually_exclusive_group(required=True)
+    prompt.add_argument("--prompt")
+    prompt.add_argument("--conversation-file")
     parser.add_argument("--prompt-tokens", type=int, required=True)
+    parser.add_argument("--reference-tokens", type=int, default=0)
     parser.add_argument("--context", type=int, required=True)
     parser.add_argument("--predict", type=int, default=256)
     parser.add_argument("--repetitions", type=int, default=5)
@@ -61,6 +64,7 @@ def parse_args():
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--cache-type-k", default="q8_0")
     parser.add_argument("--cache-type-v", default="turbo4")
+    parser.add_argument("--sparse-kernel", choices=("direct", "gather"), default="direct")
     parser.add_argument("--draft-cache-type-k")
     parser.add_argument("--draft-cache-type-v")
     parser.add_argument("--output", type=Path, required=True)
@@ -81,7 +85,6 @@ def command_for(args, mode):
     command = [
         args.binary,
         "-m", args.model,
-        "-f", args.prompt,
         "--vegas-prompt-tokens", str(args.prompt_tokens),
         "-n", str(args.predict),
         "-c", str(args.context),
@@ -97,6 +100,11 @@ def command_for(args, mode):
         "--vegas-quiet",
         "--vegas-mode", mode,
     ]
+    conversation_file = getattr(args, "conversation_file", None)
+    if conversation_file:
+        command.extend(["--vegas-conversation-file", conversation_file])
+    else:
+        command.extend(["-f", args.prompt])
     if args.draft_model and mode in mtp_modes:
         command.extend(["-md", args.draft_model])
     if mode in mtp_modes:
@@ -119,6 +127,7 @@ def command_for(args, mode):
             "--vegas-ratio", str(args.ratio),
             "--vegas-min-tokens", str(args.min_tokens),
             "--vegas-anchor-tokens", str(args.anchor_tokens),
+            "--vegas-sparse-kernel", getattr(args, "sparse_kernel", "direct"),
         ])
     if mode in {"mtp-vegas", "mtp-hierarchical", "same-prefix"} and args.selection_layer is not None:
         command.extend(["--vegas-selection-layer", str(args.selection_layer)])
@@ -135,6 +144,8 @@ def command_for(args, mode):
             command.append("--vegas-hier-trace")
     if mode == "same-prefix" and getattr(args, "same_prefix_trace", False):
         command.append("--vegas-same-prefix-trace")
+    if mode == "same-prefix" and getattr(args, "reference_tokens", 0) > 0:
+        command.extend(["--vegas-reference-tokens", str(args.reference_tokens)])
     return command
 
 
@@ -176,7 +187,10 @@ def run_one(args, mode, repetition, order):
         "batch": args.batch,
         "ubatch": args.ubatch,
         "seed": args.seed,
-        "prompt": args.prompt,
+        "prompt": getattr(args, "prompt", None),
+        "conversation_file": getattr(args, "conversation_file", None),
+        "requested_reference_tokens": getattr(args, "reference_tokens", 0),
+        "requested_sparse_kernel": getattr(args, "sparse_kernel", "direct"),
         "requested_mode": mode,
         "requested_gamma": (
             args.self_gamma if mode == "vegas" and args.self_gamma is not None else

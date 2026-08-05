@@ -7,7 +7,7 @@ from pathlib import Path
 
 
 DEFAULT_DATABASE = Path.home() / ".local/share/opencode/opencode.db"
-DEFAULT_OUTPUT = Path("/tmp/opencode-vegas-technical-conversations.txt")
+DEFAULT_OUTPUT = Path("/tmp/opencode-vegas-technical-conversations.json")
 
 # Long, coherent technical conversations selected from the local OpenCode
 # database. Keep the tutorial last so the transcript can end at its final user
@@ -56,32 +56,55 @@ def load_conversation(connection, session_id):
             continue
         text = message_text(connection, message_id)
         if text:
-            messages.append((role, text))
-    return title, messages
+            messages.append({"role": role, "content": text})
+    merged = []
+    for message in messages:
+        if merged and merged[-1]["role"] == message["role"]:
+            merged[-1]["content"] += "\n\n" + message["content"]
+        else:
+            merged.append(message)
+    return title, merged
 
 
-def render_prompt(database, session_ids=DEFAULT_SESSIONS):
+def build_fixture(database, session_ids=DEFAULT_SESSIONS):
     uri = f"file:{database}?mode=ro"
     with sqlite3.connect(uri, uri=True) as connection:
         conversations = [load_conversation(connection, session_id) for session_id in session_ids]
 
-    sections = []
-    for index, (title, messages) in enumerate(conversations, start=1):
-        if not messages:
+    fixture_messages = []
+    sources = []
+    reference = None
+    for index, (title, session_messages) in enumerate(conversations, start=1):
+        if not session_messages:
             raise RuntimeError(f"OpenCode session has no usable conversation text: {session_ids[index - 1]}")
-        if index == len(conversations) and messages[-1][0] == "assistant":
-            messages = messages[:-1]
-        lines = [f"## OpenCode conversation {index}: {title}"]
-        for role, content in messages:
-            lines.extend(("", f"{role.title()}:", content))
-        sections.append("\n".join(lines))
-    return "\n\n".join(sections) + "\n\nAssistant:\n"
+        session_id = session_ids[index - 1]
+        sources.append({"session_id": session_id, "title": title})
+        for message in session_messages:
+            message["source_session_id"] = session_id
+            message["source_title"] = title
+
+        if index == len(conversations):
+            if session_messages[-1]["role"] != "assistant":
+                raise RuntimeError(f"last OpenCode session does not end in an assistant reference: {session_id}")
+            reference = session_messages.pop()
+        fixture_messages.extend(session_messages)
+
+    if reference is None or not fixture_messages or fixture_messages[-1]["role"] != "user":
+        raise RuntimeError("fixture must end at the user message immediately before the reference answer")
+
+    return {
+        "schema_version": 1,
+        "source": "opencode",
+        "sessions": sources,
+        "messages": fixture_messages,
+        "reference": reference,
+    }
 
 
 def ensure_prompt(database=DEFAULT_DATABASE, output=DEFAULT_OUTPUT):
-    prompt = render_prompt(database)
+    fixture = build_fixture(database)
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(prompt, encoding="utf-8")
+    output.write_text(json.dumps(fixture, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return output
 
 
