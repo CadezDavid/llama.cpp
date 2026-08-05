@@ -51,6 +51,8 @@ def parse_args():
     parser.add_argument("--modes", nargs="+", choices=MODES, default=MODES)
     parser.add_argument("--self-gamma", type=int, default=1)
     parser.add_argument("--mtp-gamma", type=int, default=3)
+    parser.add_argument("--adaptive-gamma", action="store_true")
+    parser.add_argument("--adaptive-beta", type=float, default=0.9)
     parser.add_argument("--mtp-ubatch", type=int, default=128)
     parser.add_argument("--long-mtp-ubatch", type=int, default=64)
     parser.add_argument("--ratio", type=float, default=0.03)
@@ -134,15 +136,22 @@ def main():
                     gamma=args.mtp_gamma,
                     self_gamma=args.self_gamma,
                     mtp_gamma=args.mtp_gamma,
+                    adaptive_gamma=args.adaptive_gamma,
+                    adaptive_beta=args.adaptive_beta,
                     mtp_ubatch=mtp_ubatch,
                     ratio=args.ratio,
                     min_tokens=args.min_tokens,
+                    selection_layer=None,
+                    anchor_tokens=0,
+                    refresh_interval=1,
                     batch=args.batch,
                     ubatch=ubatch,
                     seed=args.seed,
                     temperature=args.temperature,
                     cache_type_k=cache_k,
                     cache_type_v=cache_v,
+                    draft_cache_type_k=None,
+                    draft_cache_type_v=None,
                     output=output,
                 )
 

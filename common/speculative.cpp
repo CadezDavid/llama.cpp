@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <cstring>
 #include <iomanip>
 #include <map>
@@ -1680,6 +1681,37 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 auto & result = *dp.result;
 
                 result.push_back(id);
+
+                if (dp.observer != nullptr) {
+                    double probability_sum = 0.0;
+                    for (size_t k = 0; k < cur_p->size; ++k) {
+                        if (std::isfinite(cur_p->data[k].p) && cur_p->data[k].p > 0.0f) {
+                            probability_sum += cur_p->data[k].p;
+                        }
+                    }
+
+                    double entropy = 0.0;
+                    if (probability_sum > 0.0) {
+                        for (size_t k = 0; k < cur_p->size; ++k) {
+                            const double p = cur_p->data[k].p / probability_sum;
+                            if (p > 0.0) {
+                                entropy -= p * std::log(p);
+                            }
+                        }
+                    }
+
+                    const common_speculative_draft_observation observation {
+                        /* .position        = */ (int32_t) result.size(),
+                        /* .top_probability = */ probability_sum > 0.0 ?
+                                (float) (cur_p->data[0].p / probability_sum) : 0.0f,
+                        /* .entropy         = */ (float) entropy,
+                    };
+                    if (!dp.observer(dp.observer_userdata, observation)) {
+                        drafting[seq_id] = false;
+                        n_drafting--;
+                        continue;
+                    }
+                }
 
                 if (params.n_max <= (int) result.size()) {
                     drafting[seq_id] = false;

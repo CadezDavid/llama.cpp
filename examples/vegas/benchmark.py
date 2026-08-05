@@ -39,6 +39,8 @@ def parse_args():
     parser.add_argument("--repetitions", type=int, default=5)
     parser.add_argument("--modes", nargs="+", default=["baseline", "mtp", "vegas", "mtp-vegas"])
     parser.add_argument("--gamma", type=int, default=5)
+    parser.add_argument("--adaptive-gamma", action="store_true")
+    parser.add_argument("--adaptive-beta", type=float, default=0.9)
     parser.add_argument("--self-gamma", type=int)
     parser.add_argument("--mtp-gamma", type=int)
     parser.add_argument("--mtp-ubatch", type=int, default=128)
@@ -98,6 +100,11 @@ def command_for(args, mode):
         ])
     if mode != "baseline":
         command.extend(["--vegas-gamma", str(gamma)])
+    if args.adaptive_gamma and mode in {"mtp", "mtp-vegas", "mtp-auto"}:
+        command.extend([
+            "--vegas-adaptive-gamma",
+            "--vegas-adaptive-beta", str(args.adaptive_beta),
+        ])
     if mode in {"vegas", "mtp-vegas"}:
         command.extend([
             "--vegas-ratio", str(args.ratio),
@@ -156,6 +163,8 @@ def run_one(args, mode, repetition, order):
             args.mtp_gamma if mode in {"mtp", "mtp-vegas", "mtp-auto"} and args.mtp_gamma is not None else
             args.gamma
         ),
+        "requested_adaptive_gamma": args.adaptive_gamma,
+        "requested_adaptive_beta": args.adaptive_beta,
         "requested_ratio": args.ratio,
         "requested_min_tokens": args.min_tokens,
         "requested_selection_layer": args.selection_layer,

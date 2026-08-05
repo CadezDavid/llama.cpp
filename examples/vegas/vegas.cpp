@@ -3,6 +3,7 @@
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
+#include "adaptive-gamma.h"
 #include "llama-ext.h"
 #include "llama.h"
 
@@ -40,6 +41,8 @@ struct vegas_options {
     int32_t mtp_ubatch = 128;
     int32_t prompt_tokens = 0;
     bool auto_policy = false;
+    bool adaptive_gamma = false;
+    float adaptive_beta = 0.9f;
     bool quiet = false;
 };
 
@@ -75,6 +78,7 @@ struct vegas_metrics {
     int32_t n_rejected = 0;
     int32_t n_reused = 0;
     uint64_t output_hash = UINT64_C(1469598103934665603);
+    std::string adaptive_summary;
 };
 
 static const char * mode_name(vegas_run_mode mode) {
@@ -145,6 +149,10 @@ static bool parse_vegas_options(
             options.quiet = true;
             continue;
         }
+        if (arg == "--vegas-adaptive-gamma") {
+            options.adaptive_gamma = true;
+            continue;
+        }
 
         if (const char * value = get_value("--vegas-mode")) {
             if (std::strcmp(value, "baseline") == 0) {
@@ -194,6 +202,13 @@ static bool parse_vegas_options(
             }
             continue;
         }
+        if (const char * value = get_value("--vegas-adaptive-beta")) {
+            if (!parse_f32(value, options.adaptive_beta)) {
+                LOG_ERR("invalid --vegas-adaptive-beta: %s\n", value);
+                return false;
+            }
+            continue;
+        }
         if (const char * value = get_value("--vegas-selection-layer")) {
             if (!parse_i32(value, options.selection_layer)) {
                 LOG_ERR("invalid --vegas-selection-layer: %s\n", value);
@@ -238,9 +253,14 @@ static bool parse_vegas_options(
     if (!(options.sparse_ratio > 0.0f && options.sparse_ratio <= 1.0f) ||
             options.min_tokens < 1 || options.max_tokens < 0 || options.gamma < 1 ||
             options.anchor_tokens < 0 || options.refresh_interval < 1 ||
-            options.mtp_ubatch < 1 || options.prompt_tokens < 0 || options.prompt_tokens == 1) {
+            options.mtp_ubatch < 1 || options.prompt_tokens < 0 || options.prompt_tokens == 1 ||
+            !(options.adaptive_beta >= 0.0f && options.adaptive_beta < 1.0f)) {
         LOG_ERR("invalid Vegas configuration\n");
         return false;
+    }
+
+    if (options.adaptive_gamma) {
+        options.gamma = vegas_adaptive_gamma::max_gamma;
     }
 
     return true;
@@ -612,12 +632,19 @@ static bool run_mtp(
     const bool sparse = options.mode == vegas_run_mode::mtp_vegas;
     bool has_eog = false;
     const int32_t current_gamma = options.gamma;
+    vegas_adaptive_gamma adaptive(options.adaptive_beta);
     const int64_t start = ggml_time_us();
 
     while (!has_eog && (params.n_predict < 0 || metrics.n_predict < params.n_predict)) {
         const int32_t remaining = params.n_predict < 0 ? INT32_MAX : params.n_predict - metrics.n_predict;
         const int32_t n_max = remaining > 1 ? std::min(current_gamma, remaining - 1) : 0;
         llama_tokens draft;
+        int64_t cycle_draft_us = 0;
+        int64_t cycle_verify_us = 0;
+
+        if (options.adaptive_gamma && n_max > 0) {
+            adaptive.begin_cycle();
+        }
 
         if (n_max > 0) {
             if (sparse && metrics.n_cycles % options.refresh_interval == 0) {
@@ -630,7 +657,8 @@ static bool run_mtp(
                 return false;
             }
 
-            common_speculative_get_draft_params(spec, 0) = {
+            auto & draft_params = common_speculative_get_draft_params(spec, 0);
+            draft_params = {
                 /* .drafting = */ true,
                 /* .n_max    = */ n_max,
                 /* .n_past   = */ n_past,
@@ -638,11 +666,16 @@ static bool run_mtp(
                 /* .prompt   = */ &history,
                 /* .result   = */ &draft,
             };
+            if (options.adaptive_gamma) {
+                draft_params.observer = vegas_adaptive_gamma::observer;
+                draft_params.observer_userdata = &adaptive;
+            }
 
             const int64_t draft_start = ggml_time_us();
             common_speculative_draft(spec);
             llama_synchronize(ctx_dft);
-            metrics.draft_us += ggml_time_us() - draft_start;
+            cycle_draft_us = ggml_time_us() - draft_start;
+            metrics.draft_us += cycle_draft_us;
             metrics.n_drafted += (int32_t) draft.size();
 
             llama_vegas_pause(ctx_dft);
@@ -673,7 +706,8 @@ static bool run_mtp(
             return false;
         }
         llama_synchronize(ctx);
-        metrics.verify_us += ggml_time_us() - verify_start;
+        cycle_verify_us = ggml_time_us() - verify_start;
+        metrics.verify_us += cycle_verify_us;
 
         if (refresh_indices) {
             const int64_t collect_start = ggml_time_us();
@@ -730,6 +764,11 @@ static bool run_mtp(
 
         common_speculative_accept(spec, 0, accepted);
 
+        if (options.adaptive_gamma && !draft.empty()) {
+            adaptive.finish_cycle((int32_t) draft.size(), accepted, cycle_draft_us, cycle_verify_us);
+            metrics.adaptive_summary = adaptive.summary_json();
+        }
+
         n_past += accepted + 1;
         id_last = next;
         ++metrics.n_cycles;
@@ -769,7 +808,7 @@ static void print_result(
         "\"accept_rate\":%.6f,\"total_ms\":%.3f,\"tokens_per_second\":%.6f,"
         "\"prompt_ms\":%.3f,\"initial_select_ms\":%.3f,\"draft_ms\":%.3f,"
         "\"verify_ms\":%.3f,\"collect_ms\":%.3f,\"sample_ms\":%.3f,"
-        "\"rollback_ms\":%.3f}\n",
+        "\"rollback_ms\":%.3f%s%s}\n",
         mode_name(options.mode), params.model.path.c_str(),
         metrics.n_prompt, metrics.n_predict, options.gamma, options.auto_policy ? "true" : "false",
         options.selection_layer, options.anchor_tokens, options.refresh_interval,
@@ -784,7 +823,9 @@ static void print_result(
         metrics.prompt_us / 1e3, metrics.initial_select_us / 1e3,
         metrics.draft_us / 1e3, metrics.verify_us / 1e3,
         metrics.collect_us / 1e3, metrics.sample_us / 1e3,
-        metrics.rollback_us / 1e3);
+        metrics.rollback_us / 1e3,
+        metrics.adaptive_summary.empty() ? "" : ",",
+        metrics.adaptive_summary.c_str());
 }
 
 int main(int argc, char ** argv) {
@@ -819,6 +860,10 @@ int main(int argc, char ** argv) {
     }
     if (params.sampling.mirostat != 0 || params.sampling.xtc_probability != 0.0f) {
         LOG_ERR("Vegas does not support stateful or randomized probability transforms\n");
+        return 1;
+    }
+    if (options.adaptive_gamma && !mode_uses_mtp(options.mode)) {
+        LOG_ERR("--vegas-adaptive-gamma requires an MTP mode\n");
         return 1;
     }
 
@@ -859,6 +904,9 @@ int main(int argc, char ** argv) {
     }
 
     resolve_auto_policy(options, params, model, (int32_t) prompt.size());
+    if (options.adaptive_gamma) {
+        options.gamma = vegas_adaptive_gamma::max_gamma;
+    }
     params.speculative.draft.n_max = options.gamma;
 
     common_speculative_init_result_ptr spec_init;

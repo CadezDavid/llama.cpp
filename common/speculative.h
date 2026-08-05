@@ -5,6 +5,16 @@
 
 struct common_speculative;
 
+struct common_speculative_draft_observation {
+    int32_t position = 0;
+    float top_probability = 0.0f;
+    float entropy = 0.0f;
+};
+
+using common_speculative_draft_observer = bool (*)(
+        void * userdata,
+        const common_speculative_draft_observation & observation);
+
 // comma separated list the provided types
 std::string common_speculative_type_name_str(const std::vector<enum common_speculative_type> & types);
 
@@ -48,6 +58,11 @@ struct common_speculative_draft_params {
 
     // the generated draft from the last _draft() call
     llama_tokens * result;
+
+    // Optional per-token observer. Returning false stops this draft after the
+    // observed token without discarding it.
+    common_speculative_draft_observer observer = nullptr;
+    void * observer_userdata = nullptr;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
