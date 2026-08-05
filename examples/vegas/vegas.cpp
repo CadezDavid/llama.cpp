@@ -56,6 +56,7 @@ struct vegas_options {
     float adaptive_beta = 0.9f;
     vegas_hierarchical_limits hierarchical;
     bool hierarchical_trace = false;
+    bool hierarchical_recompute_state = false;
     bool same_prefix_trace = false;
     bool quiet = false;
     int32_t sparse_kernel = LLAMA_VEGAS_SPARSE_KERNEL_AUTO;
@@ -261,6 +262,11 @@ struct hierarchical_cycle_trace {
     int32_t end_pos = 0;
     int64_t dense_us = 0;
     int64_t dense_sample_us = 0;
+    int64_t recompute_us = 0;
+    int64_t recompute_target_us = 0;
+    int64_t recompute_mtp_us = 0;
+    int64_t recompute_plan_us = 0;
+    int32_t recompute_input_tokens = 0;
 };
 
 struct hierarchical_metrics {
@@ -273,6 +279,10 @@ struct hierarchical_metrics {
     int64_t plan_us = 0;
     int64_t state_us = 0;
     int64_t rollback_us = 0;
+    int64_t recompute_us = 0;
+    int64_t recompute_target_us = 0;
+    int64_t recompute_mtp_us = 0;
+    int64_t recompute_plan_us = 0;
 
     int64_t outer_cycles = 0;
     int64_t inner_rounds = 0;
@@ -297,12 +307,14 @@ struct hierarchical_metrics {
     int64_t position_mismatches = 0;
     int64_t snapshot_failures = 0;
     int64_t empty_drafts = 0;
+    int64_t recompute_decodes = 0;
+    int64_t recompute_input_tokens = 0;
 
-    std::array<int64_t, 7> round_histogram {};
-    std::array<int64_t, 21> provisional_histogram {};
-    std::array<int64_t, 11> sparse_prefix_histogram {};
-    std::array<int64_t, 21> dense_prefix_histogram {};
-    std::array<int64_t, 12> sparse_mismatch_histogram {};
+    std::array<int64_t, 52> round_histogram {};
+    std::array<int64_t, 52> provisional_histogram {};
+    std::array<int64_t, 52> sparse_prefix_histogram {};
+    std::array<int64_t, 52> dense_prefix_histogram {};
+    std::array<int64_t, 52> sparse_mismatch_histogram {};
     std::array<int64_t, 3> correction_histogram {};
     std::array<int64_t, 8> stop_histogram {};
     std::array<int64_t, 3> proposed_by_source {};
@@ -634,6 +646,10 @@ static bool parse_vegas_options(
             options.hierarchical_trace = true;
             continue;
         }
+        if (arg == "--vegas-hier-recompute-state") {
+            options.hierarchical_recompute_state = true;
+            continue;
+        }
         if (arg == "--vegas-same-prefix-trace") {
             options.same_prefix_trace = true;
             continue;
@@ -799,6 +815,7 @@ static bool parse_vegas_options(
             !(options.adaptive_beta >= 0.0f && options.adaptive_beta < 1.0f) ||
             options.hierarchical.target_tokens < 1 || options.hierarchical.max_tokens < 1 ||
             options.hierarchical.target_tokens > options.hierarchical.max_tokens ||
+            options.hierarchical.max_tokens > 50 ||
             options.hierarchical.max_rounds < 1 || options.hierarchical.max_corrections < 1) {
         LOG_ERR("invalid Vegas configuration\n");
         return false;
@@ -1721,8 +1738,10 @@ static bool run_mtp_hierarchical(
                 round.sparse_discarded_inputs = batch.n_tokens - valid_inputs;
                 hierarchical.sparse_valid_input_tokens += valid_inputs;
                 hierarchical.sparse_discarded_input_tokens += round.sparse_discarded_inputs;
-                hierarchical.sparse_mismatch_histogram[
-                        mismatch ? std::min<int32_t>(round.sparse_mismatch_index, 10) : 11]++;
+                hierarchical.sparse_mismatch_histogram[mismatch ?
+                        std::min<size_t>(round.sparse_mismatch_index,
+                                hierarchical.sparse_mismatch_histogram.size() - 2) :
+                        hierarchical.sparse_mismatch_histogram.size() - 1]++;
 
                 const int64_t process_start = ggml_time_us();
                 const int32_t sparse_batch_tokens = batch.n_tokens;
@@ -1789,6 +1808,11 @@ static bool run_mtp_hierarchical(
         llama_vegas_pause(ctx_dft);
         const llama_pos target_pos_before_restore = llama_memory_seq_pos_max(llama_get_memory(ctx), 0);
         const llama_pos draft_pos_before_restore = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), 0);
+        if (options.hierarchical_recompute_state && !llama_memory_restore_recurrent(ctx, 0)) {
+            hierarchical.snapshot_failures++;
+            LOG_ERR("failed to restore target recurrent checkpoint before low-memory dense verification\n");
+            return false;
+        }
         const bool target_restored = remove_after(ctx, outer_n_past);
         const bool draft_restored = remove_after(ctx_dft, outer_n_past);
         if (!target_restored || !draft_restored) {
@@ -1799,7 +1823,7 @@ static bool run_mtp_hierarchical(
                     (int) draft_pos_before_restore, outer_n_past);
             return false;
         }
-        if (!llama_memory_restore_recurrent(ctx, 0)) {
+        if (!options.hierarchical_recompute_state && !llama_memory_restore_recurrent(ctx, 0)) {
             hierarchical.snapshot_failures++;
             LOG_ERR("failed to restore target recurrent checkpoint before dense verification\n");
             return false;
@@ -1817,6 +1841,12 @@ static bool run_mtp_hierarchical(
         }
         const int64_t restore_us = ggml_time_us() - restore_start;
         hierarchical.state_us += restore_us;
+
+        if (options.hierarchical_recompute_state && !llama_memory_checkpoint_recurrent(ctx, 0)) {
+            hierarchical.snapshot_failures++;
+            LOG_ERR("failed to checkpoint target recurrent state before low-memory dense verification\n");
+            return false;
+        }
 
         const bool refresh_indices = (metrics.n_cycles + 1) % options.refresh_interval == 0;
         if (refresh_indices) {
@@ -1850,14 +1880,16 @@ static bool run_mtp_hierarchical(
         }
 
         const int64_t process_start = ggml_time_us();
-        if (!common_speculative_process(spec, batch)) {
-            LOG_ERR("failed to process dense hierarchical verification for MTP\n");
-            return false;
+        if (!options.hierarchical_recompute_state) {
+            if (!common_speculative_process(spec, batch)) {
+                LOG_ERR("failed to process dense hierarchical verification for MTP\n");
+                return false;
+            }
+            llama_synchronize(ctx_dft);
+            hierarchical.mtp_process_us += ggml_time_us() - process_start;
         }
-        llama_synchronize(ctx_dft);
-        hierarchical.mtp_process_us += ggml_time_us() - process_start;
 
-        if (refresh_indices) {
+        if (refresh_indices && !options.hierarchical_recompute_state) {
             const int64_t plan_start = ggml_time_us();
             if (!llama_vegas_collect_indices(ctx)) {
                 LOG_ERR("failed to collect authoritative hierarchical Vegas indices\n");
@@ -1924,6 +1956,69 @@ static bool run_mtp_hierarchical(
         hierarchical.dense_sample_us += cycle.dense_sample_us;
         metrics.sample_us += cycle.dense_sample_us;
 
+        if (options.hierarchical_recompute_state) {
+            const int64_t recompute_start = ggml_time_us();
+            llama_vegas_pause(ctx);
+            llama_vegas_pause(ctx_dft);
+            if (!llama_memory_restore_recurrent(ctx, 0)) {
+                hierarchical.snapshot_failures++;
+                LOG_ERR("failed to restore target recurrent state after dense verification\n");
+                return false;
+            }
+            if (!remove_after(ctx, outer_n_past) || !remove_after(ctx_dft, outer_n_past)) {
+                hierarchical.rollback_failures++;
+                LOG_ERR("failed to restore low-memory hierarchical prefix before replay\n");
+                return false;
+            }
+            if (!common_speculative_set_state(spec, 0, spec_state)) {
+                hierarchical.snapshot_failures++;
+                LOG_ERR("failed to restore MTP state before committed-prefix replay\n");
+                return false;
+            }
+
+            if (refresh_indices) {
+                llama_vegas_set_mode(ctx, LLAMA_VEGAS_MODE_VERIFY, outer_n_past + 1);
+            } else {
+                llama_vegas_pause(ctx);
+            }
+            common_batch_clear(batch);
+            common_batch_add(batch, outer_id_last, outer_n_past, { 0 }, true);
+            for (int32_t i = 0; i < accepted; ++i) {
+                common_batch_add(batch, provisional[i], outer_n_past + i + 1, { 0 }, true);
+            }
+            cycle.recompute_input_tokens = batch.n_tokens;
+            const int64_t recompute_target_start = ggml_time_us();
+            if (llama_decode(ctx, batch) != 0) {
+                LOG_ERR("failed to replay committed dense hierarchical prefix\n");
+                return false;
+            }
+            llama_synchronize(ctx);
+            cycle.recompute_target_us = ggml_time_us() - recompute_target_start;
+            const int64_t recompute_mtp_start = ggml_time_us();
+            if (!common_speculative_process(spec, batch)) {
+                LOG_ERR("failed to process committed-prefix replay for MTP\n");
+                return false;
+            }
+            llama_synchronize(ctx_dft);
+            cycle.recompute_mtp_us = ggml_time_us() - recompute_mtp_start;
+
+            if (refresh_indices) {
+                const int64_t recompute_plan_start = ggml_time_us();
+                if (!llama_vegas_collect_indices(ctx)) {
+                    LOG_ERR("failed to collect Vegas indices after committed-prefix replay\n");
+                    return false;
+                }
+                cycle.recompute_plan_us = ggml_time_us() - recompute_plan_start;
+            }
+            cycle.recompute_us = ggml_time_us() - recompute_start;
+            hierarchical.recompute_us += cycle.recompute_us;
+            hierarchical.recompute_target_us += cycle.recompute_target_us;
+            hierarchical.recompute_mtp_us += cycle.recompute_mtp_us;
+            hierarchical.recompute_plan_us += cycle.recompute_plan_us;
+            hierarchical.recompute_decodes++;
+            hierarchical.recompute_input_tokens += cycle.recompute_input_tokens;
+        }
+
         common_speculative_accept(spec, 0, accepted);
 
         const int32_t committed = accepted + (emitted_dense_extra ? 1 : 0);
@@ -1946,7 +2041,9 @@ static bool run_mtp_hierarchical(
         hierarchical.correction_histogram[std::min(corrections, 2)]++;
         hierarchical.stop_histogram[(int) stop]++;
         for (const auto & round : cycle.rounds) {
-            hierarchical.sparse_prefix_histogram[std::min(round.sparse_accepted, 10)]++;
+            hierarchical.sparse_prefix_histogram[
+                    std::min<size_t>(round.sparse_accepted,
+                            hierarchical.sparse_prefix_histogram.size() - 1)]++;
         }
 
         const int64_t rollback_start = ggml_time_us();
@@ -1985,11 +2082,14 @@ static std::string hierarchical_summary_json(
         const hierarchical_metrics & metrics) {
     std::ostringstream out;
     out << "\"hierarchical\":true"
-        << ",\"hierarchical_trace_schema\":2"
+        << ",\"hierarchical_trace_schema\":3"
         << ",\"hierarchical_target\":" << options.hierarchical.target_tokens
         << ",\"hierarchical_max_tokens\":" << options.hierarchical.max_tokens
         << ",\"hierarchical_max_rounds\":" << options.hierarchical.max_rounds
         << ",\"hierarchical_max_corrections\":" << options.hierarchical.max_corrections
+        << ",\"hierarchical_recompute_state\":" << (options.hierarchical_recompute_state ? "true" : "false")
+        << ",\"hierarchical_target_state_capacity\":"
+        << (options.hierarchical_recompute_state ? options.gamma : options.hierarchical.max_tokens)
         << ",\"hierarchical_outer_cycles\":" << metrics.outer_cycles
         << ",\"hierarchical_inner_rounds\":" << metrics.inner_rounds
         << ",\"hierarchical_mtp_drafted\":" << metrics.mtp_drafted
@@ -2022,6 +2122,12 @@ static std::string hierarchical_summary_json(
         << ",\"hierarchical_plan_ms\":" << metrics.plan_us / 1e3
         << ",\"hierarchical_state_ms\":" << metrics.state_us / 1e3
         << ",\"hierarchical_rollback_ms\":" << metrics.rollback_us / 1e3
+        << ",\"hierarchical_recompute_ms\":" << metrics.recompute_us / 1e3
+        << ",\"hierarchical_recompute_target_ms\":" << metrics.recompute_target_us / 1e3
+        << ",\"hierarchical_recompute_mtp_ms\":" << metrics.recompute_mtp_us / 1e3
+        << ",\"hierarchical_recompute_plan_ms\":" << metrics.recompute_plan_us / 1e3
+        << ",\"hierarchical_recompute_decodes\":" << metrics.recompute_decodes
+        << ",\"hierarchical_recompute_input_tokens\":" << metrics.recompute_input_tokens
         << ",\"hierarchical_device_entropy_samples\":" << metrics.device_entropy_samples
         << ",\"hierarchical_fallback_entropy_samples\":" << metrics.fallback_entropy_samples
         << ",\"hierarchical_rollback_failures\":" << metrics.rollback_failures
@@ -2080,6 +2186,11 @@ static std::string hierarchical_summary_json(
                 << ",\"end_pos\":" << cycle.end_pos
                 << ",\"dense_ms\":" << cycle.dense_us / 1e3
                 << ",\"dense_sample_ms\":" << cycle.dense_sample_us / 1e3
+                << ",\"recompute_ms\":" << cycle.recompute_us / 1e3
+                << ",\"recompute_target_ms\":" << cycle.recompute_target_us / 1e3
+                << ",\"recompute_mtp_ms\":" << cycle.recompute_mtp_us / 1e3
+                << ",\"recompute_plan_ms\":" << cycle.recompute_plan_us / 1e3
+                << ",\"recompute_input_tokens\":" << cycle.recompute_input_tokens
                 << ",\"rounds\":[";
             for (size_t j = 0; j < cycle.rounds.size(); ++j) {
                 if (j > 0) out << ",";
@@ -2390,6 +2501,10 @@ int main(int argc, char ** argv) {
         LOG_ERR("--vegas-hier-trace requires --vegas-mode mtp-hierarchical\n");
         return 1;
     }
+    if (options.hierarchical_recompute_state && options.mode != vegas_run_mode::mtp_hierarchical) {
+        LOG_ERR("--vegas-hier-recompute-state requires --vegas-mode mtp-hierarchical\n");
+        return 1;
+    }
     if (options.same_prefix_trace && options.mode != vegas_run_mode::same_prefix) {
         LOG_ERR("--vegas-same-prefix-trace requires --vegas-mode same-prefix\n");
         return 1;
@@ -2409,7 +2524,8 @@ int main(int argc, char ** argv) {
         options.gamma = 1;
     }
     const int32_t target_state_capacity = options.mode == vegas_run_mode::mtp_hierarchical ?
-            options.hierarchical.max_tokens : options.mode == vegas_run_mode::same_prefix ?
+            (options.hierarchical_recompute_state ? options.gamma : options.hierarchical.max_tokens) :
+            options.mode == vegas_run_mode::same_prefix ?
             1 : (options.adaptive_gamma ? vegas_adaptive_gamma::max_gamma : options.gamma);
     if (options.mode != vegas_run_mode::baseline) {
         params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };

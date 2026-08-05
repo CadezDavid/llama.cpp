@@ -49,6 +49,7 @@ def parse_args():
     parser.add_argument("--hier-max-rounds", type=int, default=3)
     parser.add_argument("--hier-max-corrections", type=int, default=2)
     parser.add_argument("--hier-trace", action="store_true")
+    parser.add_argument("--hier-recompute-state", action="store_true")
     parser.add_argument("--same-prefix-trace", action="store_true")
     parser.add_argument("--self-gamma", type=int)
     parser.add_argument("--mtp-gamma", type=int)
@@ -142,6 +143,8 @@ def command_for(args, mode):
         ])
         if args.hier_trace:
             command.append("--vegas-hier-trace")
+        if getattr(args, "hier_recompute_state", False):
+            command.append("--vegas-hier-recompute-state")
     if mode == "same-prefix" and getattr(args, "same_prefix_trace", False):
         command.append("--vegas-same-prefix-trace")
     if mode == "same-prefix" and getattr(args, "reference_tokens", 0) > 0:
@@ -209,6 +212,7 @@ def run_one(args, mode, repetition, order):
         "requested_hier_max_rounds": args.hier_max_rounds,
         "requested_hier_max_corrections": args.hier_max_corrections,
         "requested_hier_trace": args.hier_trace,
+        "requested_hier_recompute_state": getattr(args, "hier_recompute_state", False),
         "requested_same_prefix_trace": getattr(args, "same_prefix_trace", False),
         "requested_draft_cache_type_k": args.draft_cache_type_k or args.cache_type_k,
         "requested_draft_cache_type_v": args.draft_cache_type_v or args.cache_type_v,
