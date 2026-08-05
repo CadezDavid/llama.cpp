@@ -2410,11 +2410,12 @@ int main(int argc, char ** argv) {
     if (options.mode == vegas_run_mode::mtp_auto && params.speculative.has_dft()) {
         options.gamma = 1;
     }
+    const int32_t target_state_capacity = options.mode == vegas_run_mode::mtp_hierarchical ?
+            options.hierarchical.max_tokens : options.mode == vegas_run_mode::same_prefix ?
+            1 : (options.adaptive_gamma ? vegas_adaptive_gamma::max_gamma : options.gamma);
     if (options.mode != vegas_run_mode::baseline) {
         params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
-        params.speculative.draft.n_max = options.mode == vegas_run_mode::mtp_hierarchical ?
-                options.hierarchical.max_tokens :
-                (options.adaptive_gamma ? vegas_adaptive_gamma::max_gamma : options.gamma);
+        params.speculative.draft.n_max = target_state_capacity;
     }
 
     llama_backend_init();
@@ -2450,14 +2451,15 @@ int main(int argc, char ** argv) {
     }
 
     resolve_auto_policy(options, params, model, (int32_t) prompt.size());
-    const int32_t draft_capacity = options.mode == vegas_run_mode::mtp_hierarchical ?
-            options.hierarchical.max_tokens : options.mode == vegas_run_mode::same_prefix ?
+    const int32_t mtp_capacity = options.mode == vegas_run_mode::same_prefix ?
             1 : (options.adaptive_gamma ? vegas_adaptive_gamma::max_gamma : options.gamma);
+    const int32_t sparse_block_capacity = options.mode == vegas_run_mode::mtp_hierarchical ?
+            options.hierarchical.max_tokens : mtp_capacity;
     // A reused plan can straddle the previous verification block, the current
     // provisional block, and one MTP boundary block. Reserve that full guard
     // block; the runtime still attends only the active recent span.
-    const int32_t recent_capacity = (options.refresh_interval + 2) * (draft_capacity + 1);
-    params.speculative.draft.n_max = draft_capacity;
+    const int32_t recent_capacity = (options.refresh_interval + 2) * (sparse_block_capacity + 1);
+    params.speculative.draft.n_max = mtp_capacity;
 
     common_speculative_init_result_ptr spec_init;
     common_speculative_ptr spec;
@@ -2543,7 +2545,7 @@ int main(int argc, char ** argv) {
         }
     }
 
-    if (prompt.size() + draft_capacity + 1 > llama_n_ctx(ctx)) {
+    if (prompt.size() + sparse_block_capacity + 1 > llama_n_ctx(ctx)) {
         LOG_ERR("prompt and draft exceed the context size\n");
         return 1;
     }
@@ -2560,7 +2562,8 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    llama_batch batch = llama_batch_init(std::max((int32_t) llama_n_batch(ctx), draft_capacity + 1), 0, 1);
+    llama_batch batch = llama_batch_init(
+            std::max((int32_t) llama_n_batch(ctx), sparse_block_capacity + 1), 0, 1);
     const int32_t last_pos = (int32_t) prompt.size() - 1;
 
     if (mode_uses_vegas(options.mode)) {
