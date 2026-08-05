@@ -60,61 +60,6 @@ static __global__ void gather_dequant_q8_turbo4_f16(
     V_f16[i] = __float2half(vval);
 }
 
-static __global__ void sparse_gather_q8_turbo4(
-        const char * __restrict__ K,
-        const char * __restrict__ V,
-        const int *  __restrict__ indices,
-        char *       __restrict__ K_gathered,
-        char *       __restrict__ V_gathered,
-        half *       __restrict__ mask_f16,
-        int64_t k_row_bytes,
-        int64_t v_row_bytes,
-        int64_t n_kv,
-        int64_t n_kv_padded,
-        int64_t n_head_kv,
-        int64_t nb11,
-        int64_t nb12,
-        int64_t nb21,
-        int64_t nb22,
-        int32_t n_indices,
-        int32_t suffix_start) {
-    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
-    const int64_t n_rows = n_head_kv * n_kv_padded;
-    const int64_t n_k_bytes = n_rows * k_row_bytes;
-    const int64_t n_v_bytes = n_rows * v_row_bytes;
-
-    if (i < n_kv_padded) {
-        mask_f16[i] = __float2half(i < n_kv ? 0.0f : -INFINITY);
-    }
-
-    if (i < n_k_bytes) {
-        const int64_t byte = i % k_row_bytes;
-        const int64_t row = i / k_row_bytes;
-        const int64_t i_kv = row % n_kv_padded;
-        const int64_t i_head = row / n_kv_padded;
-        if (i_kv < n_kv) {
-            const int64_t i_actual = n_indices == suffix_start ? i_kv :
-                    (i_kv < n_indices ? indices[i_kv] : suffix_start + i_kv - n_indices);
-            K_gathered[i] = K[i_head * nb12 + i_actual * nb11 + byte];
-        } else {
-            K_gathered[i] = 0;
-        }
-    }
-    if (i < n_v_bytes) {
-        const int64_t byte = i % v_row_bytes;
-        const int64_t row = i / v_row_bytes;
-        const int64_t i_kv = row % n_kv_padded;
-        const int64_t i_head = row / n_kv_padded;
-        if (i_kv < n_kv) {
-            const int64_t i_actual = n_indices == suffix_start ? i_kv :
-                    (i_kv < n_indices ? indices[i_kv] : suffix_start + i_kv - n_indices);
-            V_gathered[i] = V[i_head * nb22 + i_actual * nb21 + byte];
-        } else {
-            V_gathered[i] = 0;
-        }
-    }
-}
-
 static void ggml_cuda_flash_attn_ext_sparse_gather(
         ggml_backend_cuda_context & ctx,
         ggml_tensor * dst);
@@ -463,7 +408,7 @@ static void ggml_cuda_flash_attn_ext_q8_turbo4_f16(
     ggml_tensor * indices = dst->src[5];
 
     GGML_ASSERT(Q->ne[1] == 1 && Q->ne[3] == 1);
-    GGML_ASSERT(Q->ne[0] == 256 && V->ne[0] == Q->ne[0]);
+    GGML_ASSERT((Q->ne[0] == 256 || Q->ne[0] == 512) && V->ne[0] == Q->ne[0]);
     GGML_ASSERT(K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_TURBO4_0);
     GGML_ASSERT(indices == nullptr || indices->type == GGML_TYPE_I32);
 
@@ -554,85 +499,10 @@ static void ggml_cuda_flash_attn_ext_sparse_gather(
     GGML_ASSERT(K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_TURBO4_0);
     GGML_ASSERT(indices != nullptr && indices->type == GGML_TYPE_I32);
 
-    if (Q->ne[0] == 256) {
-        ggml_cuda_flash_attn_ext_q8_turbo4_f16(ctx, dst);
-        return;
-    }
-
-    const int32_t n_indices = ggml_get_op_params_i32(dst, 4);
-    const int32_t n_kv = ggml_get_op_params_i32(dst, 5);
-    const int32_t suffix_start = ggml_get_op_params_i32(dst, 6);
-    const int64_t n_kv_padded = GGML_PAD((int64_t) n_kv, (int64_t) FATTN_KQ_STRIDE);
-    const int64_t k_row_bytes = ggml_row_size(K->type, K->ne[0]);
-    const int64_t v_row_bytes = ggml_row_size(V->type, V->ne[0]);
-    const int64_t n_rows = n_kv_padded * K->ne[2];
-    const int64_t n_k_bytes = n_rows * k_row_bytes;
-    const int64_t n_v_bytes = n_rows * v_row_bytes;
-
-    ggml_cuda_pool_alloc<char> K_gathered(ctx.pool(), n_k_bytes);
-    ggml_cuda_pool_alloc<char> V_gathered(ctx.pool(), n_v_bytes);
-    ggml_cuda_pool_alloc<half> mask_f16(ctx.pool(), n_kv_padded);
-
-    const int threads = 256;
-    const int64_t work = std::max(std::max(n_k_bytes, n_v_bytes), n_kv_padded);
-    const int blocks = (int) ((work + threads - 1) / threads);
-    sparse_gather_q8_turbo4<<<blocks, threads, 0, ctx.stream()>>>(
-            (const char *) K->data,
-            (const char *) V->data,
-            (const int *) indices->data,
-            K_gathered.ptr,
-            V_gathered.ptr,
-            mask_f16.ptr,
-            k_row_bytes,
-            v_row_bytes,
-            n_kv,
-            n_kv_padded,
-            K->ne[2],
-            K->nb[1],
-            K->nb[2],
-            V->nb[1],
-            V->nb[2],
-            n_indices,
-            suffix_start);
-    CUDA_CHECK(cudaGetLastError());
-
-    ggml_tensor gathered_K = *K;
-    gathered_K.ne[1] = n_kv_padded;
-    gathered_K.nb[1] = k_row_bytes;
-    gathered_K.nb[2] = n_kv_padded * gathered_K.nb[1];
-    gathered_K.nb[3] = K->ne[2] * gathered_K.nb[2];
-    gathered_K.data = K_gathered.ptr;
-    gathered_K.view_src = nullptr;
-    gathered_K.view_offs = 0;
-
-    ggml_tensor gathered_V = *V;
-    gathered_V.ne[1] = n_kv_padded;
-    gathered_V.nb[1] = v_row_bytes;
-    gathered_V.nb[2] = n_kv_padded * gathered_V.nb[1];
-    gathered_V.nb[3] = V->ne[2] * gathered_V.nb[2];
-    gathered_V.data = V_gathered.ptr;
-    gathered_V.view_src = nullptr;
-    gathered_V.view_offs = 0;
-
-    ggml_tensor gathered_mask = {};
-    gathered_mask.type = GGML_TYPE_F16;
-    gathered_mask.ne[0] = n_kv_padded;
-    gathered_mask.ne[1] = 1;
-    gathered_mask.ne[2] = 1;
-    gathered_mask.ne[3] = 1;
-    gathered_mask.nb[0] = sizeof(half);
-    gathered_mask.nb[1] = n_kv_padded * sizeof(half);
-    gathered_mask.nb[2] = gathered_mask.nb[1];
-    gathered_mask.nb[3] = gathered_mask.nb[2];
-    gathered_mask.data = mask_f16.ptr;
-
-    ggml_tensor gathered_dst = *dst;
-    gathered_dst.src[1] = &gathered_K;
-    gathered_dst.src[2] = &gathered_V;
-    gathered_dst.src[3] = &gathered_mask;
-    gathered_dst.src[5] = nullptr;
-
-    ggml_cuda_flash_attn_ext(ctx, &gathered_dst);
+    // Gather and dequantize only the selected rows, then run the validated f16
+    // MMA kernel. Avoiding an intermediate compressed gather removes one full
+    // read/write pass and reduces peak temporary storage.
+    ggml_cuda_flash_attn_ext_q8_turbo4_f16(ctx, dst);
 }
 
 #define FATTN_VEC_CASE(D, type_K, type_V)                                                                        \
