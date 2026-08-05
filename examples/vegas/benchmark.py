@@ -41,6 +41,11 @@ def parse_args():
     parser.add_argument("--gamma", type=int, default=5)
     parser.add_argument("--adaptive-gamma", action="store_true")
     parser.add_argument("--adaptive-beta", type=float, default=0.9)
+    parser.add_argument("--hier-target", type=int, default=8)
+    parser.add_argument("--hier-max-tokens", type=int, default=10)
+    parser.add_argument("--hier-max-rounds", type=int, default=3)
+    parser.add_argument("--hier-max-corrections", type=int, default=2)
+    parser.add_argument("--hier-trace", action="store_true")
     parser.add_argument("--self-gamma", type=int)
     parser.add_argument("--mtp-gamma", type=int)
     parser.add_argument("--mtp-ubatch", type=int, default=128)
@@ -67,7 +72,9 @@ def command_for(args, mode):
     gamma = args.gamma
     if mode == "vegas" and args.self_gamma is not None:
         gamma = args.self_gamma
-    if mode in {"mtp", "mtp-vegas", "mtp-auto"} and args.mtp_gamma is not None:
+    mtp_modes = {"mtp", "mtp-vegas", "mtp-auto", "mtp-hierarchical"}
+    vegas_modes = {"vegas", "mtp-vegas", "mtp-hierarchical"}
+    if mode in mtp_modes and args.mtp_gamma is not None:
         gamma = args.mtp_gamma
 
     command = [
@@ -89,9 +96,9 @@ def command_for(args, mode):
         "--vegas-quiet",
         "--vegas-mode", mode,
     ]
-    if args.draft_model and mode in {"mtp", "mtp-vegas", "mtp-auto"}:
+    if args.draft_model and mode in mtp_modes:
         command.extend(["-md", args.draft_model])
-    if mode in {"mtp", "mtp-vegas", "mtp-auto"}:
+    if mode in mtp_modes:
         command.extend([
             "-ngld", "99",
             "--vegas-mtp-ubatch", str(args.mtp_ubatch),
@@ -106,16 +113,25 @@ def command_for(args, mode):
             "--vegas-adaptive-gamma",
             "--vegas-adaptive-beta", str(args.adaptive_beta),
         ])
-    if mode in {"vegas", "mtp-vegas"}:
+    if mode in vegas_modes:
         command.extend([
             "--vegas-ratio", str(args.ratio),
             "--vegas-min-tokens", str(args.min_tokens),
             "--vegas-anchor-tokens", str(args.anchor_tokens),
         ])
-    if mode == "mtp-vegas" and args.selection_layer is not None:
+    if mode in {"mtp-vegas", "mtp-hierarchical"} and args.selection_layer is not None:
         command.extend(["--vegas-selection-layer", str(args.selection_layer)])
-    if mode == "mtp-vegas":
+    if mode in {"mtp-vegas", "mtp-hierarchical"}:
         command.extend(["--vegas-refresh-interval", str(args.refresh_interval)])
+    if mode == "mtp-hierarchical":
+        command.extend([
+            "--vegas-hier-target", str(args.hier_target),
+            "--vegas-hier-max-tokens", str(args.hier_max_tokens),
+            "--vegas-hier-max-rounds", str(args.hier_max_rounds),
+            "--vegas-hier-max-corrections", str(args.hier_max_corrections),
+        ])
+        if args.hier_trace:
+            command.append("--vegas-hier-trace")
     return command
 
 
@@ -161,7 +177,7 @@ def run_one(args, mode, repetition, order):
         "requested_mode": mode,
         "requested_gamma": (
             args.self_gamma if mode == "vegas" and args.self_gamma is not None else
-            args.mtp_gamma if mode in {"mtp", "mtp-vegas", "mtp-auto"} and args.mtp_gamma is not None else
+            args.mtp_gamma if mode in {"mtp", "mtp-vegas", "mtp-auto", "mtp-hierarchical"} and args.mtp_gamma is not None else
             args.gamma
         ),
         "requested_adaptive_gamma": args.adaptive_gamma and mode == "mtp-vegas",
@@ -171,6 +187,11 @@ def run_one(args, mode, repetition, order):
         "requested_selection_layer": args.selection_layer,
         "requested_anchor_tokens": args.anchor_tokens,
         "requested_refresh_interval": args.refresh_interval,
+        "requested_hier_target": args.hier_target,
+        "requested_hier_max_tokens": args.hier_max_tokens,
+        "requested_hier_max_rounds": args.hier_max_rounds,
+        "requested_hier_max_corrections": args.hier_max_corrections,
+        "requested_hier_trace": args.hier_trace,
         "requested_draft_cache_type_k": args.draft_cache_type_k or args.cache_type_k,
         "requested_draft_cache_type_v": args.draft_cache_type_v or args.cache_type_v,
     })
