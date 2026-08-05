@@ -1,0 +1,6 @@
+// Mixed q8_0 K + Turbo4 V indexed MMA decode instance for D=512, GQA=8.
+
+#include "../fattn-mma-f16.cuh"
+#include "../fattn-mma-turbo.cuh"
+
+DECL_FATTN_MMA_TURBO_CASE(512, 512, 1, 8, GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0);

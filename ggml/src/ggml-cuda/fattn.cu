@@ -505,6 +505,31 @@ static void ggml_cuda_flash_attn_ext_sparse_gather(
     ggml_cuda_flash_attn_ext_q8_turbo4_f16(ctx, dst);
 }
 
+static void ggml_cuda_flash_attn_ext_sparse_mma_q8_turbo4(
+        ggml_backend_cuda_context & ctx,
+        ggml_tensor * dst) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+
+    GGML_ASSERT(dst->src[5] != nullptr);
+    GGML_ASSERT(Q->ne[1] == 1 && Q->ne[3] == 1);
+    GGML_ASSERT(K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_TURBO4_0);
+    GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
+
+    const int gqa_ratio = Q->ne[2] / K->ne[2];
+    if (Q->ne[0] == 256) {
+        GGML_ASSERT(V->ne[0] == 256 && gqa_ratio == 4);
+        ggml_cuda_flash_attn_ext_mma_turbo_case<
+                256, 256, 2, 4, GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0>(ctx, dst);
+        return;
+    }
+
+    GGML_ASSERT(Q->ne[0] == 512 && V->ne[0] == 512 && gqa_ratio == 8);
+    ggml_cuda_flash_attn_ext_mma_turbo_case<
+            512, 512, 1, 8, GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0>(ctx, dst);
+}
+
 #define FATTN_VEC_CASE(D, type_K, type_V)                                                                        \
     {                                                                                                            \
         const bool type_K_okay = K->type == (type_K) || (K->type == GGML_TYPE_F32 && (type_K) == GGML_TYPE_F16); \
@@ -961,9 +986,12 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         const ggml_sparse_fattn_mode sparse_mode = ggml_flash_attn_ext_get_sparse_mode(dst);
         const bool q8_turbo4 = dst->src[1]->type == GGML_TYPE_Q8_0 &&
                 dst->src[2]->type == GGML_TYPE_TURBO4_0;
-        if (sparse_mode == GGML_SPARSE_FATTN_MODE_GATHER ||
-                (sparse_mode == GGML_SPARSE_FATTN_MODE_AUTO && q8_turbo4 && dst->src[0]->ne[0] == 512)) {
+        if (sparse_mode == GGML_SPARSE_FATTN_MODE_GATHER) {
             ggml_cuda_flash_attn_ext_sparse_gather(ctx, dst);
+            return;
+        }
+        if (sparse_mode == GGML_SPARSE_FATTN_MODE_AUTO && q8_turbo4) {
+            ggml_cuda_flash_attn_ext_sparse_mma_q8_turbo4(ctx, dst);
             return;
         }
         ggml_cuda_flash_attn_ext_vec(ctx, dst);
@@ -1039,10 +1067,16 @@ bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
         const ggml_tensor * K = dst->src[1];
         const ggml_tensor * V = dst->src[2];
         const bool q8_turbo4 = K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_TURBO4_0;
-        if (sparse_mode == GGML_SPARSE_FATTN_MODE_GATHER ||
-                (sparse_mode == GGML_SPARSE_FATTN_MODE_AUTO && q8_turbo4 && Q->ne[0] == 512)) {
+        if (sparse_mode == GGML_SPARSE_FATTN_MODE_GATHER) {
             return (Q->ne[0] == 256 || Q->ne[0] == 512) && V->ne[0] == Q->ne[0] &&
                     Q->ne[1] == 1 && Q->ne[3] == 1 && q8_turbo4 &&
+                    turing_mma_available(ggml_cuda_info().devices[device].cc);
+        }
+        if (sparse_mode == GGML_SPARSE_FATTN_MODE_AUTO && q8_turbo4) {
+            const int gqa_ratio = Q->ne[2] / K->ne[2];
+            return ((Q->ne[0] == 256 && gqa_ratio == 4) ||
+                    (Q->ne[0] == 512 && gqa_ratio == 8)) && V->ne[0] == Q->ne[0] &&
+                    Q->ne[1] == 1 && Q->ne[3] == 1 &&
                     turing_mma_available(ggml_cuda_info().devices[device].cc);
         }
         if ((sparse_mode == GGML_SPARSE_FATTN_MODE_DIRECT ||

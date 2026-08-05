@@ -1,14 +1,14 @@
-// Fused turbo4 (4-bit PolarQuant) MMA flash-attention DECODE launcher.
+// Fused quantized MMA flash-attention DECODE launcher.
 //
-// This is the host-side case launcher for the GQA-packed MMA path with turbo4 KV.
+// This is the host-side case launcher for the GQA-packed MMA path with quantized KV.
 // It reuses the f16 MMA device kernel (flash_attn_ext_f16 in fattn-mma-f16.cuh) but
-// instantiates it with type_K/type_V = TURBO4_0 so the in-kernel load tiles dequantize
-// raw turbo4 blocks straight into SRAM. Q is ALREADY rotated at the graph level
+// instantiates it with explicit K/V types so the in-kernel tile loaders dequantize
+// raw q8 or TurboQuant blocks straight into SRAM. Q is ALREADY rotated at the graph level
 // (src/llama-graph.cpp) and the FA output is inverse-rotated there too — this path does
 // NO inline FWHT and NO src swap (that would double-rotate Q).
 //
 // Differences vs ggml_cuda_flash_attn_ext_mma_f16_case:
-//   * nstages is forced to 0 inside the kernel for turbo (synchronous dequant load), so
+//   * nstages is forced to 0 inside the kernel for quantized KV (synchronous dequant load), so
 //     here we size shared memory for the 1-stage path.
 //   * launch_fattn is called with need_f16_K = need_f16_V = false, so launch_fattn does
 //     NOT pre-convert K/V to f16; the kernel receives the raw quantized bytes and the
@@ -35,12 +35,12 @@ void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, gg
     const int  nbatch_combine = ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols, cc);
     const bool Q_in_reg       = ggml_cuda_fattn_mma_get_Q_in_reg      (DKQ, DV, ncols, cc);
 
-    // turbo path is always single-stage synchronous (nstages forced to 0 in the kernel).
+    // Quantized KV is always single-stage synchronous (nstages forced to 0 in the kernel).
     const int cols_per_warp = std::min(ncols, get_cols_per_warp(cc));
     const int warp_size_host = ggml_cuda_info().devices[ctx.device].warp_size;
     const int nwarps         = nthreads / warp_size_host;
 
-    // turbo4 never aliases V onto K.
+    // Quantized mixed K/V never aliases V onto K.
     constexpr bool V_is_K_view = false;
 
     const size_t nbytes_shared_KV_1stage = nbatch_fa            * std::max(nbatch_K2 + 4,  nbatch_V2 + 4) * sizeof(half2);
@@ -87,7 +87,7 @@ void ggml_cuda_flash_attn_ext_mma_turbo_case(ggml_backend_cuda_context & ctx, gg
 #endif // !defined(GGML_USE_MUSA)
     }
 
-    // need_f16_K = need_f16_V = false: launch_fattn does NOT convert turbo bytes to f16;
+    // need_f16_K = need_f16_V = false: launch_fattn does NOT convert quantized bytes to f16;
     // the kernel receives raw quantized KV + the true byte pitch. stream_k = true.
     launch_fattn<DV, ncols1, ncols2>
         (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa,
@@ -116,3 +116,8 @@ DECL_FATTN_MMA_TURBO_ALL(128, 128, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0);
 DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0);
 DECL_FATTN_MMA_TURBO_ALL(128, 128, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO2_0);
 DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO2_0);
+
+// Sparse mixed-cache instances used by Vegas. Only the decode geometries
+// reached by Qwen27 (D=256, GQA=4) and Gemma 4 (D=512, GQA=8) are compiled.
+extern DECL_FATTN_MMA_TURBO_CASE(256, 256, 2, 4, GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0);
+extern DECL_FATTN_MMA_TURBO_CASE(512, 512, 1, 8, GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0);
