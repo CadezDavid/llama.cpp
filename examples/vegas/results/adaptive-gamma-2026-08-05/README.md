@@ -1,9 +1,14 @@
-# Adaptive MTP+Vegas gamma screening
+# Preliminary adaptive MTP+Vegas gamma screening
 
 ## Scope
 
-This is a one-pass screening of the SparseSpec-L-style adaptive speculation
-policy in `llama-vegas`. Every run uses MTP+Vegas, candidates gamma 1 through
+This is the preliminary one-pass screening of the SparseSpec-L-style adaptive
+speculation policy in `llama-vegas`. Entropy in these runs was normalized over
+the sampler's top-10 candidates rather than the full output distribution used
+by the paper. The paper-faithful rerun superseding these numbers is in
+`../adaptive-gamma-full-entropy-2026-08-05/`.
+
+Every run uses MTP+Vegas, candidates gamma 1 through
 10, entropy EMA beta 0.9, greedy sampling, 128 generated tokens, batch one,
 full CUDA offload, and an RTX 3090. The first speculative cycle uses gamma 10
 to seed the request-local entropy and cost estimates. Later cycles maximize:

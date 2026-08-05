@@ -1,0 +1,98 @@
+{
+  "gemma4-q8-turbo4": {
+    "32k": {
+      "sparse-adaptive": {
+        "adaptive_mean_gamma": 2.272727,
+        "median_accept_rate": 0.83,
+        "median_tps": 53.898005,
+        "n": 1,
+        "output_hashes": [
+          "6229f6bf4a3022be"
+        ]
+      }
+    },
+    "64k": {
+      "sparse-adaptive": {
+        "adaptive_mean_gamma": 1.104167,
+        "median_accept_rate": 0.283019,
+        "median_tps": 23.188528,
+        "n": 1,
+        "output_hashes": [
+          "6ac1972507f54eae"
+        ]
+      }
+    }
+  },
+  "qwen27-q8-turbo4": {
+    "32k": {
+      "sparse-adaptive": {
+        "adaptive_mean_gamma": 1.150685,
+        "median_accept_rate": 0.642857,
+        "median_tps": 36.733571,
+        "n": 1,
+        "output_hashes": [
+          "4c8cfb28cbc74b28"
+        ]
+      }
+    },
+    "64k": {
+      "sparse-adaptive": {
+        "adaptive_mean_gamma": 1.121622,
+        "median_accept_rate": 0.626506,
+        "median_tps": 29.823406,
+        "n": 1,
+        "output_hashes": [
+          "c4fab99998c98b60"
+        ]
+      }
+    }
+  },
+  "qwen35-q8-q4": {
+    "32k": {
+      "sparse-adaptive": {
+        "adaptive_mean_gamma": 1.149254,
+        "median_accept_rate": 0.779221,
+        "median_tps": 130.822362,
+        "n": 1,
+        "output_hashes": [
+          "ec98a1d21c7ee481"
+        ]
+      }
+    },
+    "64k": {
+      "sparse-adaptive": {
+        "adaptive_mean_gamma": 3.02439,
+        "median_accept_rate": 0.693548,
+        "median_tps": 128.860271,
+        "n": 1,
+        "output_hashes": [
+          "71d8073d300bd04a"
+        ]
+      }
+    }
+  },
+  "qwen35-q8-turbo4": {
+    "32k": {
+      "sparse-adaptive": {
+        "adaptive_mean_gamma": 1.149254,
+        "median_accept_rate": 0.766234,
+        "median_tps": 121.310571,
+        "n": 1,
+        "output_hashes": [
+          "a525172a459616e8"
+        ]
+      }
+    },
+    "64k": {
+      "sparse-adaptive": {
+        "adaptive_mean_gamma": 4.042553,
+        "median_accept_rate": 0.415789,
+        "median_tps": 95.55997,
+        "n": 1,
+        "output_hashes": [
+          "6d1b1be7725e72d4"
+        ]
+      }
+    }
+  }
+}

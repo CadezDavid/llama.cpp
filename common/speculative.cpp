@@ -1651,10 +1651,33 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     continue;
                 }
 
+                auto & dp = dparams.at(seq_id);
                 auto * smpl = smpls[seq_id].get();
 
                 common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
                 const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
+
+                double full_entropy = 0.0;
+                double full_top_probability = 0.0;
+                if (dp.observer != nullptr) {
+                    const float * logits = llama_get_logits_ith(ctx_dft, i_last[seq_id]);
+                    const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)));
+                    if (logits != nullptr && n_vocab > 0) {
+                        const float max_logit = *std::max_element(logits, logits + n_vocab);
+                        double sum = 0.0;
+                        double weighted_shifted_logit = 0.0;
+                        for (int32_t token = 0; token < n_vocab; ++token) {
+                            const double shifted = (double) logits[token] - max_logit;
+                            const double weight = std::exp(shifted);
+                            sum += weight;
+                            weighted_shifted_logit += weight * shifted;
+                        }
+                        if (sum > 0.0 && std::isfinite(sum)) {
+                            full_top_probability = 1.0 / sum;
+                            full_entropy = std::log(sum) - weighted_shifted_logit / sum;
+                        }
+                    }
+                }
 
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
 
@@ -1677,34 +1700,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 common_sampler_accept(smpl, id, true);
 
-                auto & dp = dparams.at(seq_id);
                 auto & result = *dp.result;
 
                 result.push_back(id);
 
                 if (dp.observer != nullptr) {
-                    double probability_sum = 0.0;
-                    for (size_t k = 0; k < cur_p->size; ++k) {
-                        if (std::isfinite(cur_p->data[k].p) && cur_p->data[k].p > 0.0f) {
-                            probability_sum += cur_p->data[k].p;
-                        }
-                    }
-
-                    double entropy = 0.0;
-                    if (probability_sum > 0.0) {
-                        for (size_t k = 0; k < cur_p->size; ++k) {
-                            const double p = cur_p->data[k].p / probability_sum;
-                            if (p > 0.0) {
-                                entropy -= p * std::log(p);
-                            }
-                        }
-                    }
-
                     const common_speculative_draft_observation observation {
                         /* .position        = */ (int32_t) result.size(),
-                        /* .top_probability = */ probability_sum > 0.0 ?
-                                (float) (cur_p->data[0].p / probability_sum) : 0.0f,
-                        /* .entropy         = */ (float) entropy,
+                        /* .top_probability = */ (float) full_top_probability,
+                        /* .entropy         = */ (float) full_entropy,
                     };
                     if (!dp.observer(dp.observer_userdata, observation)) {
                         drafting[seq_id] = false;
