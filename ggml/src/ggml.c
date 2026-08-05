@@ -5541,6 +5541,24 @@ void ggml_flash_attn_ext_set_sparse_kv(
     ggml_flash_attn_ext_set_sparse_kv_n_kv(a, n_kv);
 }
 
+void ggml_flash_attn_ext_set_sparse_mode(
+        struct ggml_tensor * a,
+        enum ggml_sparse_fattn_mode mode) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(mode == GGML_SPARSE_FATTN_MODE_DIRECT || mode == GGML_SPARSE_FATTN_MODE_GATHER);
+
+    ggml_set_op_params_i32(a, 7, (int32_t) mode);
+}
+
+enum ggml_sparse_fattn_mode ggml_flash_attn_ext_get_sparse_mode(
+        const struct ggml_tensor * a) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+
+    const int32_t mode = ggml_get_op_params_i32(a, 7);
+    GGML_ASSERT(mode == GGML_SPARSE_FATTN_MODE_DIRECT || mode == GGML_SPARSE_FATTN_MODE_GATHER);
+    return (enum ggml_sparse_fattn_mode) mode;
+}
+
 void ggml_flash_attn_ext_set_sparse_kv_n_kv(
         struct ggml_tensor * a,
         int32_t              n_kv) {

@@ -1269,6 +1269,20 @@ bool llama_context::vegas_enable(
         return false;
     }
 
+    if (vegas.sparse_kernel == llama_vegas_sparse_kernel::gather) {
+        LLAMA_LOG_ERROR("%s: Vegas gather sparse attention is not implemented yet\n", __func__);
+        return false;
+    }
+
+    if (vegas.sparse_kernel == llama_vegas_sparse_kernel::direct &&
+            cparams.type_k == GGML_TYPE_Q8_0 && cparams.type_v == GGML_TYPE_TURBO4_0) {
+        LLAMA_LOG_ERROR(
+                "%s: direct Vegas sparse attention is disabled for K=q8_0 V=turbo4; "
+                "the mixed-cache vector kernel does not pass the 100%%-retention correctness gate\n",
+                __func__);
+        return false;
+    }
+
     const int32_t plan_capacity = [&]() {
         const int32_t ratio_tokens = (int32_t) std::ceil(cparams.n_ctx * sparse_ratio);
         int32_t capacity = std::min<int32_t>(cparams.n_ctx, std::max(min_tokens, ratio_tokens));
@@ -1344,6 +1358,16 @@ bool llama_context::vegas_enable(
 
     sched_need_reserve = true;
 
+    return true;
+}
+
+bool llama_context::vegas_set_sparse_kernel(llama_vegas_sparse_kernel mode) {
+    if (mode != llama_vegas_sparse_kernel::direct && mode != llama_vegas_sparse_kernel::gather) {
+        return false;
+    }
+
+    vegas.sparse_kernel = mode;
+    sched_need_reserve = true;
     return true;
 }
 
@@ -4571,6 +4595,14 @@ bool llama_vegas_enable(
                int32_t max_tokens,
                int32_t max_recent_tokens) {
     return ctx->vegas_enable(sparse_ratio, min_tokens, max_tokens, max_recent_tokens);
+}
+
+bool llama_vegas_set_sparse_kernel(llama_context * ctx, int32_t mode) {
+    if (mode < (int32_t) llama_vegas_sparse_kernel::direct ||
+            mode > (int32_t) llama_vegas_sparse_kernel::gather) {
+        return false;
+    }
+    return ctx->vegas_set_sparse_kernel((llama_vegas_sparse_kernel) mode);
 }
 
 bool llama_vegas_set_selection_layer(llama_context * ctx, int32_t il) {

@@ -7086,9 +7086,10 @@ struct test_flash_attn_ext : public test_case {
     const ggml_type type_K;
     const ggml_type type_V;
     std::array<int32_t, 4> permute;
+    const int sparse_pattern; // 0=dense, 1=identity, 2=reverse, 3=reverse prefix + contiguous suffix
 
     std::string vars() override {
-        return VARS_TO_STR14(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute);
+        return VARS_TO_STR15(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, sparse_pattern);
     }
 
     double max_nmse_err() override {
@@ -7104,9 +7105,10 @@ struct test_flash_attn_ext : public test_case {
 
     test_flash_attn_ext(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 32, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 96, int64_t nb = 8,
                         bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
-                        ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3})
+                        ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
+                        int sparse_pattern = 0)
         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
-          type_K(type_K), type_V(type_V), permute(permute) {}
+          type_K(type_K), type_V(type_V), permute(permute), sparse_pattern(sparse_pattern) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
@@ -7167,6 +7169,15 @@ struct test_flash_attn_ext : public test_case {
         ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(hsk), max_bias, logit_softcap);
         ggml_flash_attn_ext_add_sinks(out, s);
         ggml_flash_attn_ext_set_prec (out, prec);
+        if (sparse_pattern != 0) {
+            GGML_ASSERT(nb == 1 && nr23[1] == 1 && !sinks && max_bias == 0.0f);
+            const int64_t n_indices = sparse_pattern == 3 ? kv / 2 : kv;
+            const int32_t suffix_start = sparse_pattern == 3 ? (int32_t) n_indices : (int32_t) kv;
+            ggml_tensor * indices = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_indices);
+            ggml_set_name(indices, "sparse_indices");
+            ggml_flash_attn_ext_set_sparse_kv(out, indices, n_indices, suffix_start, kv);
+            ggml_flash_attn_ext_set_sparse_mode(out, GGML_SPARSE_FATTN_MODE_DIRECT);
+        }
         ggml_set_name(out, "out");
 
         return out;
@@ -7178,7 +7189,18 @@ struct test_flash_attn_ext : public test_case {
                 // make the sink values more noticeable in order to trigger a test failure when the implementation is wrong
                 init_tensor_uniform(t, -10.0f, 10.0f);
             } else if (strcmp(t->name, "m") == 0) {
-                init_tensor_kq_mask(t);
+                if (sparse_pattern == 0) {
+                    init_tensor_kq_mask(t);
+                } else {
+                    std::vector<ggml_fp16_t> zeros(ggml_nelements(t), ggml_fp32_to_fp16(0.0f));
+                    ggml_backend_tensor_set(t, zeros.data(), 0, zeros.size() * sizeof(zeros[0]));
+                }
+            } else if (strcmp(t->name, "sparse_indices") == 0) {
+                std::vector<int32_t> indices(t->ne[0]);
+                for (int32_t i = 0; i < (int32_t) indices.size(); ++i) {
+                    indices[i] = sparse_pattern == 1 ? i : (int32_t) indices.size() - 1 - i;
+                }
+                ggml_backend_tensor_set(t, indices.data(), 0, indices.size() * sizeof(indices[0]));
             } else {
                 init_tensor_uniform(t);
             }
@@ -9929,6 +9951,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(72, 72, 4, {1, 1}, 96, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 96, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F32));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 256, 1, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0));
+
+    // 100%-retention Vegas sparse attention must reproduce dense attention.
+    // Q is a single decode token and the mask is all zero, so reordering all KV
+    // rows is mathematically invariant. Pattern 3 exercises the exact Vegas
+    // representation: explicit historical indices followed by a recent suffix.
+    for (int sparse_pattern : {1, 2, 3}) {
+        test_cases.emplace_back(new test_flash_attn_ext(
+                512, 512, 4, {8, 1}, 512, 1, true, false, 0, 0,
+                GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0,
+                {0, 1, 2, 3}, sparse_pattern));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(
+            512, 512, 4, {8, 1}, 256, 1, true, false, 0, 0,
+            GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0,
+            {0, 1, 2, 3}, 1));
+    test_cases.emplace_back(new test_flash_attn_ext(
+            512, 512, 4, {8, 1}, 1024, 1, true, false, 0, 0,
+            GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_TURBO3_0,
+            {0, 1, 2, 3}, 1));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 96, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q1_0, GGML_TYPE_Q1_0));
     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q1_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 128, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q1_0));

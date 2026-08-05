@@ -2673,6 +2673,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             GGML_ASSERT(hparams.f_max_alibi_bias == 0.0f);
             ggml_flash_attn_ext_set_sparse_kv(
                     cur, vegas_indices, vegas->top_k, vegas->prefix_len, vegas_sparse_len);
+            ggml_flash_attn_ext_set_sparse_mode(
+                    cur, vegas->sparse_kernel == llama_vegas_sparse_kernel::gather ?
+                            GGML_SPARSE_FATTN_MODE_GATHER : GGML_SPARSE_FATTN_MODE_DIRECT);
             vegas_input->attention = cur;
         }
         if (vegas_score != nullptr) {

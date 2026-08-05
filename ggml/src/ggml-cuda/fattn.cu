@@ -791,6 +791,12 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 
     if (dst->src[5] != nullptr) {
         GGML_ASSERT(dst->src[0]->ne[1] == 1 && dst->src[0]->ne[3] == 1);
+        const ggml_sparse_fattn_mode sparse_mode = ggml_flash_attn_ext_get_sparse_mode(dst);
+        GGML_ASSERT(sparse_mode == GGML_SPARSE_FATTN_MODE_DIRECT &&
+                "gather sparse attention has not been implemented");
+        GGML_ASSERT(!(dst->src[1]->type == GGML_TYPE_Q8_0 &&
+                dst->src[2]->type == GGML_TYPE_TURBO4_0) &&
+                "direct q8_0/turbo4 sparse attention failed its 100%-retention correctness gate");
         ggml_cuda_flash_attn_ext_vec(ctx, dst);
         return;
     }

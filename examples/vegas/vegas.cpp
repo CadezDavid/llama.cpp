@@ -53,6 +53,7 @@ struct vegas_options {
     bool hierarchical_trace = false;
     bool same_prefix_trace = false;
     bool quiet = false;
+    int32_t sparse_kernel = LLAMA_VEGAS_SPARSE_KERNEL_DIRECT;
 };
 
 struct token_distribution {
@@ -452,6 +453,17 @@ static bool parse_vegas_options(
                 options.mode = vegas_run_mode::same_prefix;
             } else {
                 LOG_ERR("invalid --vegas-mode: %s\n", value);
+                return false;
+            }
+            continue;
+        }
+        if (const char * value = get_value("--vegas-sparse-kernel")) {
+            if (std::strcmp(value, "direct") == 0) {
+                options.sparse_kernel = LLAMA_VEGAS_SPARSE_KERNEL_DIRECT;
+            } else if (std::strcmp(value, "gather") == 0) {
+                options.sparse_kernel = LLAMA_VEGAS_SPARSE_KERNEL_GATHER;
+            } else {
+                LOG_ERR("invalid --vegas-sparse-kernel: %s\n", value);
                 return false;
             }
             continue;
@@ -1993,6 +2005,10 @@ int main(int argc, char ** argv) {
         LOG_ERR("Vegas requires flash attention\n");
         return 1;
     }
+    if (!mode_uses_vegas(options.mode) && options.sparse_kernel != LLAMA_VEGAS_SPARSE_KERNEL_DIRECT) {
+        LOG_ERR("--vegas-sparse-kernel requires a Vegas mode\n");
+        return 1;
+    }
     if (params.sampling.mirostat != 0 || params.sampling.xtc_probability != 0.0f) {
         LOG_ERR("Vegas does not support stateful or randomized probability transforms\n");
         return 1;
@@ -2096,6 +2112,17 @@ int main(int argc, char ** argv) {
         }
         llama_memory_clear(llama_get_memory(ctx_dft), true);
 
+    }
+
+    if (mode_uses_vegas(options.mode) &&
+            !llama_vegas_set_sparse_kernel(ctx, options.sparse_kernel)) {
+        LOG_ERR("failed to configure the Vegas sparse-attention kernel\n");
+        return 1;
+    }
+    if (ctx_dft != nullptr && mode_uses_vegas(options.mode) &&
+            !llama_vegas_set_sparse_kernel(ctx_dft, options.sparse_kernel)) {
+        LOG_ERR("failed to configure the MTP Vegas sparse-attention kernel\n");
+        return 1;
     }
 
     if (mode_uses_vegas(options.mode) &&

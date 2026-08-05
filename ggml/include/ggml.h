@@ -2450,6 +2450,18 @@ extern "C" {
             int32_t              suffix_start,
             int32_t              n_kv);
 
+    enum ggml_sparse_fattn_mode {
+        GGML_SPARSE_FATTN_MODE_DIRECT = 0,
+        GGML_SPARSE_FATTN_MODE_GATHER = 1,
+    };
+
+    GGML_API void ggml_flash_attn_ext_set_sparse_mode(
+            struct ggml_tensor * a,
+            enum ggml_sparse_fattn_mode mode);
+
+    GGML_API enum ggml_sparse_fattn_mode ggml_flash_attn_ext_get_sparse_mode(
+            const struct ggml_tensor * a);
+
     GGML_API void ggml_flash_attn_ext_set_sparse_kv_n_kv(
             struct ggml_tensor * a,
             int32_t              n_kv);

@@ -122,6 +122,7 @@ struct llama_context {
     void set_warmup(bool value);
 
     bool vegas_enable(float sparse_ratio, int32_t min_tokens, int32_t max_tokens, int32_t max_recent_tokens);
+    bool vegas_set_sparse_kernel(llama_vegas_sparse_kernel mode);
     bool vegas_set_selection_layer(int32_t il);
     bool vegas_set_anchor_tokens(int32_t n_tokens);
     void vegas_set_mode(llama_vegas_mode mode, int32_t prefix_len);

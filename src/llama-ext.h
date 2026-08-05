@@ -122,6 +122,15 @@ enum llama_vegas_runtime_mode {
     LLAMA_VEGAS_MODE_VERIFY   = 2,
 };
 
+enum llama_vegas_sparse_kernel_mode {
+    LLAMA_VEGAS_SPARSE_KERNEL_DIRECT = 0,
+    LLAMA_VEGAS_SPARSE_KERNEL_GATHER = 1,
+};
+
+LLAMA_API bool llama_vegas_set_sparse_kernel(
+        struct llama_context * ctx,
+                     int32_t mode);
+
 LLAMA_API bool llama_vegas_enable(
         struct llama_context * ctx,
                        float sparse_ratio,
