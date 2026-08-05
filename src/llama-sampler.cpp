@@ -589,6 +589,7 @@ static bool llama_sampler_backend_support(
         /*.probs      = */ nullptr,
         /*.sampled    = */ nullptr,
         /*.candidates = */ ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n),
+        /*.statistics = */ nullptr,
     };
 
     ggml_cgraph * gf = ggml_new_graph(ctx);
@@ -609,6 +610,10 @@ static bool llama_sampler_backend_support(
 
     if (data.candidates) {
         ggml_build_forward_expand(gf, data.candidates);
+    }
+
+    if (data.statistics) {
+        ggml_build_forward_expand(gf, data.statistics);
     }
 
     for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
@@ -1019,6 +1024,79 @@ struct llama_sampler * llama_sampler_init_greedy() {
         /* .iface = */ &llama_sampler_greedy_i,
         /* .ctx   = */ new llama_sampler_greedy {
             ("greedy"),
+        }
+    );
+}
+
+// entropy statistics
+
+struct llama_sampler_entropy : public llama_sampler_backend {
+};
+
+static const char * llama_sampler_entropy_name(const struct llama_sampler * smpl) {
+    auto * sctx = (llama_sampler_entropy *) smpl->ctx;
+    return sctx->get_name();
+}
+
+static void llama_sampler_entropy_apply(struct llama_sampler * /*smpl*/, llama_token_data_array * cur_p) {
+    llama_sampler_softmax_impl(cur_p, false);
+}
+
+static struct llama_sampler * llama_sampler_entropy_clone(const struct llama_sampler * /*smpl*/) {
+    return llama_sampler_init_entropy();
+}
+
+static void llama_sampler_entropy_free(struct llama_sampler * smpl) {
+    delete (llama_sampler_entropy *) smpl->ctx;
+}
+
+static bool llama_sampler_entropy_backend_init(
+        struct llama_sampler       * smpl,
+        ggml_backend_buffer_type_t   buft) {
+    auto * sctx = (llama_sampler_entropy *) smpl->ctx;
+    const bool res = llama_sampler_backend_support(smpl, buft);
+    sctx->init(res);
+    return res;
+}
+
+static void llama_sampler_entropy_backend_apply(
+        struct llama_sampler      * /*smpl*/,
+        struct ggml_context       * ctx,
+        struct ggml_cgraph        * /*gf*/,
+        struct llama_sampler_data * data) {
+    struct ggml_tensor * logits = ggml_reshape_1d(ctx, data->logits, ggml_nelements(data->logits));
+    struct ggml_tensor * probs = ggml_soft_max(ctx, logits);
+    struct ggml_tensor * probs_clamped = ggml_clamp(ctx, probs, 1e-10f, 1.0f);
+    struct ggml_tensor * entropy = ggml_scale(ctx,
+            ggml_sum(ctx, ggml_mul(ctx, probs_clamped, ggml_log(ctx, probs_clamped))), -1.0f);
+
+    struct ggml_tensor * max_idx = ggml_argmax(ctx, probs);
+    struct ggml_tensor * probs_rows = ggml_reshape_2d(ctx, probs, 1, ggml_nelements(probs));
+    struct ggml_tensor * top_probability = ggml_reshape_1d(ctx,
+            ggml_get_rows(ctx, probs_rows, max_idx), 1);
+
+    data->statistics = ggml_concat(ctx, entropy, top_probability, 0);
+    ggml_set_name(data->statistics, "entropy_statistics");
+}
+
+static struct llama_sampler_i llama_sampler_entropy_i = {
+    /* .name              = */ llama_sampler_entropy_name,
+    /* .accept            = */ nullptr,
+    /* .apply             = */ llama_sampler_entropy_apply,
+    /* .reset             = */ nullptr,
+    /* .clone             = */ llama_sampler_entropy_clone,
+    /* .free              = */ llama_sampler_entropy_free,
+    /* .backend_init      = */ llama_sampler_entropy_backend_init,
+    /* .backend_accept    = */ nullptr,
+    /* .backend_apply     = */ llama_sampler_entropy_backend_apply,
+    /* .backend_set_input = */ nullptr,
+};
+
+struct llama_sampler * llama_sampler_init_entropy() {
+    return llama_sampler_init(
+        /* .iface = */ &llama_sampler_entropy_i,
+        /* .ctx   = */ new llama_sampler_entropy {
+            ("entropy"),
         }
     );
 }

@@ -1110,6 +1110,25 @@ size_t llama_context::get_sampled_probs_count(int32_t idx) {
     }
 }
 
+const float * llama_context::get_sampled_statistics_ith(int32_t idx) {
+    output_reorder();
+
+    if (!sampling.statistics.has_data()) {
+        return nullptr;
+    }
+
+    try {
+        const int64_t row = output_resolve_row(idx);
+        if ((size_t) row >= sampling.statistics_count.size() || sampling.statistics_count[row] != 2) {
+            return nullptr;
+        }
+        return sampling.statistics.data + 2*row;
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: invalid backend sampled statistics id %d, reason: %s\n", __func__, idx, err.what());
+        return nullptr;
+    }
+}
+
 
 void llama_context::attach_threadpool(
            ggml_threadpool_t threadpool,
@@ -2280,7 +2299,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         // Copy backend sampling output if this ubatch produced any sampling tensors.
-        if (has_samplers && (!res->t_sampled.empty() || !res->t_sampled_probs.empty() || !res->t_sampled_logits.empty())) {
+        if (has_samplers && (!res->t_sampled.empty() || !res->t_sampled_probs.empty() ||
+                !res->t_sampled_logits.empty() || !res->t_sampled_statistics.empty())) {
             const auto seq_to_output_row = build_seq_to_output_row(ubatch, n_outputs_prev);
             const auto stride = n_vocab;
 
@@ -2289,6 +2309,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
             copy_tensor_async_floats    (res->t_sampled_logits, sampling.logits,     stride, sampling.logits_count,     seq_to_output_row, sched.get());
             copy_tensor_async_floats    (res->t_sampled_probs,  sampling.probs,      stride, sampling.probs_count,      seq_to_output_row, sched.get());
+            copy_tensor_async_floats    (res->t_sampled_statistics, sampling.statistics, 2,
+                    sampling.statistics_count, seq_to_output_row, sched.get());
             copy_tensor_async_candidates(res->t_candidates,     sampling.candidates, stride, sampling.candidates_count, seq_to_output_row, sched.get());
         }
 
@@ -2400,7 +2422,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     // Allocate backend sampling output buffers if there are backend samplers configured.
     const bool has_sampling = !sampling.samplers.empty();
     if (has_sampling) {
-        backend_float_count = 2 * n_vocab * n_outputs_max;      // logits + probs
+        backend_float_count = (2 * n_vocab + 2) * n_outputs_max; // logits + probs + entropy statistics
         backend_token_count = (1 + n_vocab) * n_outputs_max;    // sampled + candidates
     }
 
@@ -2479,6 +2501,9 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         sampling.probs = {(float *) (base + offset), (size_t)(n_vocab*n_outputs_max)};
         offset += sampling.probs.size * sizeof(float);
 
+        sampling.statistics = {(float *) (base + offset), (size_t)(2*n_outputs_max)};
+        offset += sampling.statistics.size * sizeof(float);
+
         sampling.sampled = {(llama_token *) (base + offset), (size_t)n_outputs_max};
         offset += sampling.sampled.size * sizeof(llama_token);
 
@@ -2490,21 +2515,25 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
         sampling.logits_count.resize(n_outputs_max);
         sampling.probs_count.resize(n_outputs_max);
+        sampling.statistics_count.resize(n_outputs_max);
         sampling.candidates_count.resize(n_outputs_max);
 
         std::fill(sampling.logits_count.begin(),     sampling.logits_count.end(),     0);
         std::fill(sampling.probs_count.begin(),      sampling.probs_count.end(),      0);
+        std::fill(sampling.statistics_count.begin(), sampling.statistics_count.end(), 0);
         std::fill(sampling.candidates_count.begin(), sampling.candidates_count.end(), 0);
 
         std::fill_n(sampling.sampled.data, sampling.sampled.size, LLAMA_TOKEN_NULL);
     } else {
         sampling.logits     = {nullptr, 0};
         sampling.probs      = {nullptr, 0};
+        sampling.statistics = {nullptr, 0};
         sampling.sampled    = {nullptr, 0};
         sampling.candidates = {nullptr, 0};
 
         sampling.logits_count.clear();
         sampling.probs_count.clear();
+        sampling.statistics_count.clear();
         sampling.candidates_count.clear();
     }
 
@@ -2584,10 +2613,12 @@ void llama_context::output_reorder() {
         if (!sampling.samplers.empty()) {
             assert(sampling.logits.size > 0);
             assert(sampling.probs.size > 0);
+            assert(sampling.statistics.size > 0);
             assert(sampling.candidates.size > 0);
             assert(sampling.sampled.size > 0);
             assert(sampling.logits_count.size() > 0);
             assert(sampling.probs_count.size() > 0);
+            assert(sampling.statistics_count.size() > 0);
             assert(sampling.candidates_count.size() > 0);
 
             for (uint64_t k = 0; k < n_vocab; ++k) {
@@ -2598,6 +2629,10 @@ void llama_context::output_reorder() {
                 std::swap(sampling.probs.data[i0*n_vocab + k], sampling.probs.data[i1*n_vocab + k]);
             }
 
+            for (uint64_t k = 0; k < 2; ++k) {
+                std::swap(sampling.statistics.data[i0*2 + k], sampling.statistics.data[i1*2 + k]);
+            }
+
             for (uint64_t k = 0; k < n_vocab; ++k) {
                 std::swap(sampling.candidates.data[i0*n_vocab + k], sampling.candidates.data[i1*n_vocab + k]);
             }
@@ -2605,6 +2640,7 @@ void llama_context::output_reorder() {
             std::swap(sampling.sampled.data[i0],     sampling.sampled.data[i1]);
             std::swap(sampling.logits_count[i0],     sampling.logits_count[i1]);
             std::swap(sampling.probs_count[i0],      sampling.probs_count[i1]);
+            std::swap(sampling.statistics_count[i0], sampling.statistics_count[i1]);
             std::swap(sampling.candidates_count[i0], sampling.candidates_count[i1]);
         }
     }
@@ -4116,6 +4152,26 @@ uint32_t llama_get_sampled_probs_count_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize();
 
     return static_cast<uint32_t>(ctx->get_sampled_probs_count(i));
+}
+
+bool llama_get_sampled_entropy_ith(
+        llama_context * ctx,
+        int32_t i,
+        float * entropy,
+        float * top_probability) {
+    if (ctx == nullptr || entropy == nullptr || top_probability == nullptr) {
+        return false;
+    }
+
+    ctx->synchronize();
+    const float * statistics = ctx->get_sampled_statistics_ith(i);
+    if (statistics == nullptr) {
+        return false;
+    }
+
+    *entropy = statistics[0];
+    *top_probability = statistics[1];
+    return std::isfinite(*entropy) && std::isfinite(*top_probability);
 }
 
 struct ggml_cgraph * llama_graph_reserve(

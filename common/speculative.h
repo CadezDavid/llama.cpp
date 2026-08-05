@@ -9,6 +9,7 @@ struct common_speculative_draft_observation {
     int32_t position = 0;
     float top_probability = 0.0f;
     float entropy = 0.0f;
+    bool entropy_on_device = false;
 };
 
 using common_speculative_draft_observer = bool (*)(

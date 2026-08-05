@@ -1065,6 +1065,14 @@ extern "C" {
     LLAMA_API float *  llama_get_sampled_probs_ith      (struct llama_context * ctx, int32_t i);
     LLAMA_API uint32_t llama_get_sampled_probs_count_ith(struct llama_context * ctx, int32_t i);
 
+    // Returns full-distribution entropy and top probability produced by an
+    // attached backend entropy sampler. Returns false when unavailable.
+    LLAMA_API bool llama_get_sampled_entropy_ith(
+            struct llama_context * ctx,
+            int32_t i,
+            float * entropy,
+            float * top_probability);
+
     // Get the backend sampled logits for the ith token
     // Returns NULL if no logits were sampled.
     LLAMA_API float *  llama_get_sampled_logits_ith      (struct llama_context * ctx, int32_t i);
@@ -1258,6 +1266,7 @@ extern "C" {
         struct ggml_tensor * probs;
         struct ggml_tensor * sampled;
         struct ggml_tensor * candidates;
+        struct ggml_tensor * statistics;
     };
 
     // user code can implement the interface below in order to create custom llama_sampler
@@ -1339,6 +1348,10 @@ extern "C" {
     // available samplers:
 
     LLAMA_API struct llama_sampler * llama_sampler_init_greedy(void);
+
+    // Records [entropy, top probability] for the current distribution without
+    // changing the candidates. Backend sampling copies only these two scalars.
+    LLAMA_API struct llama_sampler * llama_sampler_init_entropy(void);
 
     /// seed == LLAMA_DEFAULT_SEED to use a random seed.
     LLAMA_API struct llama_sampler * llama_sampler_init_dist(uint32_t seed);

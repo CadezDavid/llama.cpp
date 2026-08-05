@@ -1392,6 +1392,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (this->params.backend_sampling) {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
+                llama_sampler_chain_add(chain, llama_sampler_init_entropy());
                 llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
 
                 if (!llama_set_sampler(ctx_dft, seq_id, chain)) {
@@ -1657,24 +1658,29 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
                 const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
 
-                double full_entropy = 0.0;
-                double full_top_probability = 0.0;
+                float full_entropy = 0.0f;
+                float full_top_probability = 0.0f;
+                bool have_backend_entropy = false;
                 if (dp.observer != nullptr) {
-                    const float * logits = llama_get_logits_ith(ctx_dft, i_last[seq_id]);
-                    const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)));
-                    if (logits != nullptr && n_vocab > 0) {
-                        const float max_logit = *std::max_element(logits, logits + n_vocab);
-                        double sum = 0.0;
-                        double weighted_shifted_logit = 0.0;
-                        for (int32_t token = 0; token < n_vocab; ++token) {
-                            const double shifted = (double) logits[token] - max_logit;
-                            const double weight = std::exp(shifted);
-                            sum += weight;
-                            weighted_shifted_logit += weight * shifted;
-                        }
-                        if (sum > 0.0 && std::isfinite(sum)) {
-                            full_top_probability = 1.0 / sum;
-                            full_entropy = std::log(sum) - weighted_shifted_logit / sum;
+                    have_backend_entropy = llama_get_sampled_entropy_ith(
+                            ctx_dft, i_last[seq_id], &full_entropy, &full_top_probability);
+                    if (!have_backend_entropy) {
+                        const float * logits = llama_get_logits_ith(ctx_dft, i_last[seq_id]);
+                        const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)));
+                        if (logits != nullptr && n_vocab > 0) {
+                            const float max_logit = *std::max_element(logits, logits + n_vocab);
+                            double sum = 0.0;
+                            double weighted_shifted_logit = 0.0;
+                            for (int32_t token = 0; token < n_vocab; ++token) {
+                                const double shifted = (double) logits[token] - max_logit;
+                                const double weight = std::exp(shifted);
+                                sum += weight;
+                                weighted_shifted_logit += weight * shifted;
+                            }
+                            if (sum > 0.0 && std::isfinite(sum)) {
+                                full_top_probability = (float) (1.0 / sum);
+                                full_entropy = (float) (std::log(sum) - weighted_shifted_logit / sum);
+                            }
                         }
                     }
                 }
@@ -1707,8 +1713,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 if (dp.observer != nullptr) {
                     const common_speculative_draft_observation observation {
                         /* .position        = */ (int32_t) result.size(),
-                        /* .top_probability = */ (float) full_top_probability,
-                        /* .entropy         = */ (float) full_entropy,
+                        /* .top_probability = */ full_top_probability,
+                        /* .entropy         = */ full_entropy,
+                        /* .entropy_on_device = */ have_backend_entropy,
                     };
                     if (!dp.observer(dp.observer_userdata, observation)) {
                         drafting[seq_id] = false;

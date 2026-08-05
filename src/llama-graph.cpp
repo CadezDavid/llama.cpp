@@ -1342,6 +1342,7 @@ void llm_graph_result::reset() {
 
     t_sampled.clear();
     t_sampled_probs.clear();
+    t_sampled_statistics.clear();
     t_sampled_logits.clear();
     t_candidates.clear();
 
@@ -1402,6 +1403,11 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
         }
     }
     for (auto & [seq_id, t] : t_sampled_logits) {
+        if (t != nullptr) {
+            ggml_set_output(t);
+        }
+    }
+    for (auto & [seq_id, t] : t_sampled_statistics) {
         if (t != nullptr) {
             ggml_set_output(t);
         }
@@ -3967,6 +3973,7 @@ void llm_graph_context::build_sampling() const {
             /*.probs       =*/ nullptr,
             /*.sampled     =*/ nullptr,
             /*.candidates  =*/ nullptr,
+            /*.statistics  =*/ nullptr,
         };
 
         assert(sampler->iface->backend_apply);
@@ -3993,6 +4000,12 @@ void llm_graph_context::build_sampling() const {
         if (data.candidates != nullptr) {
             res->t_candidates[seq_id] = data.candidates;
             outs[1] = data.candidates;
+            ggml_build_forward_select(gf, outs.data(), outs.size(), i_out);
+        }
+
+        if (data.statistics != nullptr) {
+            res->t_sampled_statistics[seq_id] = data.statistics;
+            outs[1] = data.statistics;
             ggml_build_forward_select(gf, outs.data(), outs.size(), i_out);
         }
     }

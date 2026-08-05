@@ -99,6 +99,7 @@ struct llama_context {
 
     float * get_sampled_probs_ith(int32_t idx);
     size_t  get_sampled_probs_count(int32_t idx);
+    const float * get_sampled_statistics_ith(int32_t idx);
 
     const llama_token * get_sampled_candidates_ith(int32_t idx);
     size_t get_sampled_candidates_count(int32_t idx);
@@ -327,10 +328,12 @@ private:
         buffer_view<float>       logits     = {nullptr, 0};
         buffer_view<llama_token> sampled    = {nullptr, 0};
         buffer_view<float>       probs      = {nullptr, 0};
+        buffer_view<float>       statistics = {nullptr, 0};
         buffer_view<llama_token> candidates = {nullptr, 0};
 
         std::vector<uint32_t> logits_count;
         std::vector<uint32_t> probs_count;
+        std::vector<uint32_t> statistics_count;
         std::vector<uint32_t> candidates_count;
 
         // optimization
