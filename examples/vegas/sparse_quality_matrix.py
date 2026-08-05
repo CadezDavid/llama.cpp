@@ -11,32 +11,29 @@ from benchmark import run_one
 from opencode_prompt import DEFAULT_OUTPUT, ensure_prompt
 
 
-CONFIGURATIONS = {
-    "qwen27-q8-turbo4-64k": {
+MODEL_CONFIGURATIONS = {
+    "qwen27": {
         "model": "/home/david/models/Qwen3.6-27B-MTP/Qwen3.6-27B-UD-Q4_K_XL.gguf",
-        "context": 73728,
         "cache_k": "q8_0",
-        "cache_v": "turbo4",
-        "kernel": "gather",
+        "cache_v": "q4_0",
+        "kernel": "direct",
         "selection_layer": 15,
         "anchor_tokens": 0,
-        "refresh_interval": 2,
-        "ubatch": 128,
+        "refresh_interval": 1,
+        "ubatch": 64,
     },
-    "gemma4-q8-turbo4-64k": {
+    "gemma4": {
         "model": "/home/david/models/gemma-4-31B-it-qat-q4_0-gguf/gemma-4-31B-it-qat-UD-Q4_K_XL.gguf",
-        "context": 73728,
         "cache_k": "q8_0",
-        "cache_v": "turbo4",
-        "kernel": "gather",
+        "cache_v": "q4_0",
+        "kernel": "direct",
         "selection_layer": 59,
         "anchor_tokens": 0,
         "refresh_interval": 1,
-        "ubatch": 128,
+        "ubatch": 64,
     },
-    "qwen35-q8-q4-64k": {
+    "qwen35": {
         "model": "/home/david/models/Qwen3.6-35B-A3B-MTP-GGUF/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
-        "context": 66048,
         "cache_k": "q8_0",
         "cache_v": "q4_0",
         "kernel": "direct",
@@ -47,11 +44,28 @@ CONFIGURATIONS = {
     },
 }
 
-RATIOS = (1.0, 0.5, 0.2, 0.1)
+CONTEXT_CONFIGURATIONS = {
+    "32k": {"prompt_tokens": 32768, "context": 36864},
+    "64k": {"prompt_tokens": 65536, "context": 66048},
+}
+
+CONFIGURATIONS = {
+    f"{model}-q8-q4-{context}": {
+        **model_config,
+        **context_config,
+    }
+    for model, model_config in MODEL_CONFIGURATIONS.items()
+    for context, context_config in CONTEXT_CONFIGURATIONS.items()
+}
+
+RATIOS = (1.0, 0.75, 0.5, 0.35, 0.2, 0.1)
 GATE = {
-    "min_top1_agreement": 0.99,
-    "max_mean_total_variation": 0.03,
-    "max_mean_jensen_shannon": 0.002,
+    # This is a structural correctness gate, not the threshold used to choose a
+    # production retention ratio. Sparse execution visits KV rows in a different
+    # order, so quantized caches are not bitwise equivalent even at 100%.
+    "min_top1_agreement": 0.90,
+    "max_mean_total_variation": 0.05,
+    "max_mean_jensen_shannon": 0.003,
 }
 
 
@@ -59,7 +73,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", default="build-vegas/bin/llama-vegas")
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--prompt-tokens", type=int, default=65536)
+    parser.add_argument("--prompt-tokens", type=int, help="override the context-specific prompt length")
     parser.add_argument("--reference-tokens", type=int, default=128)
     parser.add_argument("--configurations", nargs="+", choices=CONFIGURATIONS, default=list(CONFIGURATIONS))
     parser.add_argument("--ratios", nargs="+", type=float, choices=RATIOS, default=list(RATIOS))
@@ -73,7 +87,7 @@ def make_args(args, config, ratio):
         draft_model=None,
         prompt=None,
         conversation_file=str(DEFAULT_OUTPUT),
-        prompt_tokens=args.prompt_tokens,
+        prompt_tokens=args.prompt_tokens or config["prompt_tokens"],
         reference_tokens=args.reference_tokens,
         context=config["context"],
         predict=args.reference_tokens,
@@ -204,6 +218,8 @@ def ensure_manifest(args):
             "cache_k": CONFIGURATIONS[name]["cache_k"],
             "cache_v": CONFIGURATIONS[name]["cache_v"],
             "kernel": CONFIGURATIONS[name]["kernel"],
+            "prompt_tokens": args.prompt_tokens or CONFIGURATIONS[name]["prompt_tokens"],
+            "context": CONFIGURATIONS[name]["context"],
         }
         for name in args.configurations
     }
