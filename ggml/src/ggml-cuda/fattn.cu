@@ -41,6 +41,7 @@ static __global__ void gather_dequant_sparse_f16(
         const char * __restrict__ K,
         const char * __restrict__ V,
         const int *  __restrict__ indices,
+        const half * __restrict__ mask,
         half *       __restrict__ K_f16,
         half *       __restrict__ V_f16,
         half *       __restrict__ mask_f16,
@@ -52,13 +53,26 @@ static __global__ void gather_dequant_sparse_f16(
         int64_t nb12,
         int64_t nb21,
         int64_t nb22,
+        int64_t mask_nb0,
+        int64_t mask_nb1,
+        int64_t n_queries,
         int32_t n_indices,
         int32_t suffix_start) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     const int64_t n_elements = n_head_kv * n_kv_padded * ne0;
+    const int64_t n_mask_elements = n_queries * n_kv_padded;
 
-    if (i < n_kv_padded) {
-        mask_f16[i] = __float2half(i < n_kv ? 0.0f : -INFINITY);
+    if (i < n_mask_elements) {
+        const int64_t i_kv = i % n_kv_padded;
+        const int64_t i_query = i / n_kv_padded;
+        if (i_kv >= n_kv) {
+            mask_f16[i] = __float2half(-INFINITY);
+        } else {
+            const int64_t i_actual = n_indices == suffix_start ? i_kv :
+                    (i_kv < n_indices ? indices[i_kv] : suffix_start + i_kv - n_indices);
+            mask_f16[i] = mask == nullptr ? __float2half(0.0f) :
+                    *(const half *) ((const char *) mask + i_query * mask_nb1 + i_actual * mask_nb0);
+        }
     }
     if (i >= n_elements) {
         return;
@@ -457,7 +471,7 @@ static void ggml_cuda_flash_attn_ext_gather_f16_case(
     ggml_tensor * V = dst->src[2];
     ggml_tensor * indices = dst->src[5];
 
-    GGML_ASSERT(Q->ne[1] == 1 && Q->ne[3] == 1);
+    GGML_ASSERT(Q->ne[1] >= 1 && Q->ne[3] == 1);
     GGML_ASSERT((Q->ne[0] == 256 || Q->ne[0] == 512) && V->ne[0] == Q->ne[0]);
     GGML_ASSERT(K->type == type_K && V->type == type_V);
     GGML_ASSERT(indices == nullptr || indices->type == GGML_TYPE_I32);
@@ -467,17 +481,19 @@ static void ggml_cuda_flash_attn_ext_gather_f16_case(
     const int32_t suffix_start = indices ? ggml_get_op_params_i32(dst, 6) : 0;
     const int64_t n_kv_padded = GGML_PAD((int64_t) n_kv, (int64_t) FATTN_KQ_STRIDE);
     const int64_t n_elements = K->ne[0] * n_kv_padded * K->ne[2];
+    const int64_t n_mask_elements = Q->ne[1] * n_kv_padded;
 
     ggml_cuda_pool_alloc<half> K_f16(ctx.pool(), n_elements);
     ggml_cuda_pool_alloc<half> V_f16(ctx.pool(), n_elements);
-    ggml_cuda_pool_alloc<half> mask_f16(ctx.pool(), n_kv_padded);
+    ggml_cuda_pool_alloc<half> mask_f16(ctx.pool(), n_mask_elements);
 
     const int threads = 256;
-    const int blocks = (int) ((std::max(n_elements, n_kv_padded) + threads - 1) / threads);
+    const int blocks = (int) ((std::max(n_elements, n_mask_elements) + threads - 1) / threads);
     gather_dequant_sparse_f16<type_K, type_V><<<blocks, threads, 0, ctx.stream()>>>(
             (const char *) K->data,
             (const char *) V->data,
             indices == nullptr ? nullptr : (const int *) indices->data,
+            dst->src[3] == nullptr ? nullptr : (const half *) dst->src[3]->data,
             K_f16.ptr,
             V_f16.ptr,
             mask_f16.ptr,
@@ -489,6 +505,9 @@ static void ggml_cuda_flash_attn_ext_gather_f16_case(
             K->nb[2],
             V->nb[1],
             V->nb[2],
+            dst->src[3] == nullptr ? 0 : dst->src[3]->nb[0],
+            dst->src[3] == nullptr ? 0 : dst->src[3]->nb[1],
+            Q->ne[1],
             n_indices,
             suffix_start);
     CUDA_CHECK(cudaGetLastError());
@@ -518,12 +537,12 @@ static void ggml_cuda_flash_attn_ext_gather_f16_case(
     ggml_tensor gathered_mask = {};
     gathered_mask.type = GGML_TYPE_F16;
     gathered_mask.ne[0] = n_kv_padded;
-    gathered_mask.ne[1] = 1;
+    gathered_mask.ne[1] = Q->ne[1];
     gathered_mask.ne[2] = 1;
     gathered_mask.ne[3] = 1;
     gathered_mask.nb[0] = sizeof(half);
     gathered_mask.nb[1] = n_kv_padded * sizeof(half);
-    gathered_mask.nb[2] = gathered_mask.nb[1];
+    gathered_mask.nb[2] = Q->ne[1] * gathered_mask.nb[1];
     gathered_mask.nb[3] = gathered_mask.nb[2];
     gathered_mask.data = mask_f16.ptr;
 
@@ -550,7 +569,7 @@ static void ggml_cuda_flash_attn_ext_sparse_gather(
     ggml_tensor * V = dst->src[2];
     ggml_tensor * indices = dst->src[5];
 
-    GGML_ASSERT(Q->ne[1] == 1 && Q->ne[3] == 1);
+    GGML_ASSERT(Q->ne[1] >= 1 && Q->ne[3] == 1);
     GGML_ASSERT((Q->ne[0] == 256 || Q->ne[0] == 512) && V->ne[0] == Q->ne[0]);
     GGML_ASSERT(indices != nullptr && indices->type == GGML_TYPE_I32);
 
@@ -1364,8 +1383,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     ggml_cuda_set_device(ctx.device);
 
     if (dst->src[5] != nullptr) {
-        GGML_ASSERT(dst->src[0]->ne[1] == 1 && dst->src[0]->ne[3] == 1);
         const ggml_sparse_fattn_mode sparse_mode = ggml_flash_attn_ext_get_sparse_mode(dst);
+        GGML_ASSERT(dst->src[0]->ne[3] == 1);
+        GGML_ASSERT(sparse_mode == GGML_SPARSE_FATTN_MODE_GATHER || dst->src[0]->ne[1] == 1);
         const bool q8_turbo4 = dst->src[1]->type == GGML_TYPE_Q8_0 &&
                 dst->src[2]->type == GGML_TYPE_TURBO4_0;
         if (sparse_mode == GGML_SPARSE_FATTN_MODE_GATHER) {
@@ -1456,7 +1476,7 @@ bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
                 (K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0);
         if (sparse_mode == GGML_SPARSE_FATTN_MODE_GATHER) {
             return (Q->ne[0] == 256 || Q->ne[0] == 512) && V->ne[0] == Q->ne[0] &&
-                    Q->ne[1] == 1 && Q->ne[3] == 1 && gather_types &&
+                    Q->ne[1] >= 1 && Q->ne[3] == 1 && gather_types &&
                     turing_mma_available(ggml_cuda_info().devices[device].cc);
         }
         if (sparse_mode == GGML_SPARSE_FATTN_MODE_AUTO && q8_turbo4) {
