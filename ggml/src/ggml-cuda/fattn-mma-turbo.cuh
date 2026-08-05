@@ -121,3 +121,22 @@ DECL_FATTN_MMA_TURBO_ALL(256, 256, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO2_0);
 // reached by Qwen27 (D=256, GQA=4) and Gemma 4 (D=512, GQA=8) are compiled.
 extern DECL_FATTN_MMA_TURBO_CASE(256, 256, 2, 4, GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0);
 extern DECL_FATTN_MMA_TURBO_CASE(512, 512, 1, 8, GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0);
+
+// Indexed MMA cases for the normal quantizations used by CascadeSpec. The
+// controller currently submits at most four query tokens per sparse-target
+// round, so only the reachable GQA=4/8 geometries are instantiated.
+#define DECL_FATTN_MMA_INDEXED_NORMAL(DKQ, ncols1, ncols2) \
+    extern DECL_FATTN_MMA_TURBO_CASE(DKQ, DKQ, ncols1, ncols2, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0); \
+    extern DECL_FATTN_MMA_TURBO_CASE(DKQ, DKQ, ncols1, ncols2, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0); \
+    extern DECL_FATTN_MMA_TURBO_CASE(DKQ, DKQ, ncols1, ncols2, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0)
+
+DECL_FATTN_MMA_INDEXED_NORMAL(256, 1, 8);
+DECL_FATTN_MMA_INDEXED_NORMAL(256, 2, 8);
+DECL_FATTN_MMA_INDEXED_NORMAL(256, 4, 8);
+DECL_FATTN_MMA_INDEXED_NORMAL(256, 2, 4);
+DECL_FATTN_MMA_INDEXED_NORMAL(256, 4, 4);
+DECL_FATTN_MMA_INDEXED_NORMAL(512, 1, 8);
+DECL_FATTN_MMA_INDEXED_NORMAL(512, 2, 8);
+DECL_FATTN_MMA_INDEXED_NORMAL(512, 4, 8);
+
+#undef DECL_FATTN_MMA_INDEXED_NORMAL

@@ -2628,9 +2628,6 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             ubatch.pos != nullptr && ubatch.n_tokens > 0 &&
             std::min<int32_t>(k->ne[1], ubatch.pos[ubatch.n_tokens - 1] + 1) >= vegas->prefix_len) {
         GGML_ASSERT(cparams.flash_attn);
-        if (q->ne[1] > 1 && vegas->sparse_kernel != llama_vegas_sparse_kernel::gather) {
-            GGML_ABORT("batched Vegas sparse attention requires the gather kernel");
-        }
         GGML_ASSERT(vegas->prefix_len > 0 && vegas->prefix_len <= k->ne[1]);
         GGML_ASSERT(vegas->top_k > 0 && vegas->top_k <= vegas->prefix_len);
         GGML_ASSERT(vegas->plan != nullptr && vegas->top_k <= vegas->plan_capacity);

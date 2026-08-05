@@ -497,11 +497,48 @@ static __device__ __forceinline__ int flash_attn_ext_sparse_physical_row(
         const int * const __restrict__ sparse_indices,
         const int sparse_n_indices,
         const int sparse_recent_start) {
-    if (sparse_indices == nullptr || sparse_n_indices == sparse_recent_start) {
+    if (sparse_indices == nullptr) {
         return logical_row;
     }
     return logical_row < sparse_n_indices ? sparse_indices[logical_row] :
             sparse_recent_start + logical_row - sparse_n_indices;
+}
+
+// Load q4_0 rows directly into the half2 layout consumed by the MMA kernel.
+// q4_0 stores the first 16 values in the low nibbles and the next 16 in the
+// high nibbles, so adjacent output values generally come from adjacent bytes.
+template<int stride_tile, int nbatch_fa, int nthreads, bool oob_check>
+static __device__ __forceinline__ void flash_attn_ext_q4_0_load_tile(
+        const char * const __restrict__ KV_raw, half2 * const __restrict__ tile_KV,
+        const int D2, const int stride_bytes, const int col_offset, const int i_sup,
+        const int * const __restrict__ sparse_indices = nullptr,
+        const int sparse_n_indices = 0,
+        const int sparse_recent_start = 0,
+        const int logical_row_start = 0) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    const int tid = threadIdx.y * warp_size + threadIdx.x;
+#pragma unroll 1
+    for (int linear = tid; linear < nbatch_fa * D2; linear += nthreads) {
+        const int row = linear / D2;
+        const int c = linear - row * D2;
+        if (oob_check && row >= i_sup) {
+            tile_KV[row*stride_tile + c] = make_half2(0.0f, 0.0f);
+            continue;
+        }
+        const int logical_row = logical_row_start + row;
+        const int physical_row = flash_attn_ext_sparse_physical_row(
+                logical_row, sparse_indices, sparse_n_indices, sparse_recent_start);
+        const char * row_ptr = KV_raw + (int64_t) physical_row * stride_bytes;
+        const int elem0 = 2 * (col_offset + c);
+        const block_q4_0 * blk = (const block_q4_0 *) row_ptr + elem0 / QK4_0;
+        const int in_blk = elem0 % QK4_0;
+        const int q0 = in_blk < QK4_0/2 ? blk->qs[in_blk] & 0x0f : blk->qs[in_blk - QK4_0/2] >> 4;
+        const int in_blk_1 = in_blk + 1;
+        const int q1 = in_blk_1 < QK4_0/2 ? blk->qs[in_blk_1] & 0x0f : blk->qs[in_blk_1 - QK4_0/2] >> 4;
+        const float d = __half2float(blk->d);
+        tile_KV[row*stride_tile + c] = __halves2half2(
+                __float2half(d * (q0 - 8)), __float2half(d * (q1 - 8)));
+    }
 }
 
 // Load q8_0 rows directly into the half2 layout consumed by the MMA kernel.
@@ -517,28 +554,26 @@ static __device__ __forceinline__ void flash_attn_ext_q8_0_load_tile(
         const int logical_row_start = 0) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     const int tid = threadIdx.y * warp_size + threadIdx.x;
-#pragma unroll
-    for (int row = tid; row < nbatch_fa; row += nthreads) {
+#pragma unroll 1
+    for (int linear = tid; linear < nbatch_fa * D2; linear += nthreads) {
+        const int row = linear / D2;
+        const int c = linear - row * D2;
         if (oob_check && row >= i_sup) {
-            for (int c = 0; c < D2; ++c) {
-                tile_KV[row*stride_tile + c] = make_half2(0.0f, 0.0f);
-            }
+            tile_KV[row*stride_tile + c] = make_half2(0.0f, 0.0f);
             continue;
         }
         const int logical_row = logical_row_start + row;
         const int physical_row = flash_attn_ext_sparse_physical_row(
                 logical_row, sparse_indices, sparse_n_indices, sparse_recent_start);
         const char * row_ptr = KV_raw + (int64_t) physical_row * stride_bytes;
-        for (int c = 0; c < D2; ++c) {
-            const int col = col_offset + c;
-            const int elem0 = 2 * col;
-            const block_q8_0 * blk = (const block_q8_0 *) row_ptr + elem0 / QK8_0;
-            const int in_blk = elem0 % QK8_0;
-            const float d = __half2float(blk->d);
-            const half lo = __float2half(d * blk->qs[in_blk + 0]);
-            const half hi = __float2half(d * blk->qs[in_blk + 1]);
-            tile_KV[row*stride_tile + c] = __halves2half2(lo, hi);
-        }
+        const int col = col_offset + c;
+        const int elem0 = 2 * col;
+        const block_q8_0 * blk = (const block_q8_0 *) row_ptr + elem0 / QK8_0;
+        const int in_blk = elem0 % QK8_0;
+        const float d = __half2float(blk->d);
+        const half lo = __float2half(d * blk->qs[in_blk + 0]);
+        const half hi = __float2half(d * blk->qs[in_blk + 1]);
+        tile_KV[row*stride_tile + c] = __halves2half2(lo, hi);
     }
 }
 
@@ -754,6 +789,29 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_mask(
     }
 }
 
+template<int ncols1, int nwarps, int nbatch_fa, bool oob_check>
+static __device__ __forceinline__ void flash_attn_ext_sparse_load_mask(
+        const half * const __restrict__ mask_h, half * const __restrict__ tile_mask,
+        const int stride_mask, const int i_sup, const int j0, const uint3 ne01,
+        const int * const __restrict__ sparse_indices, const int sparse_n_indices,
+        const int sparse_recent_start, const int logical_row_start) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int nthreads = nwarps * warp_size;
+    const int tid = threadIdx.y * warp_size + threadIdx.x;
+    for (int linear = tid; linear < ncols1 * nbatch_fa; linear += nthreads) {
+        const int j_sram = linear / nbatch_fa;
+        const int i = linear % nbatch_fa;
+        if (oob_check && i >= i_sup) {
+            tile_mask[j_sram*(nbatch_fa + 8) + i] = half(0.0f);
+            continue;
+        }
+        const int j_vram = fastmodulo(j0 + j_sram, ne01);
+        const int physical_row = flash_attn_ext_sparse_physical_row(
+                logical_row_start + i, sparse_indices, sparse_n_indices, sparse_recent_start);
+        tile_mask[j_sram*(nbatch_fa + 8) + i] = mask_h[int64_t(j_vram)*stride_mask + physical_row];
+    }
+}
+
 template<int DKQ, int DV, int ncols1, int ncols2, int nwarps,
     bool use_logit_softcap, bool V_is_K_view, bool needs_fixup, bool is_fixup, bool last_iter, bool oob_check,
     typename T_A_KQ, typename T_B_KQ, typename T_C_KQ, typename T_A_VKQ, typename T_B_VKQ, typename T_C_VKQ,
@@ -833,8 +891,14 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     } else {
         constexpr bool use_cp_async = nstages == 1;
         if (mask_h) {
-            flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check>
-                (mask_h + k_VKQ_0, tile_mask, stride_mask, k_VKQ_sup, jt*ncols1, ne01);
+            if (sparse_indices) {
+                flash_attn_ext_sparse_load_mask<ncols1, nwarps, nbatch_fa, oob_check>
+                    (mask_h, tile_mask, stride_mask, k_VKQ_sup, jt*ncols1, ne01,
+                     sparse_indices, sparse_n_indices, sparse_recent_start, k_VKQ_0);
+            } else {
+                flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check>
+                    (mask_h + k_VKQ_0, tile_mask, stride_mask, k_VKQ_sup, jt*ncols1, ne01);
+            }
         } else if constexpr (ncols2 > 1) {
             constexpr int nthreads = nwarps * ggml_cuda_get_physical_warp_size();
             const int tid = threadIdx.y * ggml_cuda_get_physical_warp_size() + threadIdx.x;
@@ -854,12 +918,16 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             const int k0_diff = k0_stop - k0_start;
             // Quantized K is dequantized directly into the shared-memory MMA
             // tile. Indexed q8_0 reads the original cache row in-place.
-            static_assert(type_K == GGML_TYPE_Q8_0 || type_K == GGML_TYPE_TURBO4_0 ||
+            static_assert(type_K == GGML_TYPE_Q4_0 || type_K == GGML_TYPE_Q8_0 || type_K == GGML_TYPE_TURBO4_0 ||
                           type_K == GGML_TYPE_TURBO3_0 || type_K == GGML_TYPE_TURBO2_0,
                           "unsupported quantized K type on the MMA path");
             constexpr int nthreads_turbo = nwarps * ggml_cuda_get_physical_warp_size();
             const char * K_raw = (const char *) K_h2;
-            if constexpr (type_K == GGML_TYPE_Q8_0) {
+            if constexpr (type_K == GGML_TYPE_Q4_0) {
+                flash_attn_ext_q4_0_load_tile<stride_tile_K, nbatch_fa, nthreads_turbo, oob_check>
+                    (K_raw, tile_K, k0_diff, stride_K, k0_start, k_VKQ_sup,
+                     sparse_indices, sparse_n_indices, sparse_recent_start, k_VKQ_0);
+            } else if constexpr (type_K == GGML_TYPE_Q8_0) {
                 flash_attn_ext_q8_0_load_tile<stride_tile_K, nbatch_fa, nthreads_turbo, oob_check>
                     (K_raw, tile_K, k0_diff, stride_K, k0_start, k_VKQ_sup,
                      sparse_indices, sparse_n_indices, sparse_recent_start, k_VKQ_0);
@@ -1266,13 +1334,17 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             const int i0_diff = i0_stop - i0_start;
             // Quantized V is dequantized directly into shared memory using
             // the same sparse row mapping as K.
-            static_assert(type_V == GGML_TYPE_Q8_0 || type_V == GGML_TYPE_TURBO4_0 ||
+            static_assert(type_V == GGML_TYPE_Q4_0 || type_V == GGML_TYPE_Q8_0 || type_V == GGML_TYPE_TURBO4_0 ||
                           type_V == GGML_TYPE_TURBO3_0 || type_V == GGML_TYPE_TURBO2_0,
                           "unsupported quantized V type on the MMA path");
             static_assert(!V_is_K_view, "turbo MMA path never uses V_is_K_view");
             constexpr int nthreads_turbo = nwarps * ggml_cuda_get_physical_warp_size();
             const char * V_raw = (const char *) V_h2;
-            if constexpr (type_V == GGML_TYPE_Q8_0) {
+            if constexpr (type_V == GGML_TYPE_Q4_0) {
+                flash_attn_ext_q4_0_load_tile<stride_tile_V, nbatch_fa, nthreads_turbo, oob_check>
+                    (V_raw, tile_V, i0_diff/2, stride_V, i0_start/2, k_VKQ_sup,
+                     sparse_indices, sparse_n_indices, sparse_recent_start, k_VKQ_0);
+            } else if constexpr (type_V == GGML_TYPE_Q8_0) {
                 flash_attn_ext_q8_0_load_tile<stride_tile_V, nbatch_fa, nthreads_turbo, oob_check>
                     (V_raw, tile_V, i0_diff/2, stride_V, i0_start/2, k_VKQ_sup,
                      sparse_indices, sparse_n_indices, sparse_recent_start, k_VKQ_0);
@@ -1616,8 +1688,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     }
 
     // kb0_start is always < kb0_stop so the last iter can be executed unconditionally.
-    constexpr bool indexed_mixed_kv = type_K == GGML_TYPE_Q8_0 && type_V == GGML_TYPE_TURBO4_0;
-    if constexpr (ncols2 == 1 || indexed_mixed_kv) {
+    constexpr bool quantized_kv = type_K != GGML_TYPE_F16 || type_V != GGML_TYPE_F16;
+    if constexpr (ncols2 == 1 || quantized_kv) {
         constexpr bool oob_check = true;
         for (; kb0 < kb0_stop-1; ++kb0) {
             constexpr bool last_iter = false;
@@ -2061,6 +2133,9 @@ static __global__ void flash_attn_ext_f16(
         const char * K_ptr,
         const char * V_ptr,
         const char * mask_ptr,
+        const int  * sparse_indices_ptr,
+        const int32_t sparse_n_indices,
+        const int32_t sparse_recent_start,
         const char * sinks_ptr,
         float      * score_ptr,
         const int  * KV_max_ptr,
@@ -2085,11 +2160,8 @@ static __global__ void flash_attn_ext_f16(
     const char * GGML_CUDA_RESTRICT Q        = Q_ptr;
     const char * GGML_CUDA_RESTRICT K        = K_ptr;
     const char * GGML_CUDA_RESTRICT V        = V_ptr;
-    const bool use_sparse_kv = ne33 == -1;
-    const int * GGML_CUDA_RESTRICT sparse_indices = use_sparse_kv ? (const int *) mask_ptr : nullptr;
-    const int sparse_n_indices = use_sparse_kv ? ne31 : 0;
-    const int sparse_recent_start = use_sparse_kv ? ne32 : 0;
-    const char * GGML_CUDA_RESTRICT mask     = use_sparse_kv ? nullptr : mask_ptr;
+    const int * GGML_CUDA_RESTRICT sparse_indices = sparse_indices_ptr;
+    const char * GGML_CUDA_RESTRICT mask     = mask_ptr;
     const char * GGML_CUDA_RESTRICT sinks    = sinks_ptr;
     float      * GGML_CUDA_RESTRICT score    = score_ptr;
     const int  * GGML_CUDA_RESTRICT KV_max   = KV_max_ptr;
@@ -2250,7 +2322,8 @@ static __global__ void flash_attn_ext_f16(
          sinks_f, score ? score + z_KV : nullptr, dstk, dst_meta, scale, slope, logit_softcap,
          score_prefix, ne12, ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);
 #else
-    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, score_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, scale,
+    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sparse_indices_ptr, sparse_n_indices, sparse_recent_start,
+        sinks_ptr, score_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, scale,
         max_bias, m0, m1, n_head_log2, logit_softcap,
         score_prefix_ptr,
         ne00, ne01, ne02, ne03,

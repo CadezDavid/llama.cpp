@@ -813,6 +813,9 @@ static __global__ void flash_attn_tile(
         const char * K_ptr,
         const char * V_ptr,
         const char * mask_ptr,
+        const int  * sparse_indices_ptr,
+        const int32_t sparse_n_indices,
+        const int32_t sparse_recent_start,
         const char * sinks_ptr,
         float      * score_ptr,
         const int  * KV_max_ptr,
@@ -1154,7 +1157,8 @@ static __global__ void flash_attn_tile(
         }
     }
 #else
-    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, score_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, scale,
+    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sparse_indices_ptr, sparse_n_indices, sparse_recent_start,
+        sinks_ptr, score_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, scale,
         max_bias, m0, m1, n_head_log2, logit_softcap,
         score_prefix_ptr,
         ne00, ne01, ne02, ne03,

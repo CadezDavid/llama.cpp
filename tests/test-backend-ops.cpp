@@ -7174,11 +7174,9 @@ struct test_flash_attn_ext : public test_case {
         ggml_flash_attn_ext_set_prec (out, prec);
         if (sparse_pattern != 0) {
             GGML_ASSERT(nr23[1] == 1 && !sinks && max_bias == 0.0f);
-            GGML_ASSERT(sparse_mode == GGML_SPARSE_FATTN_MODE_GATHER || nb == 1);
             const int64_t n_indices = sparse_pattern == 4 ? kv / 4 :
                     sparse_pattern == 3 ? kv / 2 : kv;
-            const int32_t suffix_start = sparse_pattern == 2 ? 0 :
-                    sparse_pattern == 3 ? (int32_t) n_indices :
+            const int32_t suffix_start = sparse_pattern == 3 ? (int32_t) n_indices :
                     sparse_pattern == 4 ? (int32_t) (kv / 2) : (int32_t) kv;
             const int32_t sparse_n_kv = (int32_t) n_indices + (int32_t) kv - suffix_start;
             ggml_tensor * indices = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_indices);
@@ -10036,10 +10034,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                         std::pair<ggml_type, ggml_type>{GGML_TYPE_Q4_0, GGML_TYPE_Q4_0},
                         std::pair<ggml_type, ggml_type>{GGML_TYPE_Q8_0, GGML_TYPE_Q4_0},
                         std::pair<ggml_type, ggml_type>{GGML_TYPE_Q8_0, GGML_TYPE_Q8_0}}) {
-                    test_cases.emplace_back(new test_flash_attn_ext(
-                            hs, hs, 4, {gqa, 1}, 512, nb, true, false, 0, 0,
-                            GGML_PREC_F32, cache_types.first, cache_types.second,
-                            {0, 1, 2, 3}, sparse_pattern, GGML_SPARSE_FATTN_MODE_GATHER));
+                    for (ggml_sparse_fattn_mode sparse_mode : {
+                            GGML_SPARSE_FATTN_MODE_DIRECT,
+                            GGML_SPARSE_FATTN_MODE_GATHER}) {
+                        test_cases.emplace_back(new test_flash_attn_ext(
+                                hs, hs, 4, {gqa, 1}, 512, nb, true, false, 0, 0,
+                                GGML_PREC_F32, cache_types.first, cache_types.second,
+                                {0, 1, 2, 3}, sparse_pattern, sparse_mode));
+                    }
                 }
             }
         }

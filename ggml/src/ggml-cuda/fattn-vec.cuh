@@ -24,6 +24,9 @@ static __global__ void flash_attn_ext_vec(
         const char * K_ptr,
         const char * V_ptr,
         const char * mask_ptr,
+        const int  * sparse_indices_ptr,
+        const int32_t sparse_n_indices,
+        const int32_t sparse_recent_start,
         const char * sinks_ptr,
         float      * score_ptr,
         const int  * KV_max_ptr,
@@ -130,15 +133,14 @@ static __global__ void flash_attn_ext_vec(
     const int sequence = blockIdx.z / ne02;
     const int head = blockIdx.z - sequence*ne02;
     const int gqa_ratio = ne02 / ne12; // With grouped query attention there are > 1 Q matrices per K, V matrix.
-    const bool use_sparse_kv = ne33 == -1;
-    const int * sparse_indices = use_sparse_kv ? (const int *) mask : nullptr;
-    const int sparse_recent_start = use_sparse_kv ? ne32 : 0;
+    const bool use_sparse_kv = sparse_indices_ptr != nullptr;
+    const int * sparse_indices = sparse_indices_ptr;
     const int sparse_n_kv = ne11;
     Q += nb03*sequence + nb02* head              + nb01*ic0;
     K += nb13*sequence + nb12*(head / gqa_ratio);
     V += nb23*sequence + nb22*(head / gqa_ratio);
 
-    const half * maskh = use_sparse_kv || !mask ? nullptr :
+    const half * maskh = !mask ? nullptr :
         (const half *) (mask + nb33*(sequence % ne33) + nb31*ic0);
 
     const float slope = get_alibi_slope(max_bias, head, n_head_log2, m0, m1);
@@ -340,8 +342,8 @@ static __global__ void flash_attn_ext_vec(
                 const int i_KQ_logical = k_VKQ_0 + i_KQ;
                 const bool i_KQ_valid = !use_sparse_kv || i_KQ_logical < sparse_n_kv;
                 const int i_KQ_actual = !i_KQ_valid ? 0 : !use_sparse_kv ? i_KQ :
-                    ne31 == sparse_recent_start ? i_KQ_logical :
-                    (i_KQ_logical < ne31 ? sparse_indices[i_KQ_logical] : sparse_recent_start + i_KQ_logical - ne31);
+                    (i_KQ_logical < sparse_n_indices ? sparse_indices[i_KQ_logical] :
+                        sparse_recent_start + i_KQ_logical - sparse_n_indices);
                 const char * K_row = K + i_KQ_actual*nb11;
 
                 if (!i_KQ_valid) {
@@ -401,8 +403,11 @@ static __global__ void flash_attn_ext_vec(
                     atomicAdd(score + i_KQ_logical*ne12 + head/gqa_ratio, sum);
                 }
 
-                if (!use_sparse_kv && mask && (ncols == 1 || ic0 + j < int(ne01.z))) {
-                    sum += slope*__half2float(maskh[j*ne11 + i_KQ]);
+                if (mask && (ncols == 1 || ic0 + j < int(ne01.z))) {
+                    const half mask_value = use_sparse_kv ?
+                            *(const half *) ((const char *) maskh + j*nb31 + i_KQ_actual*sizeof(half)) :
+                            maskh[j*ne11 + i_KQ];
+                    sum += slope*__half2float(mask_value);
                 }
 
                 KQ_max_new[j] = fmaxf(KQ_max_new[j], sum + FATTN_KQ_MAX_OFFSET);
@@ -451,8 +456,8 @@ static __global__ void flash_attn_ext_vec(
             const int k_logical = k_VKQ_0 + k;
             const bool k_valid = !use_sparse_kv || k_logical < sparse_n_kv;
             const int k_actual = !k_valid ? 0 : !use_sparse_kv ? k :
-                ne31 == sparse_recent_start ? k_logical :
-                (k_logical < ne31 ? sparse_indices[k_logical] : sparse_recent_start + k_logical - ne31);
+                (k_logical < sparse_n_indices ? sparse_indices[k_logical] :
+                    sparse_recent_start + k_logical - sparse_n_indices);
             const char * V_row = V + k_actual*nb21;
 
 #ifdef V_DOT2_F32_F16_AVAILABLE
@@ -796,7 +801,8 @@ static __global__ void flash_attn_ext_vec(
         dst_meta[((sequence*int(ne01.z) + ic0 + tid)*ne02 + head)*gridDim.y + blockIdx.y] = make_float2(KQ_max[tid], KQ_sum[tid]);
     }
 #else
-    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, score_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, scale,
+    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sparse_indices_ptr, sparse_n_indices, sparse_recent_start,
+        sinks_ptr, score_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, scale,
         max_bias, m0, m1, n_head_log2, logit_softcap,
         score_prefix_ptr,
         ne00, ne01, ne02, ne03,

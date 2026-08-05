@@ -68,8 +68,7 @@ static __global__ void gather_dequant_sparse_f16(
         if (i_kv >= n_kv) {
             mask_f16[i] = __float2half(-INFINITY);
         } else {
-            const int64_t i_actual = n_indices == suffix_start ? i_kv :
-                    (i_kv < n_indices ? indices[i_kv] : suffix_start + i_kv - n_indices);
+            const int64_t i_actual = i_kv < n_indices ? indices[i_kv] : suffix_start + i_kv - n_indices;
             mask_f16[i] = mask == nullptr ? __float2half(0.0f) :
                     *(const half *) ((const char *) mask + i_query * mask_nb1 + i_actual * mask_nb0);
         }
@@ -88,8 +87,7 @@ static __global__ void gather_dequant_sparse_f16(
         return;
     }
 
-    const int64_t i_actual = n_indices == suffix_start ? i_kv :
-            (i_kv < n_indices ? indices[i_kv] : suffix_start + i_kv - n_indices);
+    const int64_t i_actual = i_kv < n_indices ? indices[i_kv] : suffix_start + i_kv - n_indices;
     const char * K_row = K + i_head * nb12 + i_actual * nb11;
     const char * V_row = V + i_head * nb22 + i_actual * nb21;
 
@@ -300,6 +298,46 @@ static void ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2(ggml_backend_cuda_c
         return;
     }
     ggml_cuda_flash_attn_ext_mma_turbo_case<DKQ, DV, 8, 1, type_K, type_V>(ctx, dst); // ncols2 = 1 -> (8,1)
+}
+
+template <int D, ggml_type type_K, ggml_type type_V>
+static bool ggml_cuda_flash_attn_ext_mma_indexed_normal(
+        ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    if (Q->ne[0] != D || Q->ne[1] > 4 || Q->ne[2] % K->ne[2] != 0) {
+        return false;
+    }
+
+    const int gqa_ratio = Q->ne[2] / K->ne[2];
+    if (gqa_ratio >= 8) {
+        if (Q->ne[1] <= 1) {
+            ggml_cuda_flash_attn_ext_mma_turbo_case<D, D, 1, 8, type_K, type_V>(ctx, dst);
+        } else if (Q->ne[1] <= 2) {
+            ggml_cuda_flash_attn_ext_mma_turbo_case<D, D, 2, 8, type_K, type_V>(ctx, dst);
+        } else {
+            ggml_cuda_flash_attn_ext_mma_turbo_case<D, D, 4, 8, type_K, type_V>(ctx, dst);
+        }
+        return true;
+    }
+    if constexpr (D == 256) {
+        if (gqa_ratio >= 4) {
+            if (Q->ne[1] <= 2) {
+                ggml_cuda_flash_attn_ext_mma_turbo_case<D, D, 2, 4, type_K, type_V>(ctx, dst);
+            } else {
+                ggml_cuda_flash_attn_ext_mma_turbo_case<D, D, 4, 4, type_K, type_V>(ctx, dst);
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+template <ggml_type type_K, ggml_type type_V>
+static bool ggml_cuda_flash_attn_ext_try_mma_indexed_normal(
+        ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    return ggml_cuda_flash_attn_ext_mma_indexed_normal<256, type_K, type_V>(ctx, dst) ||
+           ggml_cuda_flash_attn_ext_mma_indexed_normal<512, type_K, type_V>(ctx, dst);
 }
 
 // Env latch for the fused turbo4 MMA decode path. DEFAULT OFF.
@@ -1385,7 +1423,6 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     if (dst->src[5] != nullptr) {
         const ggml_sparse_fattn_mode sparse_mode = ggml_flash_attn_ext_get_sparse_mode(dst);
         GGML_ASSERT(dst->src[0]->ne[3] == 1);
-        GGML_ASSERT(sparse_mode == GGML_SPARSE_FATTN_MODE_GATHER || dst->src[0]->ne[1] == 1);
         const bool q8_turbo4 = dst->src[1]->type == GGML_TYPE_Q8_0 &&
                 dst->src[2]->type == GGML_TYPE_TURBO4_0;
         if (sparse_mode == GGML_SPARSE_FATTN_MODE_GATHER) {
@@ -1396,6 +1433,22 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             const sparse_q8_turbo4_impl impl = sparse_q8_turbo4_autotune(ctx, dst);
             ggml_cuda_flash_attn_ext_sparse_q8_turbo4_launch(ctx, dst, impl);
             return;
+        }
+        const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+        if (sparse_mode == GGML_SPARSE_FATTN_MODE_DIRECT && turing_mma_available(cc)) {
+            const ggml_type type_K = dst->src[1]->type;
+            const ggml_type type_V = dst->src[2]->type;
+            bool launched = false;
+            if (type_K == GGML_TYPE_Q4_0 && type_V == GGML_TYPE_Q4_0) {
+                launched = ggml_cuda_flash_attn_ext_try_mma_indexed_normal<GGML_TYPE_Q4_0, GGML_TYPE_Q4_0>(ctx, dst);
+            } else if (type_K == GGML_TYPE_Q8_0 && type_V == GGML_TYPE_Q4_0) {
+                launched = ggml_cuda_flash_attn_ext_try_mma_indexed_normal<GGML_TYPE_Q8_0, GGML_TYPE_Q4_0>(ctx, dst);
+            } else if (type_K == GGML_TYPE_Q8_0 && type_V == GGML_TYPE_Q8_0) {
+                launched = ggml_cuda_flash_attn_ext_try_mma_indexed_normal<GGML_TYPE_Q8_0, GGML_TYPE_Q8_0>(ctx, dst);
+            }
+            if (launched) {
+                return;
+            }
         }
         ggml_cuda_flash_attn_ext_vec(ctx, dst);
         return;
@@ -1470,10 +1523,11 @@ bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
         const ggml_tensor * K = dst->src[1];
         const ggml_tensor * V = dst->src[2];
         const bool q8_turbo4 = K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_TURBO4_0;
-        const bool gather_types = q8_turbo4 ||
+        const bool normal_types =
                 (K->type == GGML_TYPE_Q4_0 && V->type == GGML_TYPE_Q4_0) ||
                 (K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q4_0) ||
                 (K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0);
+        const bool gather_types = q8_turbo4 || normal_types;
         if (sparse_mode == GGML_SPARSE_FATTN_MODE_GATHER) {
             return (Q->ne[0] == 256 || Q->ne[0] == 512) && V->ne[0] == Q->ne[0] &&
                     Q->ne[1] >= 1 && Q->ne[3] == 1 && gather_types &&
@@ -1487,9 +1541,9 @@ bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
                     turing_mma_available(ggml_cuda_info().devices[device].cc);
         }
         if ((sparse_mode == GGML_SPARSE_FATTN_MODE_DIRECT ||
-                sparse_mode == GGML_SPARSE_FATTN_MODE_AUTO) && q8_turbo4) {
+                sparse_mode == GGML_SPARSE_FATTN_MODE_AUTO) && (normal_types || q8_turbo4)) {
             return (Q->ne[0] == 256 || Q->ne[0] == 512) && V->ne[0] == Q->ne[0] &&
-                    Q->ne[1] == 1 && Q->ne[3] == 1;
+                    Q->ne[1] >= 1 && Q->ne[3] == 1 && (normal_types || Q->ne[1] == 1);
         }
     }
     return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;

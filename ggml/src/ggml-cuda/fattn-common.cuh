@@ -24,6 +24,9 @@ typedef void (* fattn_kernel_t)(
         const char * __restrict__ K,
         const char * __restrict__ V,
         const char * __restrict__ mask,
+        const int  * __restrict__ sparse_indices,
+        const int32_t sparse_n_indices,
+        const int32_t sparse_recent_start,
         const char * __restrict__ sinks,
         float      * __restrict__ score,
         const int  * __restrict__ KV_max,
@@ -1353,7 +1356,7 @@ void launch_fattn(
     const int sparse_n_indices = sparse_kv ? ggml_get_op_params_i32(dst, 4) : 0;
     const int n_kv = sparse_kv ? ggml_get_op_params_i32(dst, 5) : K->ne[1];
     const int sparse_suffix_start = sparse_kv ? ggml_get_op_params_i32(dst, 6) : 0;
-    GGML_ASSERT(!sparse_kv || (Q->ne[1] == 1 && Q->ne[3] == 1));
+    GGML_ASSERT(!sparse_kv || Q->ne[3] == 1);
     GGML_ASSERT(!sparse_kv || (sparse_n_indices == sparse_kv->ne[0] && sparse_n_indices > 0));
     GGML_ASSERT(!sparse_kv || (n_kv >= sparse_n_indices && n_kv <= K->ne[1]));
     GGML_ASSERT(!sparse_kv || sparse_suffix_start >= 0);
@@ -1601,7 +1604,10 @@ void launch_fattn(
         (const char *) Q->data,
         K_data,
         V_data,
-        sparse_kv ? ((const char *) sparse_kv->data) : (mask ? ((const char *) mask->data) : nullptr),
+        mask ? ((const char *) mask->data) : nullptr,
+        sparse_kv ? (const int *) sparse_kv->data : nullptr,
+        sparse_n_indices,
+        sparse_suffix_start,
         sinks ? ((const char *) sinks->data) : nullptr,
         score ? (float *) score->data : nullptr,
         KV_max.ptr,
@@ -1611,12 +1617,12 @@ void launch_fattn(
         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
         K->ne[0], n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,
-        sparse_kv ? sparse_n_indices : (mask ? mask->ne[1] : 0),
-        sparse_kv ? sparse_suffix_start : (mask ? mask->ne[2] : 0),
-        sparse_kv ? -1 : (mask ? mask->ne[3] : 0),
-        sparse_kv ? 0 : (mask ? mask->nb[1] : 0),
-        sparse_kv ? 0 : (mask ? mask->nb[2] : 0),
-        sparse_kv ? 0 : (mask ? mask->nb[3] : 0)
+        mask ? mask->ne[1] : 0,
+        mask ? mask->ne[2] : 0,
+        mask ? mask->ne[3] : 0,
+        mask ? mask->nb[1] : 0,
+        mask ? mask->nb[2] : 0,
+        mask ? mask->nb[3] : 0
     );
     CUDA_CHECK(cudaGetLastError());
 
