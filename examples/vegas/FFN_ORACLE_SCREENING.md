@@ -2,6 +2,11 @@
 
 Date: 2026-08-04
 
+Archive status: the oracle graph path and its command-line controls were
+removed from active code on 2026-08-05. The final implementation snapshot is
+commit `f1e07e9651c53ca0dd43307be62263a6d999a71b`; raw results remain preserved
+below and in `results/ffn-oracle-2026-08-04/`.
+
 ## Question
 
 Can MTP+Vegas drafts discard a large fraction of FFN channels without losing

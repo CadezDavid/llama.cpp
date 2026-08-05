@@ -730,11 +730,6 @@ struct llm_graph_params {
     int32_t vegas_max_recent_tokens;
     int32_t vegas_selection_layer;
     int32_t vegas_anchor_tokens;
-    float vegas_ffn_oracle_sparsity;
-    int32_t vegas_ffn_oracle_block_size;
-    float vegas_ffn_proxy_input_sparsity;
-    int32_t vegas_ffn_proxy_block_size;
-    bool vegas_ffn_proxy_use_values;
     const ggml_tensor * vegas_plan;
     int32_t vegas_shared_plan_layer;
 
@@ -804,14 +799,6 @@ struct llm_graph_params {
         }
 
         if (vegas_mode != other.vegas_mode) {
-            return false;
-        }
-
-        if (vegas_ffn_oracle_sparsity != other.vegas_ffn_oracle_sparsity ||
-                vegas_ffn_oracle_block_size != other.vegas_ffn_oracle_block_size ||
-                vegas_ffn_proxy_input_sparsity != other.vegas_ffn_proxy_input_sparsity ||
-                vegas_ffn_proxy_block_size != other.vegas_ffn_proxy_block_size ||
-                vegas_ffn_proxy_use_values != other.vegas_ffn_proxy_use_values) {
             return false;
         }
 
@@ -1004,12 +991,6 @@ struct llm_graph_context {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
     const llama_vegas_state      * vegas;
-
-    const float vegas_ffn_oracle_sparsity;
-    const int32_t vegas_ffn_oracle_block_size;
-    const float vegas_ffn_proxy_input_sparsity;
-    const int32_t vegas_ffn_proxy_block_size;
-    const bool vegas_ffn_proxy_use_values;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 

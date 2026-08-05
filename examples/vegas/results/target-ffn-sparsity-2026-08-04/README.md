@@ -1,5 +1,9 @@
 # Target FFN sparsity raw results
 
+Archive status: the evaluator that produced these files has been removed from
+active code. Its final source is preserved in commit
+`f1e07e9651c53ca0dd43307be62263a6d999a71b`.
+
 The files in this directory are one-line `FFN_SPARSE_EVAL` records produced by
 `llama-ffn-sparse-eval`. They are screening runs, not repeated throughput
 benchmarks.

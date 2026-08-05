@@ -1350,42 +1350,6 @@ bool llama_context::vegas_set_anchor_tokens(int32_t n_tokens) {
     return true;
 }
 
-bool llama_context::vegas_set_ffn_oracle_sparsity(float sparsity) {
-    if (!std::isfinite(sparsity) || sparsity < 0.0f || sparsity >= 1.0f) {
-        return false;
-    }
-
-    vegas.ffn_oracle_sparsity = sparsity;
-    sched_need_reserve = true;
-
-    return true;
-}
-
-bool llama_context::vegas_set_ffn_oracle_block_size(int32_t block_size) {
-    if (block_size < 1) {
-        return false;
-    }
-
-    vegas.ffn_oracle_block_size = block_size;
-    sched_need_reserve = true;
-
-    return true;
-}
-
-bool llama_context::vegas_set_ffn_proxy(float input_sparsity, int32_t block_size, bool use_values) {
-    if (!std::isfinite(input_sparsity) || input_sparsity < 0.0f || input_sparsity >= 1.0f ||
-            block_size < 1) {
-        return false;
-    }
-
-    vegas.ffn_proxy_input_sparsity = input_sparsity;
-    vegas.ffn_proxy_block_size = block_size;
-    vegas.ffn_proxy_use_values = use_values;
-    sched_need_reserve = true;
-
-    return true;
-}
-
 void llama_context::vegas_set_mode(llama_vegas_mode mode, int32_t prefix_len) {
     GGML_ASSERT(prefix_len >= 0);
 
@@ -2739,11 +2703,6 @@ llm_graph_params llama_context::graph_params(
         /*.vegas_max_recent_tokens =*/ vegas.max_recent_tokens,
         /*.vegas_selection_layer =*/ vegas.selection_layer,
         /*.vegas_anchor_tokens =*/ vegas.anchor_tokens,
-        /*.vegas_ffn_oracle_sparsity =*/ vegas.ffn_oracle_sparsity,
-        /*.vegas_ffn_oracle_block_size =*/ vegas.ffn_oracle_block_size,
-        /*.vegas_ffn_proxy_input_sparsity =*/ vegas.ffn_proxy_input_sparsity,
-        /*.vegas_ffn_proxy_block_size =*/ vegas.ffn_proxy_block_size,
-        /*.vegas_ffn_proxy_use_values =*/ vegas.ffn_proxy_use_values,
         /*.vegas_plan =*/ vegas.plan,
         /*.vegas_shared_plan_layer =*/ vegas.shared_plan_layer,
         /*.samplers    =*/ sampling.samplers,
@@ -4510,18 +4469,6 @@ bool llama_vegas_set_selection_layer(llama_context * ctx, int32_t il) {
 
 bool llama_vegas_set_anchor_tokens(llama_context * ctx, int32_t n_tokens) {
     return ctx->vegas_set_anchor_tokens(n_tokens);
-}
-
-bool llama_vegas_set_ffn_oracle_sparsity(llama_context * ctx, float sparsity) {
-    return ctx->vegas_set_ffn_oracle_sparsity(sparsity);
-}
-
-bool llama_vegas_set_ffn_oracle_block_size(llama_context * ctx, int32_t block_size) {
-    return ctx->vegas_set_ffn_oracle_block_size(block_size);
-}
-
-bool llama_vegas_set_ffn_proxy(llama_context * ctx, float input_sparsity, int32_t block_size, bool use_values) {
-    return ctx->vegas_set_ffn_proxy(input_sparsity, block_size, use_values);
 }
 
 void llama_vegas_set_mode(llama_context * ctx, int32_t mode, int32_t prefix_len) {

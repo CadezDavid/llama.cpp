@@ -1411,11 +1411,6 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     mctx             (params.mctx),
     cross            (params.cross),
     vegas            (params.vegas),
-    vegas_ffn_oracle_sparsity(params.vegas_ffn_oracle_sparsity),
-    vegas_ffn_oracle_block_size(params.vegas_ffn_oracle_block_size),
-    vegas_ffn_proxy_input_sparsity(params.vegas_ffn_proxy_input_sparsity),
-    vegas_ffn_proxy_block_size(params.vegas_ffn_proxy_block_size),
-    vegas_ffn_proxy_use_values(params.vegas_ffn_proxy_use_values),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -1635,9 +1630,6 @@ ggml_tensor * llm_graph_context::build_ffn(
      llm_ffn_op_type   type_op,
    llm_ffn_gate_type   type_gate,
                  int   il) const {
-    ggml_tensor * ffn_inp = cur;
-    const llm_ffn_gate_type ffn_gate_type = type_gate;
-
     // NVFP4 support is currently restricted to
     // 1) LORA absence (*_s would be applied after LORA residual, which is incorrect)
     // 2) bias absense (*_s would be applied after bias addition, which is incorrect)
@@ -1788,73 +1780,6 @@ ggml_tensor * llm_graph_context::build_ffn(
     if (gate && type_gate == LLM_FFN_PAR) {
         cur = ggml_mul(ctx0, cur, tmp);
         cb(cur, "ffn_gate_par", il);
-    }
-
-    if (down && vegas_ffn_oracle_sparsity > 0.0f) {
-        auto select = [&](ggml_tensor * signal, float sparsity, int32_t block_size) {
-            const int64_t n_channels = signal->ne[0];
-            GGML_ASSERT(block_size > 0 && n_channels % block_size == 0);
-            const int64_t n_blocks = n_channels / block_size;
-            const int64_t n_keep = std::max<int64_t>(1,
-                    (int64_t) std::ceil(n_blocks * (1.0f - sparsity)));
-            ggml_tensor * signal_3d = ggml_reshape_3d(
-                    ctx0, signal, block_size, n_blocks, ggml_nrows(signal));
-            ggml_tensor * scores = ggml_reshape_2d(
-                    ctx0, ggml_sum_rows(ctx0, ggml_sqr(ctx0, signal_3d)), n_blocks, ggml_nrows(signal));
-            return ggml_top_k(ctx0, scores, n_keep);
-        };
-        auto retain = [&](ggml_tensor * values, ggml_tensor * indices, int32_t block_size) {
-            const int64_t n_blocks = values->ne[0] / block_size;
-            ggml_tensor * values_3d = ggml_reshape_3d(
-                    ctx0, values, block_size, n_blocks, ggml_nrows(values));
-            ggml_tensor * selected = ggml_get_rows(ctx0, values_3d, indices);
-            ggml_tensor * sparse_3d = ggml_set_rows(
-                    ctx0, ggml_fill(ctx0, values_3d, 0.0f), selected, indices);
-            return ggml_reshape(ctx0, sparse_3d, values);
-        };
-
-        ggml_tensor * selection_signal = cur;
-        if (vegas_ffn_proxy_input_sparsity > 0.0f) {
-            GGML_ASSERT(up && gate && ffn_gate_type == LLM_FFN_PAR);
-            ggml_tensor * inp_indices = select(
-                    ffn_inp, vegas_ffn_proxy_input_sparsity, vegas_ffn_proxy_block_size);
-            ggml_tensor * proxy_inp = retain(ffn_inp, inp_indices, vegas_ffn_proxy_block_size);
-            ggml_tensor * proxy_up = build_lora_mm(up, proxy_inp);
-            ggml_tensor * proxy_gate = build_lora_mm(gate, proxy_inp);
-            if (up_b) {
-                proxy_up = ggml_add(ctx0, proxy_up, up_b);
-            }
-            if (up_s) {
-                proxy_up = ggml_mul(ctx0, proxy_up, up_s);
-            }
-            if (gate_b) {
-                proxy_gate = ggml_add(ctx0, proxy_gate, gate_b);
-            }
-            if (gate_s) {
-                proxy_gate = ggml_mul(ctx0, proxy_gate, gate_s);
-            }
-            switch (type_op) {
-                case LLM_FFN_SILU:
-                    selection_signal = ggml_swiglu_split(ctx0, proxy_gate, proxy_up);
-                    break;
-                case LLM_FFN_GELU:
-                    selection_signal = ggml_geglu_split(ctx0, proxy_gate, proxy_up);
-                    break;
-                case LLM_FFN_RELU:
-                    selection_signal = ggml_reglu_split(ctx0, proxy_gate, proxy_up);
-                    break;
-                default:
-                    GGML_ABORT("unsupported FFN proxy activation");
-            }
-        }
-
-        ggml_tensor * indices = select(
-                selection_signal, vegas_ffn_oracle_sparsity, vegas_ffn_oracle_block_size);
-        cur = retain(
-                vegas_ffn_proxy_use_values ? selection_signal : cur,
-                indices,
-                vegas_ffn_oracle_block_size);
-        cb(cur, "ffn_oracle_sparse", il);
     }
 
     if (down) {

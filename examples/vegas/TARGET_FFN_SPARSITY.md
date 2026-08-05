@@ -2,6 +2,11 @@
 
 Date: 2026-08-04
 
+Archive status: the experimental implementation was removed from active code
+on 2026-08-05. Commit `f1e07e9651c53ca0dd43307be62263a6d999a71b`
+contains the final evaluator snapshot used for these measurements. See
+`PROX_ARCHIVE.md` for the archive index and reconsideration criteria.
+
 ## Conclusion
 
 Prox-style target FFN sparsity is not a viable performance optimization for the
@@ -28,9 +33,9 @@ failed. Such a kernel could skip arithmetic, but it could not avoid enough
 weight bytes to produce a meaningful speedup. Adding it would leave a large,
 format-specific code path with a non-positive expected benefit.
 
-## What was implemented
+## What was implemented for the experiment
 
-`llama-ffn-sparse-eval` runs dense and experimental target contexts over the
+The now-removed `llama-ffn-sparse-eval` ran dense and experimental target contexts over the
 same real token stream. Prompt prefill stays dense. During the evaluation
 window it teacher-forces identical tokens and reports:
 
@@ -168,9 +173,15 @@ end-to-end ceiling is below 5% and will shrink further after overhead.
 - Qwen3.6 35B-A3B: its target FFN is already expert-sparse. The dense-SwiGLU
   Prox path tested here does not directly apply to its MoE expert dispatch.
 
-## Reproduction
+## Historical reproduction
 
-Build:
+The evaluator and runtime switches below describe the archived implementation,
+not the current branch tip. Use commit
+`f1e07e9651c53ca0dd43307be62263a6d999a71b` in a separate worktree if the
+experiment needs to be reproduced. Do not expect these options in the active
+`llama-vegas` executable.
+
+Historical build:
 
 ```sh
 cmake --build build-vegas --target llama-ffn-sparse-eval -j 12

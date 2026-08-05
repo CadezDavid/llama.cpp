@@ -39,9 +39,6 @@ struct vegas_options {
     int32_t refresh_interval = 1;
     int32_t mtp_ubatch = 128;
     int32_t prompt_tokens = 0;
-    float ffn_oracle_sparsity = 0.0f;
-    float target_ffn_oracle_sparsity = 0.0f;
-    int32_t ffn_oracle_block_size = 1;
     bool auto_policy = false;
     bool quiet = false;
 };
@@ -197,28 +194,6 @@ static bool parse_vegas_options(
             }
             continue;
         }
-        if (const char * value = get_value("--vegas-ffn-oracle-sparsity")) {
-            if (!parse_f32(value, options.ffn_oracle_sparsity)) {
-                LOG_ERR("invalid --vegas-ffn-oracle-sparsity: %s\n", value);
-                return false;
-            }
-            continue;
-        }
-        if (const char * value = get_value("--vegas-target-ffn-oracle-sparsity")) {
-            if (!parse_f32(value, options.target_ffn_oracle_sparsity)) {
-                LOG_ERR("invalid --vegas-target-ffn-oracle-sparsity: %s\n", value);
-                return false;
-            }
-            continue;
-        }
-        if (const char * value = get_value("--vegas-ffn-oracle-block-size")) {
-            if (!parse_i32(value, options.ffn_oracle_block_size)) {
-                LOG_ERR("invalid --vegas-ffn-oracle-block-size: %s\n", value);
-                return false;
-            }
-            continue;
-        }
-
         if (const char * value = get_value("--vegas-selection-layer")) {
             if (!parse_i32(value, options.selection_layer)) {
                 LOG_ERR("invalid --vegas-selection-layer: %s\n", value);
@@ -263,10 +238,7 @@ static bool parse_vegas_options(
     if (!(options.sparse_ratio > 0.0f && options.sparse_ratio <= 1.0f) ||
             options.min_tokens < 1 || options.max_tokens < 0 || options.gamma < 1 ||
             options.anchor_tokens < 0 || options.refresh_interval < 1 ||
-            options.mtp_ubatch < 1 || options.prompt_tokens < 0 || options.prompt_tokens == 1 ||
-            options.ffn_oracle_sparsity < 0.0f || options.ffn_oracle_sparsity >= 1.0f ||
-            options.target_ffn_oracle_sparsity < 0.0f || options.target_ffn_oracle_sparsity >= 1.0f ||
-            options.ffn_oracle_block_size < 1) {
+            options.mtp_ubatch < 1 || options.prompt_tokens < 0 || options.prompt_tokens == 1) {
         LOG_ERR("invalid Vegas configuration\n");
         return false;
     }
@@ -788,8 +760,7 @@ static void print_result(
         "\nVEGAS_RESULT {\"mode\":\"%s\",\"model\":\"%s\","
         "\"n_prompt\":%d,\"n_predict\":%d,\"gamma\":%d,\"auto_policy\":%s,"
         "\"selection_layer\":%d,\"anchor_tokens\":%d,\"refresh_interval\":%d,"
-        "\"sparse_ratio\":%.6f,\"ffn_oracle_sparsity\":%.6f,"
-        "\"target_ffn_oracle_sparsity\":%.6f,\"ffn_oracle_block_size\":%d,"
+        "\"sparse_ratio\":%.6f,"
         "\"min_tokens\":%d,\"max_tokens\":%d,"
         "\"cache_type_k\":\"%s\",\"cache_type_v\":\"%s\","
         "\"draft_cache_type_k\":\"%s\",\"draft_cache_type_v\":\"%s\","
@@ -802,8 +773,7 @@ static void print_result(
         mode_name(options.mode), params.model.path.c_str(),
         metrics.n_prompt, metrics.n_predict, options.gamma, options.auto_policy ? "true" : "false",
         options.selection_layer, options.anchor_tokens, options.refresh_interval,
-        options.sparse_ratio, options.ffn_oracle_sparsity,
-        options.target_ffn_oracle_sparsity, options.ffn_oracle_block_size,
+        options.sparse_ratio,
         options.min_tokens, options.max_tokens,
         ggml_type_name(params.cache_type_k), ggml_type_name(params.cache_type_v),
         ggml_type_name(params.speculative.draft.cache_type_k),
@@ -929,14 +899,6 @@ int main(int argc, char ** argv) {
         }
         llama_memory_clear(llama_get_memory(ctx_dft), true);
 
-        if (!llama_vegas_set_ffn_oracle_sparsity(ctx_dft, options.ffn_oracle_sparsity) ||
-                !llama_vegas_set_ffn_oracle_block_size(ctx_dft, options.ffn_oracle_block_size)) {
-            LOG_ERR("failed to set draft FFN oracle sparsity\n");
-            return 1;
-        }
-    } else if (options.ffn_oracle_sparsity > 0.0f) {
-        LOG_ERR("--vegas-ffn-oracle-sparsity requires an MTP mode\n");
-        return 1;
     }
 
     if (mode_uses_vegas(options.mode) &&
@@ -1009,12 +971,6 @@ int main(int argc, char ** argv) {
 
     if (!common_speculative_process(spec.get(), batch)) {
         LOG_ERR("failed to process final prompt token for MTP\n");
-        return 1;
-    }
-
-    if (!llama_vegas_set_ffn_oracle_sparsity(ctx, options.target_ffn_oracle_sparsity) ||
-            !llama_vegas_set_ffn_oracle_block_size(ctx, options.ffn_oracle_block_size)) {
-        LOG_ERR("failed to set target FFN oracle sparsity\n");
         return 1;
     }
 

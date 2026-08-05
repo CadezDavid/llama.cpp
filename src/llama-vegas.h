@@ -24,12 +24,6 @@ struct llama_vegas_state {
     int32_t max_recent_tokens = 0;
     int32_t selection_layer   = -1;
     int32_t anchor_tokens     = 0;
-    float   ffn_oracle_sparsity = 0.0f;
-    int32_t ffn_oracle_block_size = 1;
-    float   ffn_proxy_input_sparsity = 0.0f;
-    int32_t ffn_proxy_block_size = 1;
-    bool    ffn_proxy_use_values = false;
-
     ggml_tensor * plan = nullptr;
     int32_t plan_capacity = 0;
     int32_t shared_plan_layer = -1;

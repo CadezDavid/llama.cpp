@@ -123,9 +123,6 @@ struct llama_context {
     bool vegas_enable(float sparse_ratio, int32_t min_tokens, int32_t max_tokens, int32_t max_draft_tokens);
     bool vegas_set_selection_layer(int32_t il);
     bool vegas_set_anchor_tokens(int32_t n_tokens);
-    bool vegas_set_ffn_oracle_sparsity(float sparsity);
-    bool vegas_set_ffn_oracle_block_size(int32_t block_size);
-    bool vegas_set_ffn_proxy(float input_sparsity, int32_t block_size, bool use_values);
     void vegas_set_mode(llama_vegas_mode mode, int32_t prefix_len);
     void vegas_pause();
     bool vegas_resume_draft();

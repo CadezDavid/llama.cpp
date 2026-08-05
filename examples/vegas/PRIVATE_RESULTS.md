@@ -2,6 +2,10 @@
 
 Private fork only. This is not an upstream submission artifact.
 
+The discontinued Prox and FFN-sparsity study is indexed in
+[`PROX_ARCHIVE.md`](PROX_ARCHIVE.md). Its documentation and raw measurements
+are preserved, but none of its experimental runtime code remains active.
+
 ## Verdict
 
 Vegas improves batch-one decoding on this RTX 3090, but only beyond a
