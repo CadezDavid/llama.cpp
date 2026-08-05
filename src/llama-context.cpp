@@ -1278,7 +1278,9 @@ bool llama_context::vegas_enable(
         return false;
     }
 
-    if (vegas.sparse_kernel == llama_vegas_sparse_kernel::gather) {
+    if (vegas.sparse_kernel == llama_vegas_sparse_kernel::gather ||
+            (vegas.sparse_kernel == llama_vegas_sparse_kernel::auto_select &&
+             cparams.type_k == GGML_TYPE_Q8_0 && cparams.type_v == GGML_TYPE_TURBO4_0)) {
         if (cparams.type_k != GGML_TYPE_Q8_0 || cparams.type_v != GGML_TYPE_TURBO4_0) {
             LLAMA_LOG_ERROR("%s: gather sparse attention currently requires K=q8_0 V=turbo4\n", __func__);
             return false;
@@ -1377,7 +1379,9 @@ bool llama_context::vegas_enable(
 }
 
 bool llama_context::vegas_set_sparse_kernel(llama_vegas_sparse_kernel mode) {
-    if (mode != llama_vegas_sparse_kernel::direct && mode != llama_vegas_sparse_kernel::gather) {
+    if (mode != llama_vegas_sparse_kernel::direct &&
+            mode != llama_vegas_sparse_kernel::gather &&
+            mode != llama_vegas_sparse_kernel::auto_select) {
         return false;
     }
 
@@ -4614,7 +4618,7 @@ bool llama_vegas_enable(
 
 bool llama_vegas_set_sparse_kernel(llama_context * ctx, int32_t mode) {
     if (mode < (int32_t) llama_vegas_sparse_kernel::direct ||
-            mode > (int32_t) llama_vegas_sparse_kernel::gather) {
+            mode > (int32_t) llama_vegas_sparse_kernel::auto_select) {
         return false;
     }
     return ctx->vegas_set_sparse_kernel((llama_vegas_sparse_kernel) mode);

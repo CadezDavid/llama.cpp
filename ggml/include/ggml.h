@@ -2453,6 +2453,7 @@ extern "C" {
     enum ggml_sparse_fattn_mode {
         GGML_SPARSE_FATTN_MODE_DIRECT = 0,
         GGML_SPARSE_FATTN_MODE_GATHER = 1,
+        GGML_SPARSE_FATTN_MODE_AUTO   = 2,
     };
 
     GGML_API void ggml_flash_attn_ext_set_sparse_mode(

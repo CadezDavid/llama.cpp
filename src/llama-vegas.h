@@ -16,11 +16,12 @@ enum class llama_vegas_mode : int32_t {
 enum class llama_vegas_sparse_kernel : int32_t {
     direct = 0,
     gather = 1,
+    auto_select = 2,
 };
 
 struct llama_vegas_state {
     llama_vegas_mode mode = llama_vegas_mode::disabled;
-    llama_vegas_sparse_kernel sparse_kernel = llama_vegas_sparse_kernel::direct;
+    llama_vegas_sparse_kernel sparse_kernel = llama_vegas_sparse_kernel::auto_select;
 
     float   sparse_ratio = 0.07f;
     int32_t min_tokens   = 256;

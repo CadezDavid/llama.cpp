@@ -58,7 +58,7 @@ struct vegas_options {
     bool hierarchical_trace = false;
     bool same_prefix_trace = false;
     bool quiet = false;
-    int32_t sparse_kernel = LLAMA_VEGAS_SPARSE_KERNEL_DIRECT;
+    int32_t sparse_kernel = LLAMA_VEGAS_SPARSE_KERNEL_AUTO;
 };
 
 struct token_distribution {
@@ -403,7 +403,12 @@ static const char * mode_name(vegas_run_mode mode) {
 }
 
 static const char * sparse_kernel_name(int32_t mode) {
-    return mode == LLAMA_VEGAS_SPARSE_KERNEL_GATHER ? "gather" : "direct";
+    switch (mode) {
+        case LLAMA_VEGAS_SPARSE_KERNEL_DIRECT: return "direct";
+        case LLAMA_VEGAS_SPARSE_KERNEL_GATHER: return "gather";
+        case LLAMA_VEGAS_SPARSE_KERNEL_AUTO:   return "auto";
+    }
+    return "unknown";
 }
 
 static bool mode_uses_vegas(vegas_run_mode mode) {
@@ -653,6 +658,8 @@ static bool parse_vegas_options(
                 options.sparse_kernel = LLAMA_VEGAS_SPARSE_KERNEL_DIRECT;
             } else if (std::strcmp(value, "gather") == 0) {
                 options.sparse_kernel = LLAMA_VEGAS_SPARSE_KERNEL_GATHER;
+            } else if (std::strcmp(value, "auto") == 0) {
+                options.sparse_kernel = LLAMA_VEGAS_SPARSE_KERNEL_AUTO;
             } else {
                 LOG_ERR("invalid --vegas-sparse-kernel: %s\n", value);
                 return false;
@@ -2287,7 +2294,7 @@ int main(int argc, char ** argv) {
         LOG_ERR("Vegas requires flash attention\n");
         return 1;
     }
-    if (!mode_uses_vegas(options.mode) && options.sparse_kernel != LLAMA_VEGAS_SPARSE_KERNEL_DIRECT) {
+    if (!mode_uses_vegas(options.mode) && options.sparse_kernel != LLAMA_VEGAS_SPARSE_KERNEL_AUTO) {
         LOG_ERR("--vegas-sparse-kernel requires a Vegas mode\n");
         return 1;
     }

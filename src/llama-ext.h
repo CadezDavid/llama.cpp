@@ -125,6 +125,7 @@ enum llama_vegas_runtime_mode {
 enum llama_vegas_sparse_kernel_mode {
     LLAMA_VEGAS_SPARSE_KERNEL_DIRECT = 0,
     LLAMA_VEGAS_SPARSE_KERNEL_GATHER = 1,
+    LLAMA_VEGAS_SPARSE_KERNEL_AUTO   = 2,
 };
 
 LLAMA_API bool llama_vegas_set_sparse_kernel(

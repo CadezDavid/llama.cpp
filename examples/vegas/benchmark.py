@@ -64,7 +64,7 @@ def parse_args():
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--cache-type-k", default="q8_0")
     parser.add_argument("--cache-type-v", default="turbo4")
-    parser.add_argument("--sparse-kernel", choices=("direct", "gather"), default="direct")
+    parser.add_argument("--sparse-kernel", choices=("auto", "direct", "gather"), default="auto")
     parser.add_argument("--draft-cache-type-k")
     parser.add_argument("--draft-cache-type-v")
     parser.add_argument("--output", type=Path, required=True)

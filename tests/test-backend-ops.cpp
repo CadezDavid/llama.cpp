@@ -9968,6 +9968,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 {0, 1, 2, 3}, sparse_pattern, GGML_SPARSE_FATTN_MODE_GATHER));
         test_cases.emplace_back(new test_flash_attn_ext(
                 512, 512, 4, {8, 1}, 512, 1, true, false, 0, 0,
+                GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0,
+                {0, 1, 2, 3}, sparse_pattern, GGML_SPARSE_FATTN_MODE_AUTO));
+        test_cases.emplace_back(new test_flash_attn_ext(
+                512, 512, 4, {8, 1}, 512, 1, true, false, 0, 0,
                 GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0,
                 {0, 1, 2, 3}, sparse_pattern));
     }

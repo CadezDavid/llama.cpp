@@ -5545,7 +5545,9 @@ void ggml_flash_attn_ext_set_sparse_mode(
         struct ggml_tensor * a,
         enum ggml_sparse_fattn_mode mode) {
     GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
-    GGML_ASSERT(mode == GGML_SPARSE_FATTN_MODE_DIRECT || mode == GGML_SPARSE_FATTN_MODE_GATHER);
+    GGML_ASSERT(mode == GGML_SPARSE_FATTN_MODE_DIRECT ||
+            mode == GGML_SPARSE_FATTN_MODE_GATHER ||
+            mode == GGML_SPARSE_FATTN_MODE_AUTO);
 
     ggml_set_op_params_i32(a, 7, (int32_t) mode);
 }
@@ -5555,7 +5557,9 @@ enum ggml_sparse_fattn_mode ggml_flash_attn_ext_get_sparse_mode(
     GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
 
     const int32_t mode = ggml_get_op_params_i32(a, 7);
-    GGML_ASSERT(mode == GGML_SPARSE_FATTN_MODE_DIRECT || mode == GGML_SPARSE_FATTN_MODE_GATHER);
+    GGML_ASSERT(mode == GGML_SPARSE_FATTN_MODE_DIRECT ||
+            mode == GGML_SPARSE_FATTN_MODE_GATHER ||
+            mode == GGML_SPARSE_FATTN_MODE_AUTO);
     return (enum ggml_sparse_fattn_mode) mode;
 }
 
