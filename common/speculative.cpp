@@ -171,7 +171,7 @@ struct common_speculative_impl {
 
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
-    virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
+    virtual bool set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) { return false; }
 
     // true if this implementation requires the target context to extract post-norm embeddings
     virtual bool need_embd() const = 0;
@@ -890,15 +890,15 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         return true;
     }
 
-    void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+    bool set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
         if (!need_boundary_stash()) {
-            return;
+            return false;
         }
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
-            return;
+            return false;
         }
         if (data.size() != sizeof(llama_pos) + (size_t) n_embd_dec * sizeof(float)) {
-            return;
+            return false;
         }
 
         llama_pos pos = -1;
@@ -907,6 +907,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         pending_pos_last[seq_id] = pos;
         pending_g_last[seq_id].resize(n_embd_dec);
         std::memcpy(pending_g_last[seq_id].data(), data.data() + sizeof(llama_pos), (size_t) n_embd_dec * sizeof(float));
+        return true;
     }
 
     bool need_embd() const override {
@@ -1314,6 +1315,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 };
 
 struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+    static constexpr uint32_t state_magic = 0x3150544d; // "MTP1"
+
+    struct state_header {
+        uint32_t magic;
+        uint32_t version;
+        int32_t n_embd;
+        int32_t reserved;
+    };
+
     common_params_speculative_draft params; // reuses the draft-model params slot (ctx_tgt/ctx_dft)
 
     llama_batch batch;
@@ -1790,6 +1800,41 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+    }
+
+    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return false;
+        }
+
+        const state_header header {
+            /* .magic    = */ state_magic,
+            /* .version  = */ 1,
+            /* .n_embd   = */ n_embd,
+            /* .reserved = */ 0,
+        };
+        const auto & h = pending_h[seq_id];
+        data.resize(sizeof(header) + h.size() * sizeof(float));
+        std::memcpy(data.data(), &header, sizeof(header));
+        std::memcpy(data.data() + sizeof(header), h.data(), h.size() * sizeof(float));
+        return true;
+    }
+
+    bool set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq || data.size() < sizeof(state_header)) {
+            return false;
+        }
+
+        state_header header {};
+        std::memcpy(&header, data.data(), sizeof(header));
+        const size_t expected = sizeof(header) + (size_t) n_embd * sizeof(float);
+        if (header.magic != state_magic || header.version != 1 || header.n_embd != n_embd ||
+                header.reserved != 0 || data.size() != expected) {
+            return false;
+        }
+
+        std::memcpy(pending_h[seq_id].data(), data.data() + sizeof(header), (size_t) n_embd * sizeof(float));
+        return true;
     }
 
     bool need_embd() const override {
@@ -2807,14 +2852,16 @@ bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id
     return false;
 }
 
-void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data) {
+bool common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data) {
     if (spec == nullptr) {
-        return;
+        return false;
     }
 
+    bool result = false;
     for (auto & impl : spec->impls) {
-        impl->set_state(seq_id, data);
+        result = impl->set_state(seq_id, data) || result;
     }
+    return result;
 }
 
 void common_speculative_print_stats(const common_speculative * spec) {
