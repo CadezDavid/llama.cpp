@@ -7,13 +7,17 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from benchmark import run_one
+from opencode_prompt import ensure_prompt
+
+
+PROMPT = "/tmp/opencode-vegas-technical-conversations.txt"
 
 
 CONFIGURATIONS = {
     "qwen27-q8-turbo4": {
         "model": "/home/david/models/Qwen3.6-27B-MTP/Qwen3.6-27B-UD-Q4_K_XL.gguf",
         "draft_model": None,
-        "prompt": "/tmp/opencode-spomin-user-412-with-reasoning.txt",
+        "prompt": PROMPT,
         "cache_k": "q8_0",
         "cache_v": "turbo4",
         "fixed_gamma": 4,
@@ -24,7 +28,7 @@ CONFIGURATIONS = {
     "gemma4-q8-turbo4": {
         "model": "/home/david/models/gemma-4-31B-it-qat-q4_0-gguf/gemma-4-31B-it-qat-UD-Q4_K_XL.gguf",
         "draft_model": "/home/david/models/gemma-4-31B-it-qat-q4_0-unquantized-assistant/gemma-4-31B-it-qat-q4_0-assistant-Q8_0.gguf",
-        "prompt": "/tmp/codex-conversation-memory-stack.txt",
+        "prompt": PROMPT,
         "cache_k": "q8_0",
         "cache_v": "turbo4",
         "fixed_gamma": 3,
@@ -35,7 +39,7 @@ CONFIGURATIONS = {
     "qwen35-q8-turbo4": {
         "model": "/home/david/models/Qwen3.6-35B-A3B-MTP-GGUF/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
         "draft_model": None,
-        "prompt": "/tmp/opencode-spomin-user-412-with-reasoning.txt",
+        "prompt": PROMPT,
         "cache_k": "q8_0",
         "cache_v": "turbo4",
         "fixed_gamma": 5,
@@ -46,7 +50,7 @@ CONFIGURATIONS = {
     "qwen35-q8-q4": {
         "model": "/home/david/models/Qwen3.6-35B-A3B-MTP-GGUF/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
         "draft_model": None,
-        "prompt": "/tmp/opencode-spomin-user-412-with-reasoning.txt",
+        "prompt": PROMPT,
         "cache_k": "q8_0",
         "cache_v": "q4_0",
         "fixed_gamma": 5,
@@ -159,6 +163,7 @@ def summarize(results):
 
 def main():
     args = parse_args()
+    ensure_prompt()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     output_path = args.output_dir / "results.jsonl"
     results = load_results(output_path)

@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+
+import argparse
+import json
+import sqlite3
+from pathlib import Path
+
+
+DEFAULT_DATABASE = Path.home() / ".local/share/opencode/opencode.db"
+DEFAULT_OUTPUT = Path("/tmp/opencode-vegas-technical-conversations.txt")
+
+# Long, coherent technical conversations selected from the local OpenCode
+# database. Keep the tutorial last so the transcript can end at its final user
+# question and provide a natural continuation point for generation.
+DEFAULT_SESSIONS = (
+    "ses_2452593b5ffe6yJELmXEV6x9oM",  # Rebuilding MCP memory server from scratch
+    "ses_1af9879efffe0sg7s2N3kxgaDo",  # Difference between resource and object
+)
+
+
+def message_text(connection, message_id):
+    chunks = []
+    for (data,) in connection.execute(
+        "SELECT data FROM part WHERE message_id = ? ORDER BY time_created, id",
+        (message_id,),
+    ):
+        part = json.loads(data)
+        if part.get("type") == "text" and part.get("text", "").strip():
+            chunks.append(part["text"].strip())
+    return "\n\n".join(chunks)
+
+
+def load_conversation(connection, session_id):
+    session = connection.execute(
+        "SELECT title, parent_id FROM session WHERE id = ?",
+        (session_id,),
+    ).fetchone()
+    if session is None:
+        raise RuntimeError(f"OpenCode session not found: {session_id}")
+    title, parent_id = session
+    if parent_id is not None:
+        raise RuntimeError(f"OpenCode session is a child/background session: {session_id}")
+
+    messages = []
+    for message_id, data in connection.execute(
+        "SELECT id, data FROM message WHERE session_id = ? ORDER BY time_created, id",
+        (session_id,),
+    ):
+        metadata = json.loads(data)
+        role = metadata.get("role")
+        if role not in ("user", "assistant"):
+            continue
+        # Tool-call messages are usually short progress narration. Retain only
+        # completed assistant replies so the fixture reads like a conversation.
+        if role == "assistant" and metadata.get("finish") != "stop":
+            continue
+        text = message_text(connection, message_id)
+        if text:
+            messages.append((role, text))
+    return title, messages
+
+
+def render_prompt(database, session_ids=DEFAULT_SESSIONS):
+    uri = f"file:{database}?mode=ro"
+    with sqlite3.connect(uri, uri=True) as connection:
+        conversations = [load_conversation(connection, session_id) for session_id in session_ids]
+
+    sections = []
+    for index, (title, messages) in enumerate(conversations, start=1):
+        if not messages:
+            raise RuntimeError(f"OpenCode session has no usable conversation text: {session_ids[index - 1]}")
+        if index == len(conversations) and messages[-1][0] == "assistant":
+            messages = messages[:-1]
+        lines = [f"## OpenCode conversation {index}: {title}"]
+        for role, content in messages:
+            lines.extend(("", f"{role.title()}:", content))
+        sections.append("\n".join(lines))
+    return "\n\n".join(sections) + "\n\nAssistant:\n"
+
+
+def ensure_prompt(database=DEFAULT_DATABASE, output=DEFAULT_OUTPUT):
+    prompt = render_prompt(database)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(prompt, encoding="utf-8")
+    return output
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--database", type=Path, default=DEFAULT_DATABASE)
+    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    args = parser.parse_args()
+    output = ensure_prompt(args.database, args.output)
+    print(f"wrote {output} ({output.stat().st_size} bytes)")
+
+
+if __name__ == "__main__":
+    main()
