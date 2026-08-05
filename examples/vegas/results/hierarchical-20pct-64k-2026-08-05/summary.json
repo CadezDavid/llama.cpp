@@ -1,0 +1,41 @@
+{
+  "gemma4-q8-turbo4-64k": {
+    "committed_per_dense_cycle": 1.5679,
+    "dense_acceptance": 0.221154,
+    "device_entropy_samples": 2117,
+    "fallback_entropy_samples": 0,
+    "outer_cycles": 81,
+    "output_hash": "1c9542fcedfd4851",
+    "position_mismatches": 0,
+    "rollback_failures": 0,
+    "snapshot_failures": 0,
+    "sparse_agreement": 0.22439,
+    "tokens_per_second": 7.0859
+  },
+  "qwen27-q8-turbo4-64k": {
+    "committed_per_dense_cycle": 2.95349,
+    "dense_acceptance": 0.451613,
+    "device_entropy_samples": 1345,
+    "fallback_entropy_samples": 0,
+    "outer_cycles": 43,
+    "output_hash": "25fb9f862c70e4fa",
+    "position_mismatches": 0,
+    "rollback_failures": 0,
+    "snapshot_failures": 0,
+    "sparse_agreement": 0.534483,
+    "tokens_per_second": 10.774613
+  },
+  "qwen35-q8-q4-64k": {
+    "committed_per_dense_cycle": 7.47059,
+    "dense_acceptance": 0.88,
+    "device_entropy_samples": 687,
+    "fallback_entropy_samples": 0,
+    "outer_cycles": 17,
+    "output_hash": "dc5bca1527b12fad",
+    "position_mismatches": 0,
+    "rollback_failures": 0,
+    "snapshot_failures": 0,
+    "sparse_agreement": 0.826923,
+    "tokens_per_second": 50.85104
+  }
+}
