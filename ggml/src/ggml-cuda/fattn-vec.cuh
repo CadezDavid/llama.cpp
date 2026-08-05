@@ -335,6 +335,7 @@ static __global__ void flash_attn_ext_vec(
                 const int i_KQ_logical = k_VKQ_0 + i_KQ;
                 const bool i_KQ_valid = !use_sparse_kv || i_KQ_logical < sparse_n_kv;
                 const int i_KQ_actual = !i_KQ_valid ? 0 : !use_sparse_kv ? i_KQ :
+                    ne31 == sparse_recent_start ? i_KQ_logical :
                     (i_KQ_logical < ne31 ? sparse_indices[i_KQ_logical] : sparse_recent_start + i_KQ_logical - ne31);
                 const char * K_row = K + i_KQ_actual*nb11;
 
@@ -445,6 +446,7 @@ static __global__ void flash_attn_ext_vec(
             const int k_logical = k_VKQ_0 + k;
             const bool k_valid = !use_sparse_kv || k_logical < sparse_n_kv;
             const int k_actual = !k_valid ? 0 : !use_sparse_kv ? k :
+                ne31 == sparse_recent_start ? k_logical :
                 (k_logical < ne31 ? sparse_indices[k_logical] : sparse_recent_start + k_logical - ne31);
             const char * V_row = V + k_actual*nb21;
 
