@@ -1269,15 +1269,6 @@ bool llama_context::vegas_enable(
         return false;
     }
 
-    if (vegas.sparse_kernel == llama_vegas_sparse_kernel::direct &&
-            cparams.type_k == GGML_TYPE_Q8_0 && cparams.type_v == GGML_TYPE_TURBO4_0) {
-        LLAMA_LOG_ERROR(
-                "%s: direct Vegas sparse attention is disabled for K=q8_0 V=turbo4; "
-                "the mixed-cache vector kernel does not pass the 100%%-retention correctness gate\n",
-                __func__);
-        return false;
-    }
-
     if (vegas.sparse_kernel == llama_vegas_sparse_kernel::gather ||
             (vegas.sparse_kernel == llama_vegas_sparse_kernel::auto_select &&
              cparams.type_k == GGML_TYPE_Q8_0 && cparams.type_v == GGML_TYPE_TURBO4_0)) {

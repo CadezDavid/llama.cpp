@@ -9971,6 +9971,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0,
                 {0, 1, 2, 3}, sparse_pattern, GGML_SPARSE_FATTN_MODE_AUTO));
         test_cases.emplace_back(new test_flash_attn_ext(
+                256, 256, 4, {4, 1}, 512, 1, true, false, 0, 0,
+                GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0,
+                {0, 1, 2, 3}, sparse_pattern, GGML_SPARSE_FATTN_MODE_AUTO));
+        test_cases.emplace_back(new test_flash_attn_ext(
+                256, 256, 4, {4, 1}, 512, 1, true, false, 0, 0,
+                GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0,
+                {0, 1, 2, 3}, sparse_pattern, GGML_SPARSE_FATTN_MODE_DIRECT));
+        test_cases.emplace_back(new test_flash_attn_ext(
+                512, 512, 4, {8, 1}, 512, 1, true, false, 0, 0,
+                GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0,
+                {0, 1, 2, 3}, sparse_pattern, GGML_SPARSE_FATTN_MODE_DIRECT));
+        test_cases.emplace_back(new test_flash_attn_ext(
                 512, 512, 4, {8, 1}, 512, 1, true, false, 0, 0,
                 GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0,
                 {0, 1, 2, 3}, sparse_pattern));
@@ -9980,6 +9992,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 512, 512, 4, {8, 1}, kv, 1, true, false, 0, 0,
                 GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0,
                 {0, 1, 2, 3}, 1, GGML_SPARSE_FATTN_MODE_GATHER));
+        test_cases.emplace_back(new test_flash_attn_ext(
+                256, 256, 4, {4, 1}, kv, 1, true, false, 0, 0,
+                GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0,
+                {0, 1, 2, 3}, 1, GGML_SPARSE_FATTN_MODE_DIRECT));
+        test_cases.emplace_back(new test_flash_attn_ext(
+                512, 512, 4, {8, 1}, kv, 1, true, false, 0, 0,
+                GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0,
+                {0, 1, 2, 3}, 1, GGML_SPARSE_FATTN_MODE_DIRECT));
     }
     test_cases.emplace_back(new test_flash_attn_ext(
             512, 512, 4, {8, 1}, 256, 1, true, false, 0, 0,
@@ -10355,6 +10375,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+
+    // Decode-size q8/Turbo4 sparse attention. Keep direct and gather side by
+    // side so backend perf mode can act as the kernel-selection oracle.
+    for (int kv : {2048, 8192, 32768}) {
+        for (int hs : {256, 512}) {
+            const int gqa = hs == 256 ? 4 : 8;
+            for (ggml_sparse_fattn_mode sparse_mode : {
+                    GGML_SPARSE_FATTN_MODE_DIRECT,
+                    GGML_SPARSE_FATTN_MODE_GATHER}) {
+                test_cases.emplace_back(new test_flash_attn_ext(
+                        hs, hs, 4, {gqa, 1}, kv, 1, true, false, 0, 0,
+                        GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0,
+                        {0, 1, 2, 3}, 1, sparse_mode));
+            }
+        }
+    }
 
     for (int kv : { 4096, 8192, 16384, }) {
         for (int hs : { 64, 128, }) {

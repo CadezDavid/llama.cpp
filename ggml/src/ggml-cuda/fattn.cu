@@ -1092,12 +1092,10 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         const bool q8_turbo4 = dst->src[1]->type == GGML_TYPE_Q8_0 &&
                 dst->src[2]->type == GGML_TYPE_TURBO4_0;
         if (sparse_mode == GGML_SPARSE_FATTN_MODE_GATHER ||
-                (sparse_mode == GGML_SPARSE_FATTN_MODE_AUTO && q8_turbo4)) {
+                (sparse_mode == GGML_SPARSE_FATTN_MODE_AUTO && q8_turbo4 && dst->src[0]->ne[0] == 512)) {
             ggml_cuda_flash_attn_ext_sparse_gather(ctx, dst);
             return;
         }
-        GGML_ASSERT(!q8_turbo4 &&
-                "direct q8_0/turbo4 sparse attention failed its 100%-retention correctness gate");
         ggml_cuda_flash_attn_ext_vec(ctx, dst);
         return;
     }
@@ -1172,10 +1170,15 @@ bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
         const ggml_tensor * V = dst->src[2];
         const bool q8_turbo4 = K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_TURBO4_0;
         if (sparse_mode == GGML_SPARSE_FATTN_MODE_GATHER ||
-                (sparse_mode == GGML_SPARSE_FATTN_MODE_AUTO && q8_turbo4)) {
+                (sparse_mode == GGML_SPARSE_FATTN_MODE_AUTO && q8_turbo4 && Q->ne[0] == 512)) {
             return (Q->ne[0] == 256 || Q->ne[0] == 512) && V->ne[0] == Q->ne[0] &&
                     Q->ne[1] == 1 && Q->ne[3] == 1 && q8_turbo4 &&
                     turing_mma_available(ggml_cuda_info().devices[device].cc);
+        }
+        if ((sparse_mode == GGML_SPARSE_FATTN_MODE_DIRECT ||
+                sparse_mode == GGML_SPARSE_FATTN_MODE_AUTO) && q8_turbo4) {
+            return (Q->ne[0] == 256 || Q->ne[0] == 512) && V->ne[0] == Q->ne[0] &&
+                    Q->ne[1] == 1 && Q->ne[3] == 1;
         }
     }
     return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;

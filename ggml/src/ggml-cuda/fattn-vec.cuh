@@ -104,12 +104,17 @@ static __global__ void flash_attn_ext_vec(
     // Eighth nthreads_V for turbo: V_cols_per_iter goes from 4→8, processing 8 V positions
     // per outer loop iteration. Halves outer loop count again, more ILP from concurrent V rows.
     constexpr int nthreads_V_turbo = D >= 512 ? nthreads_V_q / 4 : nthreads_V_q / 8;
-    constexpr int nthreads_V  = V_is_unquantized ? (V_is_turbo ? (nthreads_V_turbo < 1 ? 1 : nthreads_V_turbo) : 128 / cpy_nb) : nthreads_V_q;
+    constexpr int nthreads_V = V_is_unquantized ?
+            (V_is_turbo ? (nthreads_V_turbo < 1 ? 1 : nthreads_V_turbo) : 128 / cpy_nb) : nthreads_V_q;
 
     static_assert(WARP_SIZE % nthreads_KQ == 0, "bad nthreads_K");
     static_assert(WARP_SIZE % nthreads_V  == 0, "bad nthreads_V");
 
-    constexpr int V_rows_per_thread = V_is_unquantized ? ((type_V == GGML_TYPE_TURBO3_0 || type_V == GGML_TYPE_TURBO2_0) ? 4 : 2*cpy_ne) : 4;
+    // Eight Turbo4 values per thread corrupt the mixed q8/Turbo4 accumulator
+    // layout. Four values preserves the aggressive row-level parallelism while
+    // passing the D=256/D=512 dense-order and indexed-order reference matrix.
+    constexpr int V_rows_per_thread = type_V == GGML_TYPE_TURBO4_0 ? 4 :
+            V_is_unquantized ? ((type_V == GGML_TYPE_TURBO3_0 || type_V == GGML_TYPE_TURBO2_0) ? 4 : 2*cpy_ne) : 4;
     constexpr int V_cols_per_iter   = WARP_SIZE / nthreads_V;
 
     constexpr vec_dot_KQ_t vec_dot_KQ = get_vec_dot_KQ<type_K, D, nthreads_KQ>();
