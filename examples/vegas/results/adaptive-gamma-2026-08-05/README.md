@@ -1,5 +1,11 @@
 # Preliminary adaptive MTP+Vegas gamma screening
 
+> Historical controller data. These runs used a forced gamma-10 calibration
+> and no dense-MTP action. The current implementation removed that calibration,
+> added a measured dense-MTP fallback, and moved entropy computation to the
+> backend. See [`../../ADAPTIVE_GAMMA.md`](../../ADAPTIVE_GAMMA.md) and the
+> branch closeout in [`../../README.md`](../../README.md).
+
 ## Scope
 
 This is the preliminary one-pass screening of the SparseSpec-L-style adaptive

@@ -1,5 +1,11 @@
 # Adaptive MTP+Vegas gamma
 
+Status: implemented and unit-tested, but not recommended as a default. The
+available eight-cell benchmark artifacts were produced by earlier controller
+versions with a forced gamma-10 calibration and therefore do not measure the
+final implementation described below. See [`README.md`](README.md) for the
+branch-level verdict and explicit remaining validation gap.
+
 `--vegas-adaptive-gamma` is available with `--vegas-mode mtp-vegas`. The
 value passed to `--vegas-gamma` is the safe dense-MTP horizon and the initial
 sparse horizon. Sparse candidates remain gamma 1 through 10.

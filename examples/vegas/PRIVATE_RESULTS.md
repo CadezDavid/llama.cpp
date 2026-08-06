@@ -2,6 +2,10 @@
 
 Private fork only. This is not an upstream submission artifact.
 
+> This is the original Vegas report. For the authoritative branch status,
+> final CascadeSpec results, deferred work, and reproduction commands, start
+> with [`README.md`](README.md).
+
 The discontinued Prox and FFN-sparsity study is indexed in
 [`PROX_ARCHIVE.md`](PROX_ARCHIVE.md). Its documentation and raw measurements
 are preserved, but none of its experimental runtime code remains active.
@@ -151,5 +155,7 @@ TurboQuant for V.
 - `git diff --check` and Python bytecode compilation pass. No non-ASCII added
   lines were found. `clang-format` is not installed on this host.
 
-All raw records are in `examples/vegas/results/`. No commit, push, issue, PR,
-or upstream-facing text was created.
+All raw records are in `examples/vegas/results/`. At the time of this original
+report no commit, push, issue, PR, or upstream-facing text had been created.
+The experiment was subsequently committed on `feat/vegas`; see
+[`README.md`](README.md) for the final branch handoff.

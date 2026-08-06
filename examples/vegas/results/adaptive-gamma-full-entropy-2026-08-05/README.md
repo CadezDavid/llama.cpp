@@ -1,5 +1,11 @@
 # Adaptive MTP+Vegas gamma screening with full-vocabulary entropy
 
+> Historical controller data. These runs still used forced gamma-10
+> calibration and CPU entropy. The current implementation removed the forced
+> calibration, added a measured dense-MTP fallback, and computes entropy on the
+> backend. See [`../../ADAPTIVE_GAMMA.md`](../../ADAPTIVE_GAMMA.md) and the
+> branch closeout in [`../../README.md`](../../README.md).
+
 ## Scope
 
 This is the paper-faithful rerun of the SparseSpec-L-style adaptive speculation

@@ -1,5 +1,11 @@
 # CascadeSpec normal-quantization optimization report
 
+> This report records the broad optimization study before the final fixed
+> four-round cadence and periodic recurrent checkpoint/replay implementation.
+> Its component measurements remain useful, but its end-to-end recommendation
+> is superseded by the final 32K and 128K runs indexed in
+> [`../README.md`](../README.md).
+
 ## Outcome
 
 CascadeSpec is now a correctness-checked implementation of the three-level
