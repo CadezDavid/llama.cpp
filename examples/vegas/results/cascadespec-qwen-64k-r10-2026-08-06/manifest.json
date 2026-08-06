@@ -1,0 +1,30 @@
+{
+  "contexts": [
+    "64k"
+  ],
+  "gamma": 3,
+  "git_commit": "47e529462ae84b35a378c52682eae269c8eb54a7",
+  "horizons": [
+    8
+  ],
+  "kernels": [
+    "direct",
+    "gather"
+  ],
+  "models": [
+    "qwen27",
+    "qwen35"
+  ],
+  "modes": [
+    "mtp-vegas",
+    "mtp-hierarchical"
+  ],
+  "predict": 128,
+  "prompt_file": "/tmp/opencode-vegas-technical-conversations.json",
+  "prompt_sha256": "3316a98b7179abeea4c4bb14987b2c12b051831cd021b45824409044a40004b7",
+  "ratios": [
+    0.1
+  ],
+  "repetitions": 1,
+  "schema_version": 2
+}

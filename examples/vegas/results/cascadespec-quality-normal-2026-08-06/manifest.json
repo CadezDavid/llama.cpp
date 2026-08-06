@@ -1,0 +1,85 @@
+{
+  "configurations": [
+    "qwen27-q8-q4-32k",
+    "qwen27-q8-q4-64k",
+    "gemma4-q8-q4-32k",
+    "gemma4-q8-q4-64k",
+    "qwen35-q8-q4-32k",
+    "qwen35-q8-q4-64k"
+  ],
+  "gate": {
+    "max_mean_jensen_shannon": 0.003,
+    "max_mean_total_variation": 0.05,
+    "min_top1_agreement": 0.9
+  },
+  "git_commit": "641044382beebeb9a65d6487642342f522512967",
+  "models": {
+    "gemma4-q8-q4-32k": {
+      "cache_k": "q8_0",
+      "cache_v": "q4_0",
+      "context": 36864,
+      "kernel": "direct",
+      "path": "/home/david/models/gemma-4-31B-it-qat-q4_0-gguf/gemma-4-31B-it-qat-UD-Q4_K_XL.gguf",
+      "prompt_tokens": 32768,
+      "size": 17287670048
+    },
+    "gemma4-q8-q4-64k": {
+      "cache_k": "q8_0",
+      "cache_v": "q4_0",
+      "context": 66048,
+      "kernel": "direct",
+      "path": "/home/david/models/gemma-4-31B-it-qat-q4_0-gguf/gemma-4-31B-it-qat-UD-Q4_K_XL.gguf",
+      "prompt_tokens": 65536,
+      "size": 17287670048
+    },
+    "qwen27-q8-q4-32k": {
+      "cache_k": "q8_0",
+      "cache_v": "q4_0",
+      "context": 36864,
+      "kernel": "direct",
+      "path": "/home/david/models/Qwen3.6-27B-MTP/Qwen3.6-27B-UD-Q4_K_XL.gguf",
+      "prompt_tokens": 32768,
+      "size": 17909097600
+    },
+    "qwen27-q8-q4-64k": {
+      "cache_k": "q8_0",
+      "cache_v": "q4_0",
+      "context": 66048,
+      "kernel": "direct",
+      "path": "/home/david/models/Qwen3.6-27B-MTP/Qwen3.6-27B-UD-Q4_K_XL.gguf",
+      "prompt_tokens": 65536,
+      "size": 17909097600
+    },
+    "qwen35-q8-q4-32k": {
+      "cache_k": "q8_0",
+      "cache_v": "q4_0",
+      "context": 36864,
+      "kernel": "direct",
+      "path": "/home/david/models/Qwen3.6-35B-A3B-MTP-GGUF/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+      "prompt_tokens": 32768,
+      "size": 22853663008
+    },
+    "qwen35-q8-q4-64k": {
+      "cache_k": "q8_0",
+      "cache_v": "q4_0",
+      "context": 66048,
+      "kernel": "direct",
+      "path": "/home/david/models/Qwen3.6-35B-A3B-MTP-GGUF/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+      "prompt_tokens": 65536,
+      "size": 22853663008
+    }
+  },
+  "prompt_file": "/tmp/opencode-vegas-technical-conversations.json",
+  "prompt_sha256": "3316a98b7179abeea4c4bb14987b2c12b051831cd021b45824409044a40004b7",
+  "prompt_tokens": null,
+  "ratios": [
+    1.0,
+    0.75,
+    0.5,
+    0.35,
+    0.2,
+    0.1
+  ],
+  "reference_tokens": 64,
+  "schema_version": 1
+}
