@@ -26,3 +26,19 @@ bool ggml_cuda_recurrent_conv_undo(
         const ggml_tensor * evicted,
         int64_t             n_undo,
         float             * elapsed_ms);
+
+bool ggml_cuda_gated_delta_net_replay(
+        ggml_tensor       * state,
+        const ggml_tensor * k,
+        const ggml_tensor * delta,
+        const ggml_tensor * gate,
+        int64_t             offset,
+        int64_t             count,
+        float             * elapsed_ms);
+
+bool ggml_cuda_recurrent_conv_replay(
+        ggml_tensor       * state,
+        const ggml_tensor * inserted,
+        int64_t             offset,
+        int64_t             count,
+        float             * elapsed_ms);

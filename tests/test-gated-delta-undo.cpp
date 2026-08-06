@@ -63,7 +63,10 @@ int main() {
     ggml_tensor * decay = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, 1, H, T, N);
     ggml_tensor * b = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, 1, H, T, N);
     ggml_tensor * state0 = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, S, S, H, N);
-    ggml_tensor * out = ggml_gated_delta_net_ext(ctx.get(), q, k, v, g, b, state0, K, true);
+    ggml_tensor * out = ggml_gated_delta_net_ext(ctx.get(), q, k, v, g, b, state0, K, 1, true);
+    constexpr int64_t PERIODIC_K = 6;
+    ggml_tensor * periodic = ggml_gated_delta_net_ext(
+            ctx.get(), q, k, v, g, b, state0, PERIODIC_K, 4, true);
 
     const size_t attn_bytes = S * H * T * N * sizeof(float);
     const size_t state_bytes = S * S * H * N * sizeof(float);
@@ -76,6 +79,7 @@ int main() {
 
     ggml_cgraph * gf = ggml_new_graph(ctx.get());
     ggml_build_forward_expand(gf, out);
+    ggml_build_forward_expand(gf, periodic);
     ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), backend.get()));
     GGML_ASSERT(buffer);
 
@@ -109,7 +113,9 @@ int main() {
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
     auto undo = (ggml_backend_gated_delta_net_undo_t)
             ggml_backend_reg_get_proc_address(reg, "ggml_backend_gated_delta_net_undo");
-    GGML_ASSERT(undo);
+    auto replay = (ggml_backend_gated_delta_net_replay_t)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_gated_delta_net_replay");
+    GGML_ASSERT(undo && replay);
 
     bool passed = true;
     for (int64_t depth : { 1, 4, 8, 16 }) {
@@ -142,6 +148,41 @@ int main() {
         printf("depth=%2lld kernel_ms=%.4f max_abs=%.9g rms=%.9g max_rel=%.9g nonfinite=%zu\n",
                 (long long) depth, elapsed_ms, max_abs, rms, max_rel, nonfinite);
         passed &= nonfinite == 0;
+    }
+
+    const size_t periodic_delta_offset = attn_bytes + PERIODIC_K * state_bytes;
+    ggml_tensor * periodic_delta = ggml_view_4d(ctx.get(), periodic, S, H, T, N,
+            S * sizeof(float), S * H * sizeof(float), S * H * T * sizeof(float),
+            periodic_delta_offset);
+    for (int64_t prefix = 0; prefix <= T; ++prefix) {
+        const int64_t boundary = (prefix / 4) * 4;
+        std::vector<float> checkpoint(state0_h.size());
+        if (boundary == 0) {
+            checkpoint = state0_h;
+        } else if (boundary == T) {
+            checkpoint = final_h;
+        } else {
+            ggml_backend_tensor_get(periodic, checkpoint.data(),
+                    attn_bytes + (boundary / 4) * state_bytes, state_bytes);
+        }
+        ggml_backend_tensor_set(final_state, checkpoint.data(), 0, state_bytes);
+        float elapsed_ms = 0.0f;
+        GGML_ASSERT(replay(final_state, k, periodic_delta, g,
+                boundary, prefix - boundary, &elapsed_ms));
+
+        std::vector<float> actual(final_h.size());
+        std::vector<float> expected(final_h.size());
+        ggml_backend_tensor_get(final_state, actual.data(), 0, state_bytes);
+        if (prefix == 0) expected = state0_h;
+        else if (prefix == T) expected = final_h;
+        else ggml_backend_tensor_get(out, expected.data(),
+                attn_bytes + (T - prefix) * state_bytes, state_bytes);
+
+        const bool exact = actual == expected;
+        printf("replay_prefix=%2lld checkpoint=%2lld updates=%lld kernel_ms=%.4f exact=%d\n",
+                (long long) prefix, (long long) boundary,
+                (long long) (prefix - boundary), elapsed_ms, exact);
+        passed &= exact;
     }
 
     return passed ? 0 : 1;

@@ -26,6 +26,7 @@ llama_memory_recurrent::llama_memory_recurrent(
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
                  uint32_t   n_rs_undo,
+                 uint32_t   n_rs_stride,
     const layer_filter_cb & filter) : hparams(model.hparams), n_seq_max(n_seq_max) {
     const int32_t n_layer = hparams.n_layer();
 
@@ -35,6 +36,7 @@ llama_memory_recurrent::llama_memory_recurrent(
 
     this->n_rs_seq = n_rs_seq;
     this->n_rs_undo = n_rs_undo;
+    this->n_rs_stride = n_rs_stride > 1 ? n_rs_stride : 1;
     rs_idx.assign(n_seq_max, 0);
 
     cells.clear();
@@ -53,7 +55,7 @@ llama_memory_recurrent::llama_memory_recurrent(
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
-                /*.mem_size   =*/ size_t(((n_rs_seq > 0 ? 4u : 2u) + (n_rs_undo > 0 ? 4u : 0u))*n_layer*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t(((n_rs_seq > 0 ? 4u : 2u) + (n_rs_undo > 0 ? 6u : 0u))*n_layer*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -78,7 +80,9 @@ llama_memory_recurrent::llama_memory_recurrent(
     undo_k_l.resize(n_layer);
     undo_delta_l.resize(n_layer);
     undo_decay_l.resize(n_layer);
+    replay_gate_l.resize(n_layer);
     undo_conv_l.resize(n_layer);
+    replay_conv_l.resize(n_layer);
 
     for (int i = 0; i < n_layer; i++) {
         if (filter && !filter(i)) {
@@ -132,18 +136,26 @@ llama_memory_recurrent::llama_memory_recurrent(
                     s_head, h_v, n_rs_undo, n_seq_max);
             ggml_tensor * undo_decay = ggml_new_tensor_4d(ctx, GGML_TYPE_F32,
                     1, h_v, n_rs_undo, n_seq_max);
+            ggml_tensor * replay_gate = ggml_new_tensor_4d(ctx, GGML_TYPE_F32,
+                    1, h_v, n_rs_undo, n_seq_max);
             // Keep time as the innermost dimension so a strided view of the
             // convolution input can be copied without a transpose.
             ggml_tensor * undo_conv = ggml_new_tensor_3d(ctx, GGML_TYPE_F32,
                     n_rs_undo, conv_channels, n_seq_max);
+            ggml_tensor * replay_conv = ggml_new_tensor_3d(ctx, GGML_TYPE_F32,
+                    n_rs_undo, conv_channels, n_seq_max);
             ggml_format_name(undo_k, "cache_undo_k_l%d", i);
             ggml_format_name(undo_delta, "cache_undo_delta_l%d", i);
             ggml_format_name(undo_decay, "cache_undo_decay_l%d", i);
+            ggml_format_name(replay_gate, "cache_replay_gate_l%d", i);
             ggml_format_name(undo_conv, "cache_undo_conv_l%d", i);
+            ggml_format_name(replay_conv, "cache_replay_conv_l%d", i);
             undo_k_l[i] = undo_k;
             undo_delta_l[i] = undo_delta;
             undo_decay_l[i] = undo_decay;
+            replay_gate_l[i] = replay_gate;
             undo_conv_l[i] = undo_conv;
+            replay_conv_l[i] = replay_conv;
         }
     }
 
@@ -163,9 +175,9 @@ llama_memory_recurrent::llama_memory_recurrent(
         const size_t memory_size_s = size_s_bytes();
         const size_t memory_size_undo = size_undo_bytes();
 
-        LLAMA_LOG_INFO("%s: size = %7.2f MiB (%6u cells, %3d layers, %2u seqs %2u rs_seq %2u undo), R (%s): %7.2f MiB, S (%s): %7.2f MiB, undo: %7.2f MiB\n", __func__,
+        LLAMA_LOG_INFO("%s: size = %7.2f MiB (%6u cells, %3d layers, %2u seqs %2u rs_seq stride %u %2u undo), R (%s): %7.2f MiB, S (%s): %7.2f MiB, undo: %7.2f MiB\n", __func__,
                 (float)(memory_size_r + memory_size_s + memory_size_undo) / (1024.0f * 1024.0f), mem_size, n_layer, n_seq_max, n_rs_seq,
-                n_rs_undo,
+                this->n_rs_stride, n_rs_undo,
                 ggml_type_name(type_r), (float)memory_size_r / (1024.0f * 1024.0f),
                 ggml_type_name(type_s), (float)memory_size_s / (1024.0f * 1024.0f),
                 (float)memory_size_undo / (1024.0f * 1024.0f));
@@ -301,6 +313,19 @@ static void recurrent_copy_checkpoint_to_group(
     ggml_backend_tensor_copy(checkpoint, &dst);
 }
 
+static void recurrent_copy_group_to_group(
+        ggml_tensor * tensor, uint32_t group_size, uint32_t src_group, uint32_t dst_group) {
+    if (tensor == nullptr || src_group == dst_group) {
+        return;
+    }
+    ggml_tensor src = *tensor;
+    ggml_tensor dst = *tensor;
+    src.ne[1] = dst.ne[1] = group_size;
+    src.data = (char *) tensor->data + (size_t) src_group * group_size * tensor->nb[1];
+    dst.data = (char *) tensor->data + (size_t) dst_group * group_size * tensor->nb[1];
+    ggml_backend_tensor_copy(&src, &dst);
+}
+
 bool llama_memory_recurrent::seq_checkpoint_recurrent(llama_seq_id seq_id) {
     if (n_rs_seq == 0 || seq_id < 0 || (size_t) seq_id >= rs_idx.size()) {
         return false;
@@ -334,8 +359,8 @@ bool llama_memory_recurrent::seq_restore_recurrent(llama_seq_id seq_id) {
     }
 
     for (size_t il = 0; il < r_l.size(); ++il) {
-        recurrent_copy_checkpoint_to_group(r_checkpoint_l[il], r_l[il], size, n_rs_seq);
-        recurrent_copy_checkpoint_to_group(s_checkpoint_l[il], s_l[il], size, n_rs_seq);
+        recurrent_copy_checkpoint_to_group(r_checkpoint_l[il], r_l[il], size, 0);
+        recurrent_copy_checkpoint_to_group(s_checkpoint_l[il], s_l[il], size, 0);
     }
 
     head   = checkpoint_head;
@@ -344,8 +369,116 @@ bool llama_memory_recurrent::seq_restore_recurrent(llama_seq_id seq_id) {
     rs_z   = checkpoint_rs_z;
     rs_idx = checkpoint_rs_idx;
     cells  = checkpoint_cells;
-    set_rs_idx(seq_id, n_rs_seq);
+    set_rs_idx(seq_id, 0);
     checkpoint_valid = false;
+    return true;
+}
+
+bool llama_memory_recurrent::seq_checkpoint_recurrent_pass(llama_seq_id seq_id) {
+    if (n_rs_stride <= 1 || n_rs_seq == 0 || seq_id < 0 || (size_t) seq_id >= rs_idx.size()) {
+        return false;
+    }
+    const uint32_t source_group = rs_idx[seq_id];
+    for (size_t il = 0; il < r_l.size(); ++il) {
+        recurrent_copy_group_to_group(r_l[il], size, source_group, n_rs_seq);
+        recurrent_copy_group_to_group(s_l[il], size, source_group, n_rs_seq);
+    }
+    return true;
+}
+
+bool llama_memory_recurrent::seq_restore_recurrent_prefix(
+        llama_seq_id seq_id, llama_pos batch_start, uint32_t valid_inputs, uint32_t total_inputs,
+        llama_recurrent_replay_stats * stats) {
+    if (n_rs_stride <= 1 || n_rs_seq == 0 || n_rs_undo == 0 ||
+            seq_id < 0 || (size_t) seq_id >= rs_idx.size() ||
+            valid_inputs > total_inputs || total_inputs > n_rs_undo) {
+        return false;
+    }
+
+    llama_recurrent_replay_stats local = {};
+    if (valid_inputs == total_inputs) {
+        local.checkpoint_group = 0;
+        local.replayed_updates = 0;
+    } else {
+        const uint32_t boundary = valid_inputs / n_rs_stride;
+        const uint32_t replay = valid_inputs - boundary * n_rs_stride;
+        const uint32_t source_group = boundary > 0 ? boundary : n_rs_seq;
+        if (source_group >= n_rs_seq || boundary * n_rs_stride >= total_inputs) {
+            if (!(boundary == 0 && source_group == n_rs_seq)) {
+                return false;
+            }
+        }
+        local.checkpoint_group = source_group;
+        local.replayed_updates = replay;
+
+        const int64_t copy_start = ggml_time_us();
+        for (size_t il = 0; il < r_l.size(); ++il) {
+            recurrent_copy_group_to_group(r_l[il], size, source_group, 0);
+            recurrent_copy_group_to_group(s_l[il], size, source_group, 0);
+        }
+        local.checkpoint_ms = (ggml_time_us() - copy_start) / 1e3f;
+
+        if (replay > 0) {
+            const uint32_t offset = boundary * n_rs_stride;
+            for (size_t il = 0; il < s_l.size(); ++il) {
+                if (!s_l[il]) {
+                    continue;
+                }
+                ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(s_l[il]->buffer);
+                ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+                ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+                auto replay_gdn = reg ? (ggml_backend_gated_delta_net_replay_t)
+                        ggml_backend_reg_get_proc_address(reg, "ggml_backend_gated_delta_net_replay") : nullptr;
+                auto replay_conv = reg ? (ggml_backend_recurrent_conv_replay_t)
+                        ggml_backend_reg_get_proc_address(reg, "ggml_backend_recurrent_conv_replay") : nullptr;
+                if (!replay_gdn || !replay_conv) {
+                    LLAMA_LOG_ERROR("%s: recurrent replay kernels are unavailable for layer %zu\n", __func__, il);
+                    return false;
+                }
+
+                const int64_t S = hparams.ssm_d_state;
+                const int64_t H = hparams.ssm_d_inner / S;
+                const int64_t conv_channels = hparams.ssm_d_inner + 2*hparams.ssm_n_group*S;
+                const int64_t window = hparams.ssm_d_conv - 1;
+
+                ggml_tensor state_s = *s_l[il];
+                state_s.ne[0] = S; state_s.ne[1] = S; state_s.ne[2] = H; state_s.ne[3] = 1;
+                state_s.nb[0] = sizeof(float); state_s.nb[1] = S*sizeof(float);
+                state_s.nb[2] = S*S*sizeof(float); state_s.nb[3] = S*S*H*sizeof(float);
+
+                ggml_tensor state_r = *r_l[il];
+                state_r.ne[0] = window; state_r.ne[1] = conv_channels; state_r.ne[2] = 1; state_r.ne[3] = 1;
+                state_r.nb[0] = sizeof(float); state_r.nb[1] = window*sizeof(float);
+                state_r.nb[2] = window*conv_channels*sizeof(float); state_r.nb[3] = state_r.nb[2];
+
+                ggml_tensor log_k = *undo_k_l[il];
+                ggml_tensor log_delta = *undo_delta_l[il];
+                ggml_tensor log_gate = *replay_gate_l[il];
+                log_k.ne[2] = log_delta.ne[2] = log_gate.ne[2] = total_inputs;
+                log_k.ne[3] = log_delta.ne[3] = log_gate.ne[3] = 1;
+
+                float gdn_ms = 0.0f;
+                float conv_ms = 0.0f;
+                if (!replay_gdn(&state_s, &log_k, &log_delta, &log_gate,
+                            offset, replay, &gdn_ms) ||
+                        !replay_conv(&state_r, replay_conv_l[il], offset, replay, &conv_ms)) {
+                    return false;
+                }
+                local.gated_delta_ms += gdn_ms;
+                local.convolution_ms += conv_ms;
+            }
+        }
+    }
+
+    const int32_t tail_id = cells[seq_id].tail;
+    if (tail_id < 0) {
+        return false;
+    }
+    cells[tail_id].pos = batch_start + (llama_pos) valid_inputs - 1;
+    set_rs_idx(seq_id, 0);
+    if (stats) {
+        *stats = local;
+    }
     return true;
 }
 
@@ -626,7 +759,8 @@ llama_memory_context_ptr llama_memory_recurrent::init_batch(llama_batch_allocr &
                 // [TAG_RECURRENT_ROLLBACK_SPLITS]
                 // the trailing (1 + n_rs_seq) tokens of each seq must stay in the same ubatch
                 //   so that the rollback snapshots remain valid
-                ubatch = balloc.split_equal(n_ubatch, true, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
+                const uint32_t rollback_tail = n_rs_seq > 0 ? n_rs_seq * n_rs_stride + 1 : 0;
+                ubatch = balloc.split_equal(n_ubatch, true, rollback_tail);
             }
 
             if (ubatch.n_tokens == 0) {
@@ -947,7 +1081,7 @@ size_t llama_memory_recurrent::size_s_bytes() const {
 
 size_t llama_memory_recurrent::size_undo_bytes() const {
     size_t result = 0;
-    for (const auto & tensors : { &undo_k_l, &undo_delta_l, &undo_decay_l, &undo_conv_l }) {
+    for (const auto & tensors : { &undo_k_l, &undo_delta_l, &undo_decay_l, &replay_gate_l, &undo_conv_l, &replay_conv_l }) {
         for (const ggml_tensor * tensor : *tensors) {
             if (tensor) {
                 result += ggml_nbytes(tensor);
@@ -1482,12 +1616,24 @@ ggml_tensor * llama_memory_recurrent_context::get_undo_decay_l(int32_t il) const
     return mem->undo_decay_l[il];
 }
 
+ggml_tensor * llama_memory_recurrent_context::get_replay_gate_l(int32_t il) const {
+    return mem->replay_gate_l[il];
+}
+
 ggml_tensor * llama_memory_recurrent_context::get_undo_conv_l(int32_t il) const {
     return mem->undo_conv_l[il];
 }
 
+ggml_tensor * llama_memory_recurrent_context::get_replay_conv_l(int32_t il) const {
+    return mem->replay_conv_l[il];
+}
+
 uint32_t llama_memory_recurrent_context::get_n_rs_undo() const {
     return mem->n_rs_undo;
+}
+
+uint32_t llama_memory_recurrent_context::get_n_rs_stride() const {
+    return mem->n_rs_stride;
 }
 
 int32_t llama_memory_recurrent_context::s_copy(int i) const {

@@ -25,6 +25,7 @@ public:
                      uint32_t   n_seq_max,
                      uint32_t   n_rs_seq,
                      uint32_t   n_rs_undo,
+                     uint32_t   n_rs_stride,
         const layer_filter_cb & filter);
 
     ~llama_memory_recurrent() = default;
@@ -47,6 +48,10 @@ public:
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
     bool seq_checkpoint_recurrent(llama_seq_id seq_id) override;
     bool seq_restore_recurrent   (llama_seq_id seq_id) override;
+    bool seq_checkpoint_recurrent_pass(llama_seq_id seq_id) override;
+    bool seq_restore_recurrent_prefix(
+            llama_seq_id seq_id, llama_pos batch_start, uint32_t valid_inputs, uint32_t total_inputs,
+            llama_recurrent_replay_stats * stats) override;
     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
     void seq_keep(llama_seq_id seq_id)                                                          override;
     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
@@ -76,6 +81,7 @@ public:
     // number of recurrent-state snapshots per seq for rollback; tensors are widened to (1 + n_rs_seq) groups
     uint32_t n_rs_seq = 0;
     uint32_t n_rs_undo = 0;
+    uint32_t n_rs_stride = 1;
 
     // per-seq rollback index
     std::vector<uint32_t> rs_idx;
@@ -138,7 +144,9 @@ public:
     std::vector<ggml_tensor *> undo_k_l;
     std::vector<ggml_tensor *> undo_delta_l;
     std::vector<ggml_tensor *> undo_decay_l;
+    std::vector<ggml_tensor *> replay_gate_l;
     std::vector<ggml_tensor *> undo_conv_l;
+    std::vector<ggml_tensor *> replay_conv_l;
 
 private:
     //const llama_model & model;
@@ -202,8 +210,11 @@ public:
     ggml_tensor * get_undo_k_l(int32_t il) const;
     ggml_tensor * get_undo_delta_l(int32_t il) const;
     ggml_tensor * get_undo_decay_l(int32_t il) const;
+    ggml_tensor * get_replay_gate_l(int32_t il) const;
     ggml_tensor * get_undo_conv_l(int32_t il) const;
+    ggml_tensor * get_replay_conv_l(int32_t il) const;
     uint32_t get_n_rs_undo() const;
+    uint32_t get_n_rs_stride() const;
 
     int32_t s_copy(int i) const;
 

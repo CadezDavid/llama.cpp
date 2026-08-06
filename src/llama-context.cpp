@@ -118,6 +118,10 @@ llama_context::llama_context(
     if (cparams.n_rs_undo > 0 && cparams.n_seq_max != 1) {
         throw std::runtime_error("compact recurrent undo logging currently requires n_seq_max=1");
     }
+    cparams.n_rs_stride = params.n_rs_stride > 1 ? params.n_rs_stride : 1;
+    if (cparams.n_rs_seq == 0) {
+        cparams.n_rs_stride = 1;
+    }
 
     cparams.n_threads               = params.n_threads;
     cparams.n_threads_batch         = params.n_threads_batch;
@@ -327,6 +331,7 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: freq_scale    = %g\n",   __func__, cparams.rope_freq_scale);
     LLAMA_LOG_INFO("%s: n_rs_seq      = %u\n",   __func__, cparams.n_rs_seq);
     LLAMA_LOG_INFO("%s: n_rs_undo     = %u\n",   __func__, cparams.n_rs_undo);
+    LLAMA_LOG_INFO("%s: n_rs_stride   = %u\n",   __func__, cparams.n_rs_stride);
     LLAMA_LOG_INFO("%s: n_outputs_max = %u\n",   __func__, cparams.n_outputs_max);
 
     if (cparams.n_ctx_seq < hparams.n_ctx_train) {
@@ -3883,6 +3888,7 @@ llama_context_params llama_context_default_params() {
         /*.n_seq_max                   =*/ 1,
         /*.n_rs_seq                    =*/ 0,
         /*.n_rs_undo                   =*/ 0,
+        /*.n_rs_stride                 =*/ 1,
         /*.n_outputs_max               =*/ 0,
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
         /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
@@ -4674,4 +4680,17 @@ bool llama_memory_checkpoint_recurrent(llama_context * ctx, llama_seq_id seq_id)
 
 bool llama_memory_restore_recurrent(llama_context * ctx, llama_seq_id seq_id) {
     return ctx->get_memory()->seq_restore_recurrent(seq_id);
+}
+
+bool llama_memory_checkpoint_recurrent_pass(llama_context * ctx, llama_seq_id seq_id) {
+    llama_synchronize(ctx);
+    return ctx->get_memory()->seq_checkpoint_recurrent_pass(seq_id);
+}
+
+bool llama_memory_restore_recurrent_prefix(
+        llama_context * ctx, llama_seq_id seq_id, llama_pos batch_start,
+        uint32_t valid_inputs, uint32_t total_inputs, llama_recurrent_replay_stats * stats) {
+    llama_synchronize(ctx);
+    return ctx->get_memory()->seq_restore_recurrent_prefix(
+            seq_id, batch_start, valid_inputs, total_inputs, stats);
 }

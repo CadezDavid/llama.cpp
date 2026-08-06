@@ -2630,6 +2630,7 @@ extern "C" {
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state,
             int64_t               K,
+            int64_t               snapshot_stride,
             bool                  log_delta);
 
     // DSA lightning indexer

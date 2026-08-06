@@ -1645,6 +1645,8 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.n_seq_max         = params.n_parallel;
     cparams.n_outputs_max     = params.n_outputs_max;
     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
+    cparams.n_rs_stride       = params.speculative.rs_stride;
+    cparams.n_rs_undo         = params.speculative.rs_log_capacity;
     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
     cparams.n_batch           = params.n_batch;
     cparams.n_ubatch          = params.n_ubatch;

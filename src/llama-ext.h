@@ -169,6 +169,12 @@ LLAMA_API void llama_set_entropy_output(struct llama_context * ctx, bool enabled
 LLAMA_API bool llama_memory_checkpoint_recurrent(struct llama_context * ctx, llama_seq_id seq_id);
 LLAMA_API bool llama_memory_restore_recurrent   (struct llama_context * ctx, llama_seq_id seq_id);
 
+LLAMA_API bool llama_memory_checkpoint_recurrent_pass(
+        struct llama_context * ctx, llama_seq_id seq_id);
+LLAMA_API bool llama_memory_restore_recurrent_prefix(
+        struct llama_context * ctx, llama_seq_id seq_id, llama_pos batch_start,
+        uint32_t valid_inputs, uint32_t total_inputs, struct llama_recurrent_replay_stats * stats);
+
 //
 // model/context data extraction
 //

@@ -122,6 +122,13 @@ struct llama_memory_i {
     // defaults; their tail can be restored with seq_rm().
     virtual bool seq_checkpoint_recurrent(llama_seq_id seq_id) { (void) seq_id; return true; }
     virtual bool seq_restore_recurrent   (llama_seq_id seq_id) { (void) seq_id; return true; }
+    virtual bool seq_checkpoint_recurrent_pass(llama_seq_id seq_id) { (void) seq_id; return false; }
+    virtual bool seq_restore_recurrent_prefix(
+            llama_seq_id seq_id, llama_pos batch_start, uint32_t valid_inputs, uint32_t total_inputs,
+            llama_recurrent_replay_stats * stats) {
+        (void) seq_id; (void) batch_start; (void) valid_inputs; (void) total_inputs; (void) stats;
+        return false;
+    }
     virtual void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) = 0;
     virtual void seq_keep(llama_seq_id seq_id) = 0;
     virtual void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) = 0;

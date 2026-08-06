@@ -384,6 +384,11 @@ struct common_params_speculative {
 
     common_params_speculative_ngram_cache ngram_cache;
 
+    // Experimental recurrent rollback layout. A stride above one stores only
+    // periodic full states and logs the intervening forward updates.
+    uint32_t rs_stride = 1;
+    uint32_t rs_log_capacity = 0;
+
     bool has_dft() const {
         return !draft.mparams.empty();
     }
@@ -393,7 +398,11 @@ struct common_params_speculative {
             return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
         });
 
-        return needs_rs_seq ? draft.n_max : 0u;
+        if (!needs_rs_seq) {
+            return 0u;
+        }
+        const uint32_t stride = std::max<uint32_t>(1, rs_stride);
+        return ((uint32_t) draft.n_max + stride - 1) / stride;
     }
 };
 

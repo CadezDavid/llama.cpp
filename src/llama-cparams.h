@@ -15,6 +15,7 @@ struct llama_cparams {
     uint32_t n_seq_max;
     uint32_t n_rs_seq;        // number of recurrent-state snapshots per seq for rollback
     uint32_t n_rs_undo;       // compact recurrent undo-log capacity
+    uint32_t n_rs_stride;     // token spacing between recurrent-state snapshots
     uint32_t n_outputs_max;   // max outputs supported by the context
     ggml_type type_k;
     ggml_type type_v;

@@ -26,6 +26,7 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
                  uint32_t   n_rs_undo,
+                 uint32_t   n_rs_stride,
                      bool   offload,
                      bool   unified,
                             /* layer filters */
@@ -60,6 +61,7 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
         n_seq_max,
         n_rs_seq,
         n_rs_undo,
+        n_rs_stride,
         filter_recr == nullptr ?
             [&](int32_t il) { return hparams.is_recr(il); }
             : filter_recr
@@ -85,9 +87,10 @@ llama_memory_context_ptr llama_memory_hybrid_iswa::init_batch(llama_batch_allocr
                 // [TAG_RECURRENT_ROLLBACK_SPLITS]
                 // the trailing (1 + n_rs_seq) tokens of each seq must stay in the same ubatch
                 //   so that the rollback snapshots remain valid
-                const uint32_t n_rs_seq = mem_recr->n_rs_seq;
+                const uint32_t rollback_tail = mem_recr->n_rs_seq > 0 ?
+                        mem_recr->n_rs_seq * mem_recr->n_rs_stride + 1 : 0;
 
-                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
+                ubatch = balloc.split_equal(n_ubatch, !unified, rollback_tail);
             }
 
             if (ubatch.n_tokens == 0) {
@@ -162,6 +165,20 @@ bool llama_memory_hybrid_iswa::seq_checkpoint_recurrent(llama_seq_id seq_id) {
 
 bool llama_memory_hybrid_iswa::seq_restore_recurrent(llama_seq_id seq_id) {
     return mem_recr->seq_restore_recurrent(seq_id);
+}
+
+bool llama_memory_hybrid_iswa::seq_checkpoint_recurrent_pass(llama_seq_id seq_id) {
+    return mem_recr->seq_checkpoint_recurrent_pass(seq_id);
+}
+
+bool llama_memory_hybrid_iswa::seq_restore_recurrent_prefix(
+        llama_seq_id seq_id, llama_pos batch_start, uint32_t valid_inputs, uint32_t total_inputs,
+        llama_recurrent_replay_stats * stats) {
+    if (!mem_recr->seq_restore_recurrent_prefix(
+                seq_id, batch_start, valid_inputs, total_inputs, stats)) {
+        return false;
+    }
+    return mem_attn->seq_rm(seq_id, batch_start + valid_inputs, -1);
 }
 
 void llama_memory_hybrid_iswa::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {

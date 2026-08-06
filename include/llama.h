@@ -356,6 +356,7 @@ extern "C" {
         uint32_t n_seq_max;         // max number of sequences (i.e. distinct states for recurrent models)
         uint32_t n_rs_seq;          // number of recurrent-state snapshots per seq for rollback (0 = no rollback) [EXPERIMENTAL]
         uint32_t n_rs_undo;         // compact recurrent undo-log capacity (0 = disabled) [EXPERIMENTAL]
+        uint32_t n_rs_stride;       // token spacing between recurrent snapshots (0/1 = every token) [EXPERIMENTAL]
         uint32_t n_outputs_max;     // max outputs in a ubatch (0 = n_batch)
         int32_t  n_threads;         // number of threads to use for generation
         int32_t  n_threads_batch;   // number of threads to use for batch processing
@@ -409,6 +410,14 @@ extern "C" {
         // a source/target/parent context
         // can be utilized in various ways, for example by sharing results or llama_memory between 2 contexts
         struct llama_context * ctx_other;
+    };
+
+    struct llama_recurrent_replay_stats {
+        uint32_t checkpoint_group;
+        uint32_t replayed_updates;
+        float    checkpoint_ms;
+        float    gated_delta_ms;
+        float    convolution_ms;
     };
 
     struct llama_model_tensor_override {

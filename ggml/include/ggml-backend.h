@@ -229,6 +229,20 @@ extern "C" {
             const struct ggml_tensor * evicted,
             int64_t                    n_undo,
             float                    * elapsed_ms);
+    typedef bool (*ggml_backend_gated_delta_net_replay_t)(
+            struct ggml_tensor       * state,
+            const struct ggml_tensor * k,
+            const struct ggml_tensor * delta,
+            const struct ggml_tensor * gate,
+            int64_t                    offset,
+            int64_t                    count,
+            float                    * elapsed_ms);
+    typedef bool (*ggml_backend_recurrent_conv_replay_t)(
+            struct ggml_tensor       * state,
+            const struct ggml_tensor * inserted,
+            int64_t                    offset,
+            int64_t                    count,
+            float                    * elapsed_ms);
     // Get a list of feature flags supported by the backend (returns a NULL-terminated array)
     struct ggml_backend_feature {
         const char * name;

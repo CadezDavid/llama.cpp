@@ -2694,7 +2694,9 @@ static int ggml_cuda_try_gdn_cache_fusion(
     const int64_t       n_seqs    = src_v->ne[3];
     const int64_t       D         = S_v * S_v * H;
     const int64_t       K         = ggml_get_op_params_i32(gdn, 0); // snapshot slot count
-    const int64_t       n_written = std::min<int64_t>(n_tokens, K); // newest n_written slots are written
+    const int64_t       stride    = ggml_get_op_params_i32(gdn, 2);
+    const int64_t       n_written = stride == 1 ? std::min<int64_t>(n_tokens, K) :
+            1 + std::min<int64_t>((n_tokens - 1) / stride, K - 1);
 
     // snapshot tail starts right after the attention scores
     const size_t tail_off = ggml_row_size(GGML_TYPE_F32, S_v * H * n_tokens * n_seqs);
@@ -5392,6 +5394,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_recurrent_conv_undo") == 0) {
         return (void *)ggml_cuda_recurrent_conv_undo;
+    }
+    if (strcmp(name, "ggml_backend_gated_delta_net_replay") == 0) {
+        return (void *)ggml_cuda_gated_delta_net_replay;
+    }
+    if (strcmp(name, "ggml_backend_recurrent_conv_replay") == 0) {
+        return (void *)ggml_cuda_recurrent_conv_replay;
     }
     return nullptr;
 }

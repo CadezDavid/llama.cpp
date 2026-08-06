@@ -36,6 +36,7 @@ public:
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
                  uint32_t   n_rs_undo,
+                 uint32_t   n_rs_stride,
                      bool   offload,
                      bool   unified,
                             /* layer filters */
@@ -64,6 +65,10 @@ public:
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
     bool seq_checkpoint_recurrent(llama_seq_id seq_id) override;
     bool seq_restore_recurrent   (llama_seq_id seq_id) override;
+    bool seq_checkpoint_recurrent_pass(llama_seq_id seq_id) override;
+    bool seq_restore_recurrent_prefix(
+            llama_seq_id seq_id, llama_pos batch_start, uint32_t valid_inputs, uint32_t total_inputs,
+            llama_recurrent_replay_stats * stats) override;
     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
     void seq_keep(llama_seq_id seq_id)                                                          override;
     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;

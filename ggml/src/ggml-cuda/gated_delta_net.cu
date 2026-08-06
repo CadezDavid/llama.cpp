@@ -28,7 +28,8 @@ gated_delta_net_cuda(const float * q,
                                      const uint3   rq3_magic,
                                      float         scale,
                                      int64_t       state_slot_stride,
-                                     int           K) {
+                                     int           K,
+                                     int           snapshot_stride) {
     const uint32_t h_idx    = blockIdx.x;
     const uint32_t sequence = blockIdx.y;
     // each warp owns one column, using warp-level primitives to reduce across rows
@@ -152,9 +153,18 @@ gated_delta_net_cuda(const float * q,
         attn_data += S_v * H;
 
         if constexpr (keep_rs_t) {
-            // snapshot slot mapping: slot 0 = most recent state, slot s = s tokens back.
-            // When n_tokens < K only slots 0..n_tokens-1 are written; older slots are caller-owned.
-            const int target_slot = (int) n_tokens - 1 - t;
+            int target_slot = -1;
+            if (snapshot_stride == 1) {
+                // Legacy mapping: slot 0 is newest and slot s is s tokens back.
+                target_slot = (int) n_tokens - 1 - t;
+            } else if (t == n_tokens - 1) {
+                // Periodic mapping: slot 0 is always the live final state.
+                target_slot = 0;
+            } else if ((t + 1) % snapshot_stride == 0) {
+                // Slots 1.. hold chronological boundaries. The final boundary
+                // is omitted because slot 0 already contains that exact state.
+                target_slot = (t + 1) / snapshot_stride;
+            }
             if (target_slot >= 0 && target_slot < K) {
                 float * curr_state = state + target_slot * state_slot_stride;
 #pragma unroll
@@ -185,7 +195,7 @@ static void launch_gated_delta_net(
         int64_t sv1,   int64_t sv2, int64_t sv3,
         int64_t sb1,   int64_t sb2, int64_t sb3,
         int64_t neqk1, int64_t rq3,
-        float scale, int64_t state_slot_stride, int K, cudaStream_t stream) {
+        float scale, int64_t state_slot_stride, int K, int snapshot_stride, cudaStream_t stream) {
     //TODO: Add chunked kernel for even faster pre-fill
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     const int num_warps = 4;
@@ -201,26 +211,26 @@ static void launch_gated_delta_net(
             ggml_cuda_kernel_launch(gated_delta_net_cuda<16, KDA, keep_rs_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, delta_log_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, snapshot_stride);
             break;
         case 32:
             ggml_cuda_kernel_launch(gated_delta_net_cuda<32, KDA, keep_rs_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, delta_log_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, snapshot_stride);
             break;
         case 64: {
             ggml_cuda_kernel_launch(gated_delta_net_cuda<64, KDA, keep_rs_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, delta_log_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, snapshot_stride);
             break;
         }
         case 128: {
             ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, delta_log_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, snapshot_stride);
             break;
         }
         default:
@@ -293,6 +303,7 @@ static void ggml_cuda_op_gated_delta_net_impl(
 
     // K (snapshot slot count) is an op param; state holds s0 only [S_v, S_v, H, n_seqs].
     const int K = ggml_get_op_params_i32(dst, 0);
+    const int snapshot_stride = ggml_get_op_params_i32(dst, 2);
     const bool keep_rs = K > 1;
     const bool log_delta = ggml_get_op_params_i32(dst, 1) != 0;
 
@@ -311,21 +322,21 @@ static void ggml_cuda_op_gated_delta_net_impl(
         if (keep_rs) {
             launch_gated_delta_net<true, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, delta_log_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
+                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, snapshot_stride, stream);
         } else {
             launch_gated_delta_net<true, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, delta_log_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
+                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, snapshot_stride, stream);
         }
     } else {
         if (keep_rs) {
             launch_gated_delta_net<false, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, delta_log_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
+                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, snapshot_stride, stream);
         } else {
             launch_gated_delta_net<false, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, delta_log_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
+                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, snapshot_stride, stream);
         }
     }
 }
@@ -523,6 +534,156 @@ bool ggml_cuda_recurrent_conv_undo(
     if (elapsed_ms) {
         CUDA_CHECK(cudaEventElapsedTime(elapsed_ms, start, stop));
     }
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+    return true;
+}
+
+template <int S_v, bool KDA>
+__global__ void gated_delta_net_replay_cuda(
+        float       * state,
+        const float * k,
+        const float * delta,
+        const float * gate,
+        int64_t       H,
+        int64_t       H_k,
+        int64_t       n_tokens,
+        int64_t       offset,
+        int64_t       count) {
+    const int h_idx    = blockIdx.x;
+    const int sequence = blockIdx.y;
+    const int lane     = threadIdx.x;
+    const int col      = blockIdx.z * blockDim.y + threadIdx.y;
+    if (col >= S_v) {
+        return;
+    }
+
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size() < S_v ?
+            ggml_cuda_get_physical_warp_size() : S_v;
+    constexpr int rows_per_lane = (S_v + warp_size - 1) / warp_size;
+    float s_shard[rows_per_lane];
+    float * state_col = state + (sequence * H + h_idx) * S_v * S_v + col * S_v;
+#pragma unroll
+    for (int r = 0; r < rows_per_lane; ++r) {
+        const int i = r * warp_size + lane;
+        s_shard[r] = state_col[i];
+    }
+
+    const int k_head = h_idx % H_k;
+    for (int64_t step = 0; step < count; ++step) {
+        const int64_t t = offset + step;
+        const float * k_t = k + (sequence * n_tokens * H_k + t * H_k + k_head) * S_v;
+        const float delta_col = delta[(sequence * n_tokens * H + t * H + h_idx) * S_v + col];
+        const float * gate_t = gate + (sequence * n_tokens * H + t * H + h_idx) * (KDA ? S_v : 1);
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; ++r) {
+            const int i = r * warp_size + lane;
+            s_shard[r] = expf(gate_t[KDA ? i : 0]) * s_shard[r] + k_t[i] * delta_col;
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < rows_per_lane; ++r) {
+        const int i = r * warp_size + lane;
+        state_col[i] = s_shard[r];
+    }
+}
+
+template <bool KDA>
+static void launch_gated_delta_net_replay(
+        float * state, const float * k, const float * delta, const float * gate,
+        int64_t S_v, int64_t H, int64_t H_k, int64_t n_tokens, int64_t n_seqs,
+        int64_t offset, int64_t count, cudaStream_t stream) {
+    const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+    const int num_warps = 4;
+    const dim3 grid(H, n_seqs, (S_v + num_warps - 1) / num_warps);
+    const dim3 block(warp_size <= S_v ? warp_size : S_v, num_warps, 1);
+    const ggml_cuda_kernel_launch_params params(grid, block, 0, stream);
+#define LAUNCH_REPLAY(SV) ggml_cuda_kernel_launch(gated_delta_net_replay_cuda<SV, KDA>, params, \
+        state, k, delta, gate, H, H_k, n_tokens, offset, count)
+    switch (S_v) {
+        case 16:  LAUNCH_REPLAY(16);  break;
+        case 32:  LAUNCH_REPLAY(32);  break;
+        case 64:  LAUNCH_REPLAY(64);  break;
+        case 128: LAUNCH_REPLAY(128); break;
+        default: GGML_ABORT("unsupported gated-delta replay head size");
+    }
+#undef LAUNCH_REPLAY
+}
+
+bool ggml_cuda_gated_delta_net_replay(
+        ggml_tensor * state, const ggml_tensor * k, const ggml_tensor * delta,
+        const ggml_tensor * gate, int64_t offset, int64_t count, float * elapsed_ms) {
+    GGML_ASSERT(state && k && delta && gate);
+    GGML_ASSERT(state->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F32 &&
+                delta->type == GGML_TYPE_F32 && gate->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(state) && ggml_is_contiguous(k) &&
+                ggml_is_contiguous(delta) && ggml_is_contiguous(gate));
+    const int64_t S_v = state->ne[0];
+    const int64_t H = state->ne[2];
+    const int64_t n_seqs = state->ne[3];
+    const int64_t H_k = k->ne[1];
+    const int64_t n_tokens = k->ne[2];
+    GGML_ASSERT(offset >= 0 && count >= 0 && offset + count <= n_tokens);
+
+    cudaEvent_t start;
+    cudaEvent_t stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+    CUDA_CHECK(cudaEventRecord(start, cudaStreamPerThread));
+    if (gate->ne[0] == S_v) {
+        launch_gated_delta_net_replay<true>((float *) state->data, (const float *) k->data,
+                (const float *) delta->data, (const float *) gate->data,
+                S_v, H, H_k, n_tokens, n_seqs, offset, count, cudaStreamPerThread);
+    } else {
+        launch_gated_delta_net_replay<false>((float *) state->data, (const float *) k->data,
+                (const float *) delta->data, (const float *) gate->data,
+                S_v, H, H_k, n_tokens, n_seqs, offset, count, cudaStreamPerThread);
+    }
+    CUDA_CHECK(cudaEventRecord(stop, cudaStreamPerThread));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+    if (elapsed_ms) CUDA_CHECK(cudaEventElapsedTime(elapsed_ms, start, stop));
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+    return true;
+}
+
+__global__ void recurrent_conv_replay_cuda(
+        float * state, const float * inserted, int64_t window, int64_t channels,
+        int64_t capacity, int64_t offset, int64_t count) {
+    const int64_t channel = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (channel >= channels) return;
+    float * state_c = state + channel * window;
+    const float * inserted_c = inserted + channel * capacity;
+    for (int64_t step = 0; step < count; ++step) {
+        for (int64_t j = 0; j + 1 < window; ++j) {
+            state_c[j] = state_c[j + 1];
+        }
+        state_c[window - 1] = inserted_c[offset + step];
+    }
+}
+
+bool ggml_cuda_recurrent_conv_replay(
+        ggml_tensor * state, const ggml_tensor * inserted,
+        int64_t offset, int64_t count, float * elapsed_ms) {
+    GGML_ASSERT(state && inserted && state->type == GGML_TYPE_F32 && inserted->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(state) && ggml_is_contiguous(inserted));
+    const int64_t window = state->ne[0];
+    const int64_t channels = state->ne[1];
+    const int64_t capacity = inserted->ne[0];
+    GGML_ASSERT(offset >= 0 && count >= 0 && offset + count <= capacity);
+    cudaEvent_t start;
+    cudaEvent_t stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+    CUDA_CHECK(cudaEventRecord(start, cudaStreamPerThread));
+    recurrent_conv_replay_cuda<<<(channels + 255) / 256, 256, 0, cudaStreamPerThread>>>(
+            (float *) state->data, (const float *) inserted->data,
+            window, channels, capacity, offset, count);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaEventRecord(stop, cudaStreamPerThread));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+    if (elapsed_ms) CUDA_CHECK(cudaEventElapsedTime(elapsed_ms, start, stop));
     CUDA_CHECK(cudaEventDestroy(start));
     CUDA_CHECK(cudaEventDestroy(stop));
     return true;
