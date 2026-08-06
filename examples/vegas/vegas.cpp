@@ -2485,9 +2485,6 @@ int main(int argc, char ** argv) {
                     "q8_0/q4_0, or q8_0/q8_0 target and draft KV caches\n");
             return 1;
         }
-        if (options.sparse_kernel == LLAMA_VEGAS_SPARSE_KERNEL_AUTO) {
-            options.sparse_kernel = LLAMA_VEGAS_SPARSE_KERNEL_DIRECT;
-        }
     }
     if (params.sampling.mirostat != 0 || params.sampling.xtc_probability != 0.0f) {
         LOG_ERR("Vegas does not support stateful or randomized probability transforms\n");

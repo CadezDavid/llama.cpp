@@ -1435,7 +1435,15 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         GGML_ASSERT(dst->src[0]->ne[3] == 1);
         const bool q8_turbo4 = dst->src[1]->type == GGML_TYPE_Q8_0 &&
                 dst->src[2]->type == GGML_TYPE_TURBO4_0;
-        if (sparse_mode == GGML_SPARSE_FATTN_MODE_GATHER) {
+        const bool normal_quantized =
+                (dst->src[1]->type == GGML_TYPE_Q4_0 && dst->src[2]->type == GGML_TYPE_Q4_0) ||
+                (dst->src[1]->type == GGML_TYPE_Q8_0 && dst->src[2]->type == GGML_TYPE_Q4_0) ||
+                (dst->src[1]->type == GGML_TYPE_Q8_0 && dst->src[2]->type == GGML_TYPE_Q8_0);
+        // For normal quantized caches the gather cost is amortized by the highly
+        // optimized dense MMA kernel. Keep the indexed kernel available through
+        // DIRECT, but prefer the consistently faster end-to-end path for AUTO.
+        if (sparse_mode == GGML_SPARSE_FATTN_MODE_GATHER ||
+                (sparse_mode == GGML_SPARSE_FATTN_MODE_AUTO && normal_quantized)) {
             ggml_cuda_flash_attn_ext_sparse_gather(ctx, dst);
             return;
         }
