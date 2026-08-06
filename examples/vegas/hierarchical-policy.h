@@ -11,6 +11,7 @@ enum class vegas_hierarchical_stop {
     round_cap,
     empty_draft,
     output_limit,
+    dense_interval,
 };
 
 struct vegas_hierarchical_limits {
@@ -28,6 +29,11 @@ int32_t vegas_hierarchical_valid_batch_inputs(
         int32_t accepted_draft_tokens,
         bool correction,
         bool extension);
+
+// Round numbers are zero-based. With interval four, rounds 0..2 use the
+// sparse target and round 3 sends its unchecked MTP tokens directly to the
+// dense target.
+bool vegas_hierarchical_is_dense_round(int32_t round, int32_t dense_interval);
 
 vegas_hierarchical_stop vegas_hierarchical_should_stop(
         const vegas_hierarchical_limits & limits,

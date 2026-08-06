@@ -26,6 +26,12 @@ int main() {
     REQUIRE(vegas_hierarchical_valid_batch_inputs(-1, false, false) == -1);
     REQUIRE(vegas_hierarchical_valid_batch_inputs(1, true, true) == -1);
 
+    REQUIRE(!vegas_hierarchical_is_dense_round(0, 4));
+    REQUIRE(!vegas_hierarchical_is_dense_round(1, 4));
+    REQUIRE(!vegas_hierarchical_is_dense_round(2, 4));
+    REQUIRE( vegas_hierarchical_is_dense_round(3, 4));
+    REQUIRE(!vegas_hierarchical_is_dense_round(3, 0));
+
     REQUIRE(vegas_hierarchical_should_stop(limits, 4, 1, 0, false, false, false) ==
             vegas_hierarchical_stop::continue_drafting);
     REQUIRE(vegas_hierarchical_should_stop(limits, 8, 2, 0, false, false, false) ==
@@ -44,6 +50,8 @@ int main() {
             vegas_hierarchical_stop::output_limit);
     REQUIRE(std::strcmp(vegas_hierarchical_stop_name(vegas_hierarchical_stop::target_length),
                         "target_length") == 0);
+    REQUIRE(std::strcmp(vegas_hierarchical_stop_name(vegas_hierarchical_stop::dense_interval),
+                        "dense_interval") == 0);
 
     const vegas_hierarchical_limits target_20 {
         /* .target_tokens   = */ 20,

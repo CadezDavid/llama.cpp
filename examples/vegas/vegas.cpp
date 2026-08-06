@@ -55,6 +55,8 @@ struct vegas_options {
     bool adaptive_gamma = false;
     float adaptive_beta = 0.9f;
     vegas_hierarchical_limits hierarchical;
+    int32_t hierarchical_dense_interval = 0;
+    int32_t hierarchical_rs_checkpoint_stride = 1;
     bool hierarchical_trace = false;
     bool hierarchical_recompute_state = false;
     bool same_prefix_trace = false;
@@ -206,6 +208,7 @@ enum class hierarchical_token_source : int32_t {
     mtp = 0,
     sparse_correction = 1,
     sparse_extension = 2,
+    mtp_unchecked = 3,
 };
 
 struct hierarchical_entropy_stats {
@@ -234,6 +237,7 @@ struct hierarchical_round_trace {
     int32_t sparse_mismatch_index = -1;
     bool correction = false;
     bool extension = false;
+    bool direct_dense = false;
     int32_t provisional_after = 0;
     int64_t mtp_us = 0;
     int64_t mtp_process_us = 0;
@@ -266,6 +270,7 @@ struct hierarchical_cycle_trace {
     int64_t recompute_target_us = 0;
     int64_t recompute_mtp_us = 0;
     int64_t recompute_plan_us = 0;
+    int32_t dense_round = -1;
     int32_t recompute_input_tokens = 0;
 };
 
@@ -283,6 +288,10 @@ struct hierarchical_metrics {
     int64_t recompute_target_us = 0;
     int64_t recompute_mtp_us = 0;
     int64_t recompute_plan_us = 0;
+    int64_t recurrent_checkpoint_us = 0;
+    int64_t recurrent_checkpoint_copy_us = 0;
+    int64_t recurrent_replay_gdn_us = 0;
+    int64_t recurrent_replay_conv_us = 0;
 
     int64_t outer_cycles = 0;
     int64_t inner_rounds = 0;
@@ -300,6 +309,7 @@ struct hierarchical_metrics {
     int64_t dense_accepted = 0;
     int64_t dense_corrections = 0;
     int64_t dense_bonus = 0;
+    int64_t dense_batch_input_tokens = 0;
     int64_t committed_tokens = 0;
     int64_t device_entropy_samples = 0;
     int64_t fallback_entropy_samples = 0;
@@ -309,16 +319,24 @@ struct hierarchical_metrics {
     int64_t empty_drafts = 0;
     int64_t recompute_decodes = 0;
     int64_t recompute_input_tokens = 0;
+    int64_t direct_dense_rounds = 0;
+    int64_t skipped_sparse_decodes = 0;
+    int64_t recurrent_pass_checkpoints = 0;
+    int64_t recurrent_prefix_restores = 0;
+    int64_t recurrent_replayed_updates = 0;
+    int64_t recurrent_restore_failures = 0;
 
     std::array<int64_t, 52> round_histogram {};
     std::array<int64_t, 52> provisional_histogram {};
     std::array<int64_t, 52> sparse_prefix_histogram {};
     std::array<int64_t, 52> dense_prefix_histogram {};
+    std::array<int64_t, 52> dense_batch_input_histogram {};
     std::array<int64_t, 52> sparse_mismatch_histogram {};
     std::array<int64_t, 3> correction_histogram {};
-    std::array<int64_t, 8> stop_histogram {};
-    std::array<int64_t, 3> proposed_by_source {};
-    std::array<int64_t, 3> accepted_by_source {};
+    std::array<int64_t, 9> stop_histogram {};
+    std::array<int64_t, 4> proposed_by_source {};
+    std::array<int64_t, 4> accepted_by_source {};
+    std::array<int64_t, 4> recurrent_replay_depth_histogram {};
 
     hierarchical_entropy_stats sparse_match_entropy;
     hierarchical_entropy_stats sparse_correction_entropy;
@@ -380,6 +398,8 @@ struct hierarchical_entropy_observation {
     bool on_device = false;
 };
 
+static bool remove_after(llama_context * ctx, int32_t pos);
+
 static hierarchical_entropy_observation hierarchical_entropy(llama_context * ctx, int32_t idx) {
     hierarchical_entropy_observation result;
     result.on_device = llama_get_sampled_entropy_ith(
@@ -408,6 +428,52 @@ static hierarchical_entropy_observation hierarchical_entropy(llama_context * ctx
         result.entropy = (float) (std::log(sum) - weighted_shifted_logit / sum);
     }
     return result;
+}
+
+static bool hierarchical_checkpoint_recurrent_pass(
+        llama_context * ctx,
+        bool enabled,
+        hierarchical_metrics & metrics) {
+    if (!enabled) {
+        return true;
+    }
+    const int64_t start = ggml_time_us();
+    const bool ok = llama_memory_checkpoint_recurrent_pass(ctx, 0);
+    metrics.recurrent_checkpoint_us += ggml_time_us() - start;
+    if (ok) {
+        metrics.recurrent_pass_checkpoints++;
+    } else {
+        metrics.recurrent_restore_failures++;
+    }
+    return ok;
+}
+
+static bool hierarchical_restore_recurrent_prefix(
+        llama_context * ctx,
+        bool enabled,
+        llama_pos batch_start,
+        int32_t valid_inputs,
+        int32_t total_inputs,
+        hierarchical_metrics & metrics) {
+    if (!enabled) {
+        return remove_after(ctx, batch_start + valid_inputs);
+    }
+
+    llama_recurrent_replay_stats stats = {};
+    if (!llama_memory_restore_recurrent_prefix(
+                ctx, 0, batch_start, valid_inputs, total_inputs, &stats)) {
+        metrics.recurrent_restore_failures++;
+        return false;
+    }
+    metrics.recurrent_prefix_restores++;
+    metrics.recurrent_checkpoint_copy_us += (int64_t) std::llround(stats.checkpoint_ms * 1e3);
+    metrics.recurrent_replay_gdn_us += (int64_t) std::llround(stats.gated_delta_ms * 1e3);
+    metrics.recurrent_replay_conv_us += (int64_t) std::llround(stats.convolution_ms * 1e3);
+    metrics.recurrent_replayed_updates += stats.replayed_updates;
+    metrics.recurrent_replay_depth_histogram[
+            std::min<size_t>(stats.replayed_updates,
+                    metrics.recurrent_replay_depth_histogram.size() - 1)]++;
+    return true;
 }
 
 static const char * mode_name(vegas_run_mode mode) {
@@ -755,6 +821,20 @@ static bool parse_vegas_options(
             }
             continue;
         }
+        if (const char * value = get_value("--vegas-hier-dense-interval")) {
+            if (!parse_i32(value, options.hierarchical_dense_interval)) {
+                LOG_ERR("invalid --vegas-hier-dense-interval: %s\n", value);
+                return false;
+            }
+            continue;
+        }
+        if (const char * value = get_value("--vegas-hier-rs-checkpoint-stride")) {
+            if (!parse_i32(value, options.hierarchical_rs_checkpoint_stride)) {
+                LOG_ERR("invalid --vegas-hier-rs-checkpoint-stride: %s\n", value);
+                return false;
+            }
+            continue;
+        }
         if (const char * value = get_value("--vegas-selection-layer")) {
             if (!parse_i32(value, options.selection_layer)) {
                 LOG_ERR("invalid --vegas-selection-layer: %s\n", value);
@@ -816,7 +896,10 @@ static bool parse_vegas_options(
             options.hierarchical.target_tokens < 1 || options.hierarchical.max_tokens < 1 ||
             options.hierarchical.target_tokens > options.hierarchical.max_tokens ||
             options.hierarchical.max_tokens > 50 ||
-            options.hierarchical.max_rounds < 1 || options.hierarchical.max_corrections < 1) {
+            options.hierarchical.max_rounds < 1 || options.hierarchical.max_corrections < 1 ||
+            options.hierarchical_dense_interval < 0 || options.hierarchical_rs_checkpoint_stride < 1 ||
+            (options.hierarchical_dense_interval > 0 &&
+                    options.hierarchical.max_rounds < options.hierarchical_dense_interval)) {
         LOG_ERR("invalid Vegas configuration\n");
         return false;
     }
@@ -1515,6 +1598,9 @@ static bool run_mtp_hierarchical(
         hierarchical_metrics & hierarchical) {
     bool has_eog = false;
     const int64_t start = ggml_time_us();
+    const bool scheduled_hierarchy = options.hierarchical_dense_interval > 0;
+    const bool periodic_recurrent = scheduled_hierarchy &&
+            options.hierarchical_rs_checkpoint_stride > 1 && llama_n_rs_seq(ctx) > 0;
 
     while (!has_eog && (params.n_predict < 0 || metrics.n_predict < params.n_predict)) {
         const int32_t remaining = params.n_predict < 0 ? INT32_MAX : params.n_predict - metrics.n_predict;
@@ -1621,6 +1707,36 @@ static bool run_mtp_hierarchical(
             metrics.rollback_us += draft_rollback_us;
 
             const bool empty_draft = draft.empty();
+            round.direct_dense = vegas_hierarchical_is_dense_round(
+                    round.round, options.hierarchical_dense_interval);
+            if (round.direct_dense) {
+                cycle.dense_round = round.round;
+                hierarchical.direct_dense_rounds++;
+                hierarchical.skipped_sparse_decodes++;
+                if (empty_draft) {
+                    hierarchical.empty_drafts++;
+                } else {
+                    for (llama_token token : draft) {
+                        provisional.push_back(token);
+                        provenance.push_back(hierarchical_token_source::mtp_unchecked);
+                        provisional_history.push_back(token);
+                        provisional_last = token;
+                        provisional_n_past++;
+                        hierarchical.proposed_by_source[
+                                (int) hierarchical_token_source::mtp_unchecked]++;
+                        provisional_eog = llama_vocab_is_eog(vocab, token);
+                        if (provisional_eog || (int32_t) provisional.size() >= outer_capacity) {
+                            break;
+                        }
+                    }
+                }
+
+                round.provisional_after = (int32_t) provisional.size();
+                cycle.rounds.push_back(std::move(round));
+                hierarchical.inner_rounds++;
+                stop = vegas_hierarchical_stop::dense_interval;
+                break;
+            }
             if (!empty_draft) {
                 if (!llama_vegas_resume_draft(ctx)) {
                     LOG_ERR("failed to resume sparse-target Vegas plan\n");
@@ -1639,6 +1755,12 @@ static bool run_mtp_hierarchical(
                 hierarchical.sparse_batches++;
                 hierarchical.sparse_decodes++;
                 hierarchical.sparse_batch_input_tokens += batch.n_tokens;
+
+                if (!hierarchical_checkpoint_recurrent_pass(
+                            ctx, periodic_recurrent, hierarchical)) {
+                    LOG_ERR("failed to checkpoint recurrent state before sparse-target verification\n");
+                    return false;
+                }
 
                 const int64_t sparse_start = ggml_time_us();
                 if (llama_decode(ctx, batch) != 0) {
@@ -1757,9 +1879,11 @@ static bool run_mtp_hierarchical(
                 hierarchical.mtp_process_us += round.mtp_process_us;
 
                 const int64_t sparse_rollback_start = ggml_time_us();
-                if (!remove_after(ctx, sparse_batch_start + valid_inputs)) {
+                if (!hierarchical_restore_recurrent_prefix(
+                            ctx, periodic_recurrent, sparse_batch_start,
+                            valid_inputs, batch.n_tokens, hierarchical)) {
                     hierarchical.rollback_failures++;
-                    LOG_ERR("failed to remove invalid sparse-target batch suffix\n");
+                    LOG_ERR("failed to restore valid sparse-target batch prefix\n");
                     return false;
                 }
                 const int64_t sparse_rollback_us = ggml_time_us() - sparse_rollback_start;
@@ -1808,9 +1932,10 @@ static bool run_mtp_hierarchical(
         llama_vegas_pause(ctx_dft);
         const llama_pos target_pos_before_restore = llama_memory_seq_pos_max(llama_get_memory(ctx), 0);
         const llama_pos draft_pos_before_restore = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), 0);
-        if (options.hierarchical_recompute_state && !llama_memory_restore_recurrent(ctx, 0)) {
+        if ((options.hierarchical_recompute_state || periodic_recurrent) &&
+                !llama_memory_restore_recurrent(ctx, 0)) {
             hierarchical.snapshot_failures++;
-            LOG_ERR("failed to restore target recurrent checkpoint before low-memory dense verification\n");
+            LOG_ERR("failed to restore target recurrent checkpoint before dense verification\n");
             return false;
         }
         const bool target_restored = remove_after(ctx, outer_n_past);
@@ -1823,7 +1948,8 @@ static bool run_mtp_hierarchical(
                     (int) draft_pos_before_restore, outer_n_past);
             return false;
         }
-        if (!options.hierarchical_recompute_state && !llama_memory_restore_recurrent(ctx, 0)) {
+        if (!options.hierarchical_recompute_state && !periodic_recurrent &&
+                !llama_memory_restore_recurrent(ctx, 0)) {
             hierarchical.snapshot_failures++;
             LOG_ERR("failed to restore target recurrent checkpoint before dense verification\n");
             return false;
@@ -1859,6 +1985,15 @@ static bool run_mtp_hierarchical(
         common_batch_add(batch, outer_id_last, outer_n_past, { 0 }, true);
         for (size_t i = 0; i < provisional.size(); ++i) {
             common_batch_add(batch, provisional[i], outer_n_past + (int32_t) i + 1, { 0 }, true);
+        }
+        hierarchical.dense_batch_input_tokens += batch.n_tokens;
+        hierarchical.dense_batch_input_histogram[
+                std::min<size_t>(batch.n_tokens,
+                        hierarchical.dense_batch_input_histogram.size() - 1)]++;
+
+        if (!hierarchical_checkpoint_recurrent_pass(ctx, periodic_recurrent, hierarchical)) {
+            LOG_ERR("failed to checkpoint recurrent state before dense verification\n");
+            return false;
         }
 
         const int64_t dense_start = ggml_time_us();
@@ -1956,6 +2091,21 @@ static bool run_mtp_hierarchical(
         hierarchical.dense_sample_us += cycle.dense_sample_us;
         metrics.sample_us += cycle.dense_sample_us;
 
+        if (scheduled_hierarchy) {
+            const int32_t valid_dense_inputs = accepted + 1;
+            const int64_t dense_rollback_start = ggml_time_us();
+            if (!hierarchical_restore_recurrent_prefix(
+                        ctx, periodic_recurrent, outer_n_past,
+                        valid_dense_inputs, batch.n_tokens, hierarchical)) {
+                hierarchical.rollback_failures++;
+                LOG_ERR("failed to restore accepted dense verification prefix\n");
+                return false;
+            }
+            const int64_t dense_rollback_us = ggml_time_us() - dense_rollback_start;
+            hierarchical.rollback_us += dense_rollback_us;
+            metrics.rollback_us += dense_rollback_us;
+        }
+
         if (options.hierarchical_recompute_state) {
             const int64_t recompute_start = ggml_time_us();
             llama_vegas_pause(ctx);
@@ -2041,6 +2191,9 @@ static bool run_mtp_hierarchical(
         hierarchical.correction_histogram[std::min(corrections, 2)]++;
         hierarchical.stop_histogram[(int) stop]++;
         for (const auto & round : cycle.rounds) {
+            if (round.direct_dense) {
+                continue;
+            }
             hierarchical.sparse_prefix_histogram[
                     std::min<size_t>(round.sparse_accepted,
                             hierarchical.sparse_prefix_histogram.size() - 1)]++;
@@ -2082,14 +2235,18 @@ static std::string hierarchical_summary_json(
         const hierarchical_metrics & metrics) {
     std::ostringstream out;
     out << "\"hierarchical\":true"
-        << ",\"hierarchical_trace_schema\":3"
+        << ",\"hierarchical_trace_schema\":4"
         << ",\"hierarchical_target\":" << options.hierarchical.target_tokens
         << ",\"hierarchical_max_tokens\":" << options.hierarchical.max_tokens
         << ",\"hierarchical_max_rounds\":" << options.hierarchical.max_rounds
         << ",\"hierarchical_max_corrections\":" << options.hierarchical.max_corrections
+        << ",\"hierarchical_dense_interval\":" << options.hierarchical_dense_interval
+        << ",\"hierarchical_rs_checkpoint_stride\":"
+        << options.hierarchical_rs_checkpoint_stride
         << ",\"hierarchical_recompute_state\":" << (options.hierarchical_recompute_state ? "true" : "false")
         << ",\"hierarchical_target_state_capacity\":"
-        << (options.hierarchical_recompute_state ? options.gamma : options.hierarchical.max_tokens)
+        << (options.hierarchical_dense_interval > 0 ? options.hierarchical.max_tokens + 1 :
+                (options.hierarchical_recompute_state ? options.gamma : options.hierarchical.max_tokens))
         << ",\"hierarchical_outer_cycles\":" << metrics.outer_cycles
         << ",\"hierarchical_inner_rounds\":" << metrics.inner_rounds
         << ",\"hierarchical_mtp_drafted\":" << metrics.mtp_drafted
@@ -2106,6 +2263,7 @@ static std::string hierarchical_summary_json(
         << ",\"hierarchical_dense_accepted\":" << metrics.dense_accepted
         << ",\"hierarchical_dense_corrections\":" << metrics.dense_corrections
         << ",\"hierarchical_dense_bonus\":" << metrics.dense_bonus
+        << ",\"hierarchical_dense_batch_input_tokens\":" << metrics.dense_batch_input_tokens
         << ",\"hierarchical_committed_tokens\":" << metrics.committed_tokens
         << ",\"hierarchical_committed_per_dense_cycle\":"
         << (metrics.outer_cycles > 0 ? (double) metrics.committed_tokens / metrics.outer_cycles : 0.0)
@@ -2128,6 +2286,17 @@ static std::string hierarchical_summary_json(
         << ",\"hierarchical_recompute_plan_ms\":" << metrics.recompute_plan_us / 1e3
         << ",\"hierarchical_recompute_decodes\":" << metrics.recompute_decodes
         << ",\"hierarchical_recompute_input_tokens\":" << metrics.recompute_input_tokens
+        << ",\"hierarchical_direct_dense_rounds\":" << metrics.direct_dense_rounds
+        << ",\"hierarchical_skipped_sparse_decodes\":" << metrics.skipped_sparse_decodes
+        << ",\"hierarchical_recurrent_pass_checkpoints\":" << metrics.recurrent_pass_checkpoints
+        << ",\"hierarchical_recurrent_prefix_restores\":" << metrics.recurrent_prefix_restores
+        << ",\"hierarchical_recurrent_replayed_updates\":" << metrics.recurrent_replayed_updates
+        << ",\"hierarchical_recurrent_restore_failures\":" << metrics.recurrent_restore_failures
+        << ",\"hierarchical_recurrent_checkpoint_ms\":" << metrics.recurrent_checkpoint_us / 1e3
+        << ",\"hierarchical_recurrent_checkpoint_copy_ms\":"
+        << metrics.recurrent_checkpoint_copy_us / 1e3
+        << ",\"hierarchical_recurrent_replay_gdn_ms\":" << metrics.recurrent_replay_gdn_us / 1e3
+        << ",\"hierarchical_recurrent_replay_conv_ms\":" << metrics.recurrent_replay_conv_us / 1e3
         << ",\"hierarchical_device_entropy_samples\":" << metrics.device_entropy_samples
         << ",\"hierarchical_fallback_entropy_samples\":" << metrics.fallback_entropy_samples
         << ",\"hierarchical_rollback_failures\":" << metrics.rollback_failures
@@ -2143,6 +2312,8 @@ static std::string hierarchical_summary_json(
     json_array(out, metrics.sparse_prefix_histogram);
     out << ",\"hierarchical_dense_prefix_histogram\":";
     json_array(out, metrics.dense_prefix_histogram);
+    out << ",\"hierarchical_dense_batch_input_histogram\":";
+    json_array(out, metrics.dense_batch_input_histogram);
     out << ",\"hierarchical_sparse_mismatch_histogram\":";
     json_array(out, metrics.sparse_mismatch_histogram);
     out << ",\"hierarchical_correction_histogram\":";
@@ -2153,6 +2324,8 @@ static std::string hierarchical_summary_json(
     json_array(out, metrics.proposed_by_source);
     out << ",\"hierarchical_accepted_by_source\":";
     json_array(out, metrics.accepted_by_source);
+    out << ",\"hierarchical_recurrent_replay_depth_histogram\":";
+    json_array(out, metrics.recurrent_replay_depth_histogram);
 
     out << ",\"hierarchical_sparse_match_entropy\":";
     json_entropy_stats(out, metrics.sparse_match_entropy);
@@ -2171,6 +2344,7 @@ static std::string hierarchical_summary_json(
             out << "{\"cycle\":" << cycle.cycle
                 << ",\"start_pos\":" << cycle.start_pos
                 << ",\"stop\":\"" << vegas_hierarchical_stop_name(cycle.stop) << "\""
+                << ",\"dense_round\":" << cycle.dense_round
                 << ",\"provisional_tokens\":";
             json_vector(out, cycle.provisional_tokens);
             out << ",\"provenance\":";
@@ -2206,6 +2380,7 @@ static std::string hierarchical_summary_json(
                     << ",\"sparse_mismatch_index\":" << round.sparse_mismatch_index
                     << ",\"correction\":" << (round.correction ? "true" : "false")
                     << ",\"extension\":" << (round.extension ? "true" : "false")
+                    << ",\"direct_dense\":" << (round.direct_dense ? "true" : "false")
                     << ",\"provisional_after\":" << round.provisional_after
                     << ",\"mtp_ms\":" << round.mtp_us / 1e3
                     << ",\"mtp_process_ms\":" << round.mtp_process_us / 1e3
@@ -2502,6 +2677,22 @@ int main(int argc, char ** argv) {
         LOG_ERR("--vegas-hier-recompute-state requires --vegas-mode mtp-hierarchical\n");
         return 1;
     }
+    if ((options.hierarchical_dense_interval > 0 || options.hierarchical_rs_checkpoint_stride > 1) &&
+            options.mode != vegas_run_mode::mtp_hierarchical) {
+        LOG_ERR("hierarchical dense cadence and recurrent checkpoint flags require "
+                "--vegas-mode mtp-hierarchical\n");
+        return 1;
+    }
+    if (options.hierarchical_rs_checkpoint_stride > 1 &&
+            options.hierarchical_dense_interval == 0) {
+        LOG_ERR("periodic recurrent checkpoints require --vegas-hier-dense-interval\n");
+        return 1;
+    }
+    if (options.hierarchical_dense_interval > 0 && options.hierarchical_recompute_state) {
+        LOG_ERR("the scheduled CascadeSpec path uses exact prefix restore and cannot be combined "
+                "with --vegas-hier-recompute-state\n");
+        return 1;
+    }
     if (options.same_prefix_trace && options.mode != vegas_run_mode::same_prefix) {
         LOG_ERR("--vegas-same-prefix-trace requires --vegas-mode same-prefix\n");
         return 1;
@@ -2520,13 +2711,20 @@ int main(int argc, char ** argv) {
     if (options.mode == vegas_run_mode::mtp_auto && params.speculative.has_dft()) {
         options.gamma = 1;
     }
+    const bool scheduled_hierarchy = options.mode == vegas_run_mode::mtp_hierarchical &&
+            options.hierarchical_dense_interval > 0;
     const int32_t target_state_capacity = options.mode == vegas_run_mode::mtp_hierarchical ?
-            (options.hierarchical_recompute_state ? options.gamma : options.hierarchical.max_tokens) :
+            (scheduled_hierarchy ? options.hierarchical.max_tokens + 1 :
+                    (options.hierarchical_recompute_state ? options.gamma : options.hierarchical.max_tokens)) :
             options.mode == vegas_run_mode::same_prefix ?
             1 : (options.adaptive_gamma ? vegas_adaptive_gamma::max_gamma : options.gamma);
     if (options.mode != vegas_run_mode::baseline) {
         params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
         params.speculative.draft.n_max = target_state_capacity;
+        if (scheduled_hierarchy) {
+            params.speculative.rs_stride = options.hierarchical_rs_checkpoint_stride;
+            params.speculative.rs_log_capacity = target_state_capacity;
+        }
     }
 
     llama_backend_init();

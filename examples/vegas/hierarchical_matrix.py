@@ -44,7 +44,7 @@ CONTEXTS = {
 MODES = ("mtp", "mtp-vegas", "mtp-hierarchical")
 KERNELS = ("direct", "gather")
 RATIOS = (1.0, 0.75, 0.5, 0.35, 0.2, 0.1)
-HORIZONS = (8, 12, 20, 32, 50)
+HORIZONS = (8, 12, 19, 20, 32, 50)
 
 
 def parse_args():
@@ -58,6 +58,8 @@ def parse_args():
     parser.add_argument("--ratios", nargs="+", type=float, choices=RATIOS, default=[0.5])
     parser.add_argument("--horizons", nargs="+", type=int, choices=HORIZONS, default=list(HORIZONS))
     parser.add_argument("--gamma", type=int, default=3)
+    parser.add_argument("--dense-interval", type=int, default=0)
+    parser.add_argument("--rs-checkpoint-stride", type=int, default=1)
     parser.add_argument("--predict", type=int, default=128)
     parser.add_argument("--repetitions", type=int, default=1)
     parser.add_argument("--trace", action="store_true")
@@ -65,7 +67,7 @@ def parse_args():
 
 
 def make_args(args, model, context, ratio, horizon, mode, kernel):
-    rounds = math.ceil(horizon / args.gamma) + 2
+    rounds = max(args.dense_interval, math.ceil(horizon / args.gamma) + 2)
     return SimpleNamespace(
         binary=args.binary,
         model=model["model"],
@@ -87,8 +89,10 @@ def make_args(args, model, context, ratio, horizon, mode, kernel):
         hier_max_tokens=horizon,
         hier_max_rounds=rounds,
         hier_max_corrections=rounds,
+        hier_dense_interval=args.dense_interval,
+        hier_rs_checkpoint_stride=args.rs_checkpoint_stride,
         hier_trace=args.trace,
-        hier_recompute_state=model["recurrent"] and horizon > 10,
+        hier_recompute_state=model["recurrent"] and horizon > 10 and args.dense_interval == 0,
         same_prefix_trace=False,
         mtp_ubatch=64,
         ratio=ratio,
@@ -147,6 +151,8 @@ def compact_row(row):
             "sparse_ms": row["hierarchical_sparse_ms"],
             "dense_ms": row["hierarchical_dense_ms"],
             "recompute_ms": row["hierarchical_recompute_ms"],
+            "direct_dense_rounds": row.get("hierarchical_direct_dense_rounds", 0),
+            "replayed_updates": row.get("hierarchical_recurrent_replayed_updates", 0),
             "provisional_histogram": row["hierarchical_provisional_histogram"],
             "state_failures": (
                 row["hierarchical_snapshot_failures"]
@@ -179,6 +185,8 @@ def ensure_manifest(args):
         "ratios": args.ratios,
         "horizons": args.horizons,
         "gamma": args.gamma,
+        "dense_interval": args.dense_interval,
+        "rs_checkpoint_stride": args.rs_checkpoint_stride,
         "predict": args.predict,
         "repetitions": args.repetitions,
     }

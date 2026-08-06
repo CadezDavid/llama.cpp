@@ -48,6 +48,8 @@ def parse_args():
     parser.add_argument("--hier-max-tokens", type=int, default=10)
     parser.add_argument("--hier-max-rounds", type=int, default=3)
     parser.add_argument("--hier-max-corrections", type=int, default=2)
+    parser.add_argument("--hier-dense-interval", type=int, default=0)
+    parser.add_argument("--hier-rs-checkpoint-stride", type=int, default=1)
     parser.add_argument("--hier-trace", action="store_true")
     parser.add_argument("--hier-recompute-state", action="store_true")
     parser.add_argument("--same-prefix-trace", action="store_true")
@@ -141,6 +143,11 @@ def command_for(args, mode):
             "--vegas-hier-max-rounds", str(args.hier_max_rounds),
             "--vegas-hier-max-corrections", str(args.hier_max_corrections),
         ])
+        if getattr(args, "hier_dense_interval", 0) > 0:
+            command.extend([
+                "--vegas-hier-dense-interval", str(args.hier_dense_interval),
+                "--vegas-hier-rs-checkpoint-stride", str(args.hier_rs_checkpoint_stride),
+            ])
         if args.hier_trace:
             command.append("--vegas-hier-trace")
         if getattr(args, "hier_recompute_state", False):
@@ -211,6 +218,8 @@ def run_one(args, mode, repetition, order):
         "requested_hier_max_tokens": args.hier_max_tokens,
         "requested_hier_max_rounds": args.hier_max_rounds,
         "requested_hier_max_corrections": args.hier_max_corrections,
+        "requested_hier_dense_interval": getattr(args, "hier_dense_interval", 0),
+        "requested_hier_rs_checkpoint_stride": getattr(args, "hier_rs_checkpoint_stride", 1),
         "requested_hier_trace": args.hier_trace,
         "requested_hier_recompute_state": getattr(args, "hier_recompute_state", False),
         "requested_same_prefix_trace": getattr(args, "same_prefix_trace", False),

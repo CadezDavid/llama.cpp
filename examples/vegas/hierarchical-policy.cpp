@@ -10,6 +10,10 @@ int32_t vegas_hierarchical_valid_batch_inputs(
     return accepted_draft_tokens + (correction || extension ? 1 : 0);
 }
 
+bool vegas_hierarchical_is_dense_round(int32_t round, int32_t dense_interval) {
+    return dense_interval > 0 && round >= 0 && (round + 1) % dense_interval == 0;
+}
+
 vegas_hierarchical_stop vegas_hierarchical_should_stop(
         const vegas_hierarchical_limits & limits,
         int32_t provisional_tokens,
@@ -52,6 +56,7 @@ const char * vegas_hierarchical_stop_name(vegas_hierarchical_stop stop) {
         case vegas_hierarchical_stop::round_cap:         return "round_cap";
         case vegas_hierarchical_stop::empty_draft:       return "empty_draft";
         case vegas_hierarchical_stop::output_limit:      return "output_limit";
+        case vegas_hierarchical_stop::dense_interval:    return "dense_interval";
     }
     return "unknown";
 }
