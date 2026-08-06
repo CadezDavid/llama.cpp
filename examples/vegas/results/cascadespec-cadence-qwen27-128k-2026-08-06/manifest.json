@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "git_commit": "fdc9006f381a5022dd0062944c728d16f3a5ec39",
+  "binary": "build-vegas/bin/llama-vegas",
+  "model": "/home/david/models/Qwen3.6-27B-MTP/Qwen3.6-27B-UD-Q4_K_XL.gguf",
+  "context": 131584,
+  "prompt_token_budget": 131072,
+  "actual_prompt_tokens": 131038,
+  "predict": 128,
+  "gamma": 4,
+  "dense_interval": 4,
+  "provisional_token_cap": 19,
+  "rs_checkpoint_stride": 4,
+  "sparse_ratio": 0.1,
+  "cache_type_k": "q8_0",
+  "cache_type_v": "q4_0",
+  "temperature": 0.0,
+  "seed": 1234,
+  "conversation_fixture": "/tmp/opencode-vegas-technical-conversations-128k.json",
+  "conversation_sha256": "8d432d98c712426cebafdbbae5a996d3f86c08c3f0a8bbe5f860fecd994421f6",
+  "conversation_sessions": [
+    "ses_23a218cfafferJgVhVdKGJcsAa",
+    "ses_1c4c58710ffeGpqN5FEGz3nseM",
+    "ses_2452593b5ffe6yJELmXEV6x9oM",
+    "ses_1af9879efffe0sg7s2N3kxgaDo"
+  ]
+}

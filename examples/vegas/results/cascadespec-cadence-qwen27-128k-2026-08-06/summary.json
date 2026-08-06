@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "actual_prompt_tokens": 131038,
+  "cascadespec_state_checks_passed": true,
+  "output_hashes_equal": false,
+  "plain_mtp": {
+    "tokens_per_second": 37.27208,
+    "total_ms": 3434.206,
+    "cycles": 33,
+    "draft_ms": 872.382,
+    "verify_ms": 2525.19,
+    "mean_dense_pass_ms": 76.5209,
+    "output_hash": "b26bd385cfed9913"
+  },
+  "cascadespec": {
+    "tokens_per_second": 26.323583,
+    "total_ms": 4862.56,
+    "outer_cycles": 14,
+    "sparse_decodes": 41,
+    "mean_sparse_pass_ms": 61.4624,
+    "mean_dense_pass_ms": 89.0314,
+    "committed_per_dense_cycle": 9.07143,
+    "sparse_agreement": 0.745283,
+    "dense_acceptance": 0.660819,
+    "recurrent_prefix_restores": 55,
+    "recurrent_replayed_updates": 53,
+    "state_failures": 0,
+    "output_hash": "3b22ee6063e9623d"
+  },
+  "speed_change_percent": -29.3745
+}
