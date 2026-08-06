@@ -109,6 +109,16 @@ llama_context::llama_context(
         cparams.n_rs_seq = 0;
     }
 
+    cparams.n_rs_undo = params.n_rs_undo;
+    if (cparams.n_rs_undo > 0 && !llm_arch_supports_rs_rollback(model.arch)) {
+        LLAMA_LOG_DEBUG("%s: n_rs_undo=%u requested but model arch does not support recurrent rollback; clamping to 0\n",
+                        __func__, cparams.n_rs_undo);
+        cparams.n_rs_undo = 0;
+    }
+    if (cparams.n_rs_undo > 0 && cparams.n_seq_max != 1) {
+        throw std::runtime_error("compact recurrent undo logging currently requires n_seq_max=1");
+    }
+
     cparams.n_threads               = params.n_threads;
     cparams.n_threads_batch         = params.n_threads_batch;
     cparams.type_k                  = params.type_k;
@@ -316,6 +326,7 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: freq_base     = %.1f\n", __func__, cparams.rope_freq_base);
     LLAMA_LOG_INFO("%s: freq_scale    = %g\n",   __func__, cparams.rope_freq_scale);
     LLAMA_LOG_INFO("%s: n_rs_seq      = %u\n",   __func__, cparams.n_rs_seq);
+    LLAMA_LOG_INFO("%s: n_rs_undo     = %u\n",   __func__, cparams.n_rs_undo);
     LLAMA_LOG_INFO("%s: n_outputs_max = %u\n",   __func__, cparams.n_outputs_max);
 
     if (cparams.n_ctx_seq < hparams.n_ctx_train) {
@@ -3871,6 +3882,7 @@ llama_context_params llama_context_default_params() {
         /*.n_ubatch                    =*/ 512,
         /*.n_seq_max                   =*/ 1,
         /*.n_rs_seq                    =*/ 0,
+        /*.n_rs_undo                   =*/ 0,
         /*.n_outputs_max               =*/ 0,
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
         /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,

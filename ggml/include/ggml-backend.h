@@ -221,7 +221,12 @@ extern "C" {
             struct ggml_tensor       * state,
             const struct ggml_tensor * k,
             const struct ggml_tensor * delta,
-            const struct ggml_tensor * g,
+            const struct ggml_tensor * decay,
+            int64_t                    n_undo,
+            float                    * elapsed_ms);
+    typedef bool (*ggml_backend_recurrent_conv_undo_t)(
+            struct ggml_tensor       * state,
+            const struct ggml_tensor * evicted,
             int64_t                    n_undo,
             float                    * elapsed_ms);
     // Get a list of feature flags supported by the backend (returns a NULL-terminated array)

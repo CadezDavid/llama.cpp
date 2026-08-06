@@ -25,6 +25,7 @@ llama_memory_recurrent::llama_memory_recurrent(
                  uint32_t   mem_size,
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
+                 uint32_t   n_rs_undo,
     const layer_filter_cb & filter) : hparams(model.hparams), n_seq_max(n_seq_max) {
     const int32_t n_layer = hparams.n_layer();
 
@@ -33,6 +34,7 @@ llama_memory_recurrent::llama_memory_recurrent(
     used = 0;
 
     this->n_rs_seq = n_rs_seq;
+    this->n_rs_undo = n_rs_undo;
     rs_idx.assign(n_seq_max, 0);
 
     cells.clear();
@@ -51,7 +53,7 @@ llama_memory_recurrent::llama_memory_recurrent(
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
-                /*.mem_size   =*/ size_t((n_rs_seq > 0 ? 4u : 2u)*n_layer*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t(((n_rs_seq > 0 ? 4u : 2u) + (n_rs_undo > 0 ? 4u : 0u))*n_layer*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -73,6 +75,10 @@ llama_memory_recurrent::llama_memory_recurrent(
     s_l.resize(n_layer);
     r_checkpoint_l.resize(n_layer);
     s_checkpoint_l.resize(n_layer);
+    undo_k_l.resize(n_layer);
+    undo_delta_l.resize(n_layer);
+    undo_decay_l.resize(n_layer);
+    undo_conv_l.resize(n_layer);
 
     for (int i = 0; i < n_layer; i++) {
         if (filter && !filter(i)) {
@@ -113,6 +119,32 @@ llama_memory_recurrent::llama_memory_recurrent(
             r_checkpoint_l[i] = r_checkpoint;
             s_checkpoint_l[i] = s_checkpoint;
         }
+        if (n_rs_undo > 0) {
+            const int64_t s_head = hparams.ssm_d_state;
+            const int64_t h_k = hparams.ssm_n_group;
+            GGML_ASSERT(s_head > 0 && h_k > 0 && hparams.ssm_d_inner % s_head == 0);
+            const int64_t h_v = hparams.ssm_d_inner / s_head;
+            const int64_t conv_channels = hparams.ssm_d_inner + 2*h_k*s_head;
+
+            ggml_tensor * undo_k = ggml_new_tensor_4d(ctx, GGML_TYPE_F32,
+                    s_head, h_k, n_rs_undo, n_seq_max);
+            ggml_tensor * undo_delta = ggml_new_tensor_4d(ctx, GGML_TYPE_F32,
+                    s_head, h_v, n_rs_undo, n_seq_max);
+            ggml_tensor * undo_decay = ggml_new_tensor_4d(ctx, GGML_TYPE_F32,
+                    1, h_v, n_rs_undo, n_seq_max);
+            // Keep time as the innermost dimension so a strided view of the
+            // convolution input can be copied without a transpose.
+            ggml_tensor * undo_conv = ggml_new_tensor_3d(ctx, GGML_TYPE_F32,
+                    n_rs_undo, conv_channels, n_seq_max);
+            ggml_format_name(undo_k, "cache_undo_k_l%d", i);
+            ggml_format_name(undo_delta, "cache_undo_delta_l%d", i);
+            ggml_format_name(undo_decay, "cache_undo_decay_l%d", i);
+            ggml_format_name(undo_conv, "cache_undo_conv_l%d", i);
+            undo_k_l[i] = undo_k;
+            undo_delta_l[i] = undo_delta;
+            undo_decay_l[i] = undo_decay;
+            undo_conv_l[i] = undo_conv;
+        }
     }
 
     // allocate tensors and initialize the buffers to avoid NaNs in the padding
@@ -129,11 +161,14 @@ llama_memory_recurrent::llama_memory_recurrent(
     {
         const size_t memory_size_r = size_r_bytes();
         const size_t memory_size_s = size_s_bytes();
+        const size_t memory_size_undo = size_undo_bytes();
 
-        LLAMA_LOG_INFO("%s: size = %7.2f MiB (%6u cells, %3d layers, %2u seqs %2u rs_seq), R (%s): %7.2f MiB, S (%s): %7.2f MiB\n", __func__,
-                (float)(memory_size_r + memory_size_s) / (1024.0f * 1024.0f), mem_size, n_layer, n_seq_max, n_rs_seq,
+        LLAMA_LOG_INFO("%s: size = %7.2f MiB (%6u cells, %3d layers, %2u seqs %2u rs_seq %2u undo), R (%s): %7.2f MiB, S (%s): %7.2f MiB, undo: %7.2f MiB\n", __func__,
+                (float)(memory_size_r + memory_size_s + memory_size_undo) / (1024.0f * 1024.0f), mem_size, n_layer, n_seq_max, n_rs_seq,
+                n_rs_undo,
                 ggml_type_name(type_r), (float)memory_size_r / (1024.0f * 1024.0f),
-                ggml_type_name(type_s), (float)memory_size_s / (1024.0f * 1024.0f));
+                ggml_type_name(type_s), (float)memory_size_s / (1024.0f * 1024.0f),
+                (float)memory_size_undo / (1024.0f * 1024.0f));
     }
 }
 
@@ -478,6 +513,94 @@ void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {
     rs_idx[seq_id] = (idx > n_rs_seq) ? n_rs_seq : idx;
 }
 
+bool llama_memory_recurrent::undo(uint32_t n_undo, float * gdn_ms, float * conv_ms) {
+    if (n_rs_undo == 0 || n_undo == 0 || n_undo > n_rs_undo || size != 1 || n_seq_max != 1) {
+        return false;
+    }
+
+    float total_gdn = 0.0f;
+    float total_conv = 0.0f;
+    for (size_t il = 0; il < s_l.size(); ++il) {
+        if (!s_l[il]) {
+            continue;
+        }
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(s_l[il]->buffer);
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        auto undo_gdn = reg ? (ggml_backend_gated_delta_net_undo_t)
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_gated_delta_net_undo") : nullptr;
+        auto undo_conv = reg ? (ggml_backend_recurrent_conv_undo_t)
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_recurrent_conv_undo") : nullptr;
+        if (!undo_gdn || !undo_conv) {
+            LLAMA_LOG_ERROR("%s: recurrent undo kernels are unavailable for layer %zu\n", __func__, il);
+            return false;
+        }
+
+        const int64_t S = hparams.ssm_d_state;
+        const int64_t H = hparams.ssm_d_inner / S;
+        const int64_t conv_channels = hparams.ssm_d_inner + 2*hparams.ssm_n_group*S;
+        const int64_t window = hparams.ssm_d_conv - 1;
+
+        ggml_tensor state_s = *s_l[il];
+        state_s.ne[0] = S;
+        state_s.ne[1] = S;
+        state_s.ne[2] = H;
+        state_s.ne[3] = 1;
+        state_s.nb[0] = sizeof(float);
+        state_s.nb[1] = S*sizeof(float);
+        state_s.nb[2] = S*S*sizeof(float);
+        state_s.nb[3] = S*S*H*sizeof(float);
+
+        ggml_tensor state_r = *r_l[il];
+        state_r.ne[0] = window;
+        state_r.ne[1] = conv_channels;
+        state_r.ne[2] = 1;
+        state_r.ne[3] = 1;
+        state_r.nb[0] = sizeof(float);
+        state_r.nb[1] = window*sizeof(float);
+        state_r.nb[2] = window*conv_channels*sizeof(float);
+        state_r.nb[3] = state_r.nb[2];
+
+        // Logging always starts at slot zero for the diagnostic tail. Narrow
+        // the logical token dimension so the GDN inverse starts at the last
+        // token actually recorded, not at the end of the allocation.
+        ggml_tensor undo_k = *undo_k_l[il];
+        ggml_tensor undo_delta = *undo_delta_l[il];
+        ggml_tensor undo_decay = *undo_decay_l[il];
+        undo_k.ne[2] = undo_delta.ne[2] = undo_decay.ne[2] = n_undo;
+        undo_k.ne[3] = undo_delta.ne[3] = undo_decay.ne[3] = 1;
+
+        float layer_gdn = 0.0f;
+        float layer_conv = 0.0f;
+        if (!undo_gdn(&state_s, &undo_k, &undo_delta, &undo_decay, n_undo, &layer_gdn) ||
+                !undo_conv(&state_r, undo_conv_l[il], n_undo, &layer_conv)) {
+            return false;
+        }
+        total_gdn += layer_gdn;
+        total_conv += layer_conv;
+    }
+    if (gdn_ms) {
+        *gdn_ms = total_gdn;
+    }
+    if (conv_ms) {
+        *conv_ms = total_conv;
+    }
+    return true;
+}
+
+bool llama_memory_recurrent::set_pos_after_undo(llama_seq_id seq_id, llama_pos pos) {
+    if (seq_id < 0 || (size_t) seq_id >= cells.size()) {
+        return false;
+    }
+    const int32_t tail_id = cells[seq_id].tail;
+    if (tail_id < 0) {
+        return false;
+    }
+    cells[tail_id].pos = pos;
+    set_rs_idx(seq_id, 0);
+    return true;
+}
+
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
     for (const auto & [_, buf] : ctxs_bufs) {
@@ -820,6 +943,18 @@ size_t llama_memory_recurrent::size_s_bytes() const {
     }
 
     return size_s_bytes;
+}
+
+size_t llama_memory_recurrent::size_undo_bytes() const {
+    size_t result = 0;
+    for (const auto & tensors : { &undo_k_l, &undo_delta_l, &undo_decay_l, &undo_conv_l }) {
+        for (const ggml_tensor * tensor : *tensors) {
+            if (tensor) {
+                result += ggml_nbytes(tensor);
+            }
+        }
+    }
+    return result;
 }
 
 void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
@@ -1333,6 +1468,26 @@ ggml_tensor * llama_memory_recurrent_context::get_r_l(int32_t il) const {
 
 ggml_tensor * llama_memory_recurrent_context::get_s_l(int32_t il) const {
     return mem->s_l[il];
+}
+
+ggml_tensor * llama_memory_recurrent_context::get_undo_k_l(int32_t il) const {
+    return mem->undo_k_l[il];
+}
+
+ggml_tensor * llama_memory_recurrent_context::get_undo_delta_l(int32_t il) const {
+    return mem->undo_delta_l[il];
+}
+
+ggml_tensor * llama_memory_recurrent_context::get_undo_decay_l(int32_t il) const {
+    return mem->undo_decay_l[il];
+}
+
+ggml_tensor * llama_memory_recurrent_context::get_undo_conv_l(int32_t il) const {
+    return mem->undo_conv_l[il];
+}
+
+uint32_t llama_memory_recurrent_context::get_n_rs_undo() const {
+    return mem->n_rs_undo;
 }
 
 int32_t llama_memory_recurrent_context::s_copy(int i) const {

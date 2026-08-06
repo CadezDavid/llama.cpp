@@ -60,6 +60,7 @@ int main() {
     ggml_tensor * k = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, S, H_K, T, N);
     ggml_tensor * v = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, S, H, T, N);
     ggml_tensor * g = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, 1, H, T, N);
+    ggml_tensor * decay = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, 1, H, T, N);
     ggml_tensor * b = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, 1, H, T, N);
     ggml_tensor * state0 = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, S, S, H, N);
     ggml_tensor * out = ggml_gated_delta_net_ext(ctx.get(), q, k, v, g, b, state0, K, true);
@@ -82,12 +83,14 @@ int main() {
     std::vector<float> k_h(ggml_nelements(k));
     std::vector<float> v_h(ggml_nelements(v));
     std::vector<float> g_h(ggml_nelements(g));
+    std::vector<float> decay_h(ggml_nelements(decay));
     std::vector<float> b_h(ggml_nelements(b));
     std::vector<float> state0_h(ggml_nelements(state0));
     fill_random(q_h, -0.2f, 0.2f, 1);
     fill_random(k_h, -0.1f, 0.1f, 2);
     fill_random(v_h, -0.3f, 0.3f, 3);
     fill_random(g_h, -0.10f, -0.001f, 4);
+    std::transform(g_h.begin(), g_h.end(), decay_h.begin(), [](float x) { return std::exp(x); });
     fill_random(b_h, 0.01f, 0.99f, 5);
     fill_random(state0_h, -0.1f, 0.1f, 6);
 
@@ -95,6 +98,7 @@ int main() {
     ggml_backend_tensor_set(k, k_h.data(), 0, ggml_nbytes(k));
     ggml_backend_tensor_set(v, v_h.data(), 0, ggml_nbytes(v));
     ggml_backend_tensor_set(g, g_h.data(), 0, ggml_nbytes(g));
+    ggml_backend_tensor_set(decay, decay_h.data(), 0, ggml_nbytes(decay));
     ggml_backend_tensor_set(b, b_h.data(), 0, ggml_nbytes(b));
     ggml_backend_tensor_set(state0, state0_h.data(), 0, ggml_nbytes(state0));
     GGML_ASSERT(ggml_backend_graph_compute(backend.get(), gf) == GGML_STATUS_SUCCESS);
@@ -111,7 +115,7 @@ int main() {
     for (int64_t depth : { 1, 4, 8, 16 }) {
         ggml_backend_tensor_set(final_state, final_h.data(), 0, state_bytes);
         float elapsed_ms = 0.0f;
-        GGML_ASSERT(undo(final_state, k, delta, g, depth, &elapsed_ms));
+        GGML_ASSERT(undo(final_state, k, delta, decay, depth, &elapsed_ms));
 
         std::vector<float> actual(final_h.size());
         std::vector<float> expected(final_h.size());

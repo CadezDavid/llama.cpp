@@ -24,6 +24,7 @@ public:
                      uint32_t   mem_size,
                      uint32_t   n_seq_max,
                      uint32_t   n_rs_seq,
+                     uint32_t   n_rs_undo,
         const layer_filter_cb & filter);
 
     ~llama_memory_recurrent() = default;
@@ -74,11 +75,18 @@ public:
 
     // number of recurrent-state snapshots per seq for rollback; tensors are widened to (1 + n_rs_seq) groups
     uint32_t n_rs_seq = 0;
+    uint32_t n_rs_undo = 0;
 
     // per-seq rollback index
     std::vector<uint32_t> rs_idx;
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
+
+    // Experimental compact rollback support. The caller must first remove the
+    // corresponding attention-KV positions, then update the recurrent cell's
+    // logical position with set_pos_after_undo().
+    bool undo(uint32_t n_undo, float * gdn_ms, float * conv_ms);
+    bool set_pos_after_undo(llama_seq_id seq_id, llama_pos pos);
 
     // computed before each graph build
     uint32_t n = 0;
@@ -125,6 +133,13 @@ public:
     std::vector<ggml_tensor *> r_checkpoint_l;
     std::vector<ggml_tensor *> s_checkpoint_l;
 
+    // Compact per-token data required to reverse gated-delta and convolution
+    // updates. These tensors exist only when n_rs_undo > 0.
+    std::vector<ggml_tensor *> undo_k_l;
+    std::vector<ggml_tensor *> undo_delta_l;
+    std::vector<ggml_tensor *> undo_decay_l;
+    std::vector<ggml_tensor *> undo_conv_l;
+
 private:
     //const llama_model & model;
     const llama_hparams & hparams;
@@ -138,6 +153,7 @@ private:
 
     size_t size_r_bytes() const;
     size_t size_s_bytes() const;
+    size_t size_undo_bytes() const;
 
     void state_write_meta(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id = -1) const;
     void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const;
@@ -183,6 +199,11 @@ public:
 
     ggml_tensor * get_r_l(int32_t il) const;
     ggml_tensor * get_s_l(int32_t il) const;
+    ggml_tensor * get_undo_k_l(int32_t il) const;
+    ggml_tensor * get_undo_delta_l(int32_t il) const;
+    ggml_tensor * get_undo_decay_l(int32_t il) const;
+    ggml_tensor * get_undo_conv_l(int32_t il) const;
+    uint32_t get_n_rs_undo() const;
 
     int32_t s_copy(int i) const;
 

@@ -344,7 +344,7 @@ __global__ void gated_delta_net_undo_cuda(
         float       * state,
         const float * k,
         const float * delta,
-        const float * g,
+        const float * decay,
         int64_t       H,
         int64_t       H_k,
         int64_t       n_tokens,
@@ -375,13 +375,12 @@ __global__ void gated_delta_net_undo_cuda(
         const int64_t t = n_tokens - 1 - step;
         const float * k_t = k + (sequence * n_tokens * H_k + t * H_k + k_head) * S_v;
         const float delta_col = delta[(sequence * n_tokens * H + t * H + h_idx) * S_v + col];
-        const float * g_t = g + (sequence * n_tokens * H + t * H + h_idx) * (KDA ? S_v : 1);
+        const float * decay_t = decay + (sequence * n_tokens * H + t * H + h_idx) * (KDA ? S_v : 1);
 
 #pragma unroll
         for (int r = 0; r < rows_per_lane; ++r) {
             const int i = r * warp_size + lane;
-            const float decay = expf(g_t[KDA ? i : 0]);
-            s_shard[r] = (s_shard[r] - k_t[i] * delta_col) / decay;
+            s_shard[r] = (s_shard[r] - k_t[i] * delta_col) / decay_t[KDA ? i : 0];
         }
     }
 
@@ -397,7 +396,7 @@ static void launch_gated_delta_net_undo(
         float       * state,
         const float * k,
         const float * delta,
-        const float * g,
+        const float * decay,
         int64_t S_v,
         int64_t H,
         int64_t H_k,
@@ -412,7 +411,7 @@ static void launch_gated_delta_net_undo(
     const ggml_cuda_kernel_launch_params params(grid, block, 0, stream);
 
 #define LAUNCH_UNDO(SV) ggml_cuda_kernel_launch(gated_delta_net_undo_cuda<SV, KDA>, params, \
-        state, k, delta, g, H, H_k, n_tokens, n_undo)
+        state, k, delta, decay, H, H_k, n_tokens, n_undo)
     switch (S_v) {
         case 16:  LAUNCH_UNDO(16);  break;
         case 32:  LAUNCH_UNDO(32);  break;
@@ -427,14 +426,14 @@ bool ggml_cuda_gated_delta_net_undo(
         ggml_tensor       * state,
         const ggml_tensor * k,
         const ggml_tensor * delta,
-        const ggml_tensor * g,
+        const ggml_tensor * decay,
         int64_t             n_undo,
         float             * elapsed_ms) {
-    GGML_ASSERT(state && k && delta && g);
+    GGML_ASSERT(state && k && delta && decay);
     GGML_ASSERT(state->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F32 &&
-                delta->type == GGML_TYPE_F32 && g->type == GGML_TYPE_F32);
+                delta->type == GGML_TYPE_F32 && decay->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_is_contiguous(state) && ggml_is_contiguous(k) &&
-                ggml_is_contiguous(delta) && ggml_is_contiguous(g));
+                ggml_is_contiguous(delta) && ggml_is_contiguous(decay));
 
     const int64_t S_v = state->ne[0];
     const int64_t H = state->ne[2];
@@ -444,8 +443,8 @@ bool ggml_cuda_gated_delta_net_undo(
     GGML_ASSERT(state->ne[1] == S_v && delta->ne[0] == S_v && delta->ne[1] == H);
     GGML_ASSERT(delta->ne[2] == n_tokens && delta->ne[3] == n_seqs);
     GGML_ASSERT(k->ne[0] == S_v && k->ne[3] == n_seqs && H % H_k == 0);
-    GGML_ASSERT((g->ne[0] == 1 || g->ne[0] == S_v) && g->ne[1] == H &&
-                g->ne[2] == n_tokens && g->ne[3] == n_seqs);
+    GGML_ASSERT((decay->ne[0] == 1 || decay->ne[0] == S_v) && decay->ne[1] == H &&
+                decay->ne[2] == n_tokens && decay->ne[3] == n_seqs);
     GGML_ASSERT(n_undo >= 0 && n_undo <= n_tokens);
 
     cudaEvent_t start;
@@ -454,16 +453,71 @@ bool ggml_cuda_gated_delta_net_undo(
     CUDA_CHECK(cudaEventCreate(&stop));
     CUDA_CHECK(cudaEventRecord(start, cudaStreamPerThread));
 
-    if (g->ne[0] == S_v) {
+    if (decay->ne[0] == S_v) {
         launch_gated_delta_net_undo<true>((float *) state->data, (const float *) k->data,
-                (const float *) delta->data, (const float *) g->data,
+                (const float *) delta->data, (const float *) decay->data,
                 S_v, H, H_k, n_tokens, n_seqs, n_undo, cudaStreamPerThread);
     } else {
         launch_gated_delta_net_undo<false>((float *) state->data, (const float *) k->data,
-                (const float *) delta->data, (const float *) g->data,
+                (const float *) delta->data, (const float *) decay->data,
                 S_v, H, H_k, n_tokens, n_seqs, n_undo, cudaStreamPerThread);
     }
 
+    CUDA_CHECK(cudaEventRecord(stop, cudaStreamPerThread));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+    if (elapsed_ms) {
+        CUDA_CHECK(cudaEventElapsedTime(elapsed_ms, start, stop));
+    }
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+    return true;
+}
+
+__global__ void recurrent_conv_undo_cuda(
+        float       * state,
+        const float * evicted,
+        int64_t       window,
+        int64_t       channels,
+        int64_t       capacity,
+        int64_t       n_undo) {
+    const int64_t channel = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (channel >= channels) {
+        return;
+    }
+
+    float * state_c = state + channel * window;
+    const float * evicted_c = evicted + channel * capacity;
+    for (int64_t step = 0; step < n_undo; ++step) {
+        for (int64_t j = window - 1; j > 0; --j) {
+            state_c[j] = state_c[j - 1];
+        }
+        state_c[0] = evicted_c[n_undo - 1 - step];
+    }
+}
+
+bool ggml_cuda_recurrent_conv_undo(
+        ggml_tensor       * state,
+        const ggml_tensor * evicted,
+        int64_t             n_undo,
+        float             * elapsed_ms) {
+    GGML_ASSERT(state && evicted);
+    GGML_ASSERT(state->type == GGML_TYPE_F32 && evicted->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(state) && ggml_is_contiguous(evicted));
+    const int64_t window = state->ne[0];
+    const int64_t channels = state->ne[1];
+    const int64_t capacity = evicted->ne[0];
+    GGML_ASSERT(state->ne[2] == 1 && evicted->ne[1] == channels && evicted->ne[2] == 1);
+    GGML_ASSERT(n_undo >= 0 && n_undo <= capacity);
+
+    cudaEvent_t start;
+    cudaEvent_t stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+    CUDA_CHECK(cudaEventRecord(start, cudaStreamPerThread));
+    recurrent_conv_undo_cuda<<<(channels + 255) / 256, 256, 0, cudaStreamPerThread>>>(
+            (float *) state->data, (const float *) evicted->data,
+            window, channels, capacity, n_undo);
+    CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaEventRecord(stop, cudaStreamPerThread));
     CUDA_CHECK(cudaEventSynchronize(stop));
     if (elapsed_ms) {

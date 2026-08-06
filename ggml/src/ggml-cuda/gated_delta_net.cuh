@@ -17,6 +17,12 @@ bool ggml_cuda_gated_delta_net_undo(
         ggml_tensor       * state,
         const ggml_tensor * k,
         const ggml_tensor * delta,
-        const ggml_tensor * g,
+        const ggml_tensor * decay,
+        int64_t             n_undo,
+        float             * elapsed_ms);
+
+bool ggml_cuda_recurrent_conv_undo(
+        ggml_tensor       * state,
+        const ggml_tensor * evicted,
         int64_t             n_undo,
         float             * elapsed_ms);

@@ -472,6 +472,22 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
     ggml_tensor * conv_input = ggml_concat(ctx0, conv_states, qkv_mixed, 0);
     cb(conv_input, "conv_input", il);
 
+    if (mctx_cur->get_n_rs_undo() > 0 && qkv_mixed->ne[0] <= mctx_cur->get_n_rs_undo()) {
+        const int64_t capacity = mctx_cur->get_n_rs_undo();
+        GGML_ASSERT(n_seqs == 1);
+        ggml_tensor * undo_conv = mctx_cur->get_undo_conv_l(il);
+        GGML_ASSERT(undo_conv && undo_conv->ne[0] == capacity && undo_conv->ne[1] == conv_channels);
+
+        // conv_input[t, channel] is exactly the slice evicted by token t.
+        ggml_tensor * evicted = ggml_view_3d(ctx0, conv_input,
+                qkv_mixed->ne[0], conv_channels, n_seqs,
+                conv_input->nb[1], conv_input->nb[2], 0);
+        ggml_tensor * undo_dst = ggml_view_3d(ctx0, undo_conv,
+                qkv_mixed->ne[0], conv_channels, n_seqs,
+                undo_conv->nb[1], undo_conv->nb[2], 0);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, evicted, undo_dst));
+    }
+
     const int64_t row_count = (conv_kernel_size - 1) * conv_channels;
 
     const size_t row_size  = ggml_row_size(conv_states_all->type, row_count);
@@ -544,8 +560,10 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const int64_t n_seq_tokens = q->ne[2];
 
     const bool keep = cparams.n_rs_seq > 0;
+    const bool log_undo = mctx_cur->get_n_rs_undo() > 0 &&
+            n_seq_tokens <= mctx_cur->get_n_rs_undo();
 
-    if (!keep) {
+    if (!keep && !log_undo) {
         auto attn_out = build_delta_net(q, k, v, g, b, s, il);
         ggml_tensor * output    = attn_out.first;
         ggml_tensor * new_state = attn_out.second;
@@ -561,10 +579,10 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     }
 
     const int64_t D = S_v * S_v * H_v;
-    const int64_t K = cparams.n_rs_seq + 1;
+    const int64_t K = keep ? cparams.n_rs_seq + 1 : 1;
 
     // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
-    ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
+    ggml_tensor * gdn_out = ggml_gated_delta_net_ext(ctx0, q, k, v, g, b, s, K, log_undo);
     if (n_seq_tokens > 1) {
         res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
     } else {
@@ -581,6 +599,42 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         ggml_row_size(gdn_out->type, S_v * H_v * n_seq_tokens),
         0);
     cb(output, "attn_output", il);
+
+    std::vector<ggml_tensor *> undo_copies;
+    if (log_undo) {
+        GGML_ASSERT(n_seqs == 1);
+
+        ggml_tensor * undo_k = mctx_cur->get_undo_k_l(il);
+        ggml_tensor * undo_delta = mctx_cur->get_undo_delta_l(il);
+        ggml_tensor * undo_decay = mctx_cur->get_undo_decay_l(il);
+        GGML_ASSERT(undo_k && undo_delta && undo_decay);
+        GGML_ASSERT(undo_k->ne[0] == k->ne[0] && undo_k->ne[1] == k->ne[1]);
+
+        ggml_tensor * k_dst = ggml_view_4d(ctx0, undo_k,
+                k->ne[0], k->ne[1], n_seq_tokens, n_seqs,
+                undo_k->nb[1], undo_k->nb[2], undo_k->nb[3], 0);
+        ggml_tensor * decay_dst = ggml_view_4d(ctx0, undo_decay,
+                g->ne[0], g->ne[1], n_seq_tokens, n_seqs,
+                undo_decay->nb[1], undo_decay->nb[2], undo_decay->nb[3], 0);
+
+        const size_t delta_offset = ggml_row_size(gdn_out->type,
+                attn_score_elems + K * state_size_per_snap);
+        ggml_tensor * delta = ggml_view_4d(ctx0, gdn_out,
+                S_v, H_v, n_seq_tokens, n_seqs,
+                ggml_row_size(gdn_out->type, S_v),
+                ggml_row_size(gdn_out->type, S_v * H_v),
+                ggml_row_size(gdn_out->type, S_v * H_v * n_seq_tokens),
+                delta_offset);
+        ggml_tensor * delta_dst = ggml_view_4d(ctx0, undo_delta,
+                S_v, H_v, n_seq_tokens, n_seqs,
+                undo_delta->nb[1], undo_delta->nb[2], undo_delta->nb[3], 0);
+
+        undo_copies.push_back(ggml_cpy(ctx0, k, k_dst));
+        // The forward op consumes log-decay g and internally exponentiates it.
+        // Persist the actual decay so the inverse kernel does not repeat exp().
+        undo_copies.push_back(ggml_cpy(ctx0, ggml_exp(ctx0, g), decay_dst));
+        undo_copies.push_back(ggml_cpy(ctx0, delta, delta_dst));
+    }
 
     const size_t row_size = hparams.n_embd_s() * ggml_element_size(ssm_states_all);
 
@@ -601,6 +655,12 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         (size_t) kv_head * row_size);
 
     ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
+
+    // Keep the cache copy immediately after GDN so CUDA can fuse it into the
+    // forward kernel. The compact log copies are intentionally expanded last.
+    for (ggml_tensor * copy : undo_copies) {
+        ggml_build_forward_expand(gf, copy);
+    }
 
     return output;
 }

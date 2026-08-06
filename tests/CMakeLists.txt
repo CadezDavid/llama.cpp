@@ -150,6 +150,8 @@ endif ()
 
 llama_build(test-recurrent-state-rollback.cpp)
 llama_build(test-gated-delta-undo.cpp)
+llama_build(test-recurrent-undo-model.cpp)
+target_include_directories(test-recurrent-undo-model PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)

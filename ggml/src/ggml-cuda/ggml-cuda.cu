@@ -5390,6 +5390,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_gated_delta_net_undo") == 0) {
         return (void *)ggml_cuda_gated_delta_net_undo;
     }
+    if (strcmp(name, "ggml_backend_recurrent_conv_undo") == 0) {
+        return (void *)ggml_cuda_recurrent_conv_undo;
+    }
     return nullptr;
 }
 
