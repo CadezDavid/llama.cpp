@@ -1,0 +1,28 @@
+{
+  "binary": "build-vegas/bin/llama-vegas",
+  "cache_type_k": "q8_0",
+  "cache_type_v": "q4_0",
+  "context": 36864,
+  "conversation_file": "/tmp/opencode-vegas-technical-conversations.json",
+  "conversation_sha256": "3316a98b7179abeea4c4bb14987b2c12b051831cd021b45824409044a40004b7",
+  "dense_input_row_cap": 20,
+  "dense_interval": 4,
+  "gamma": 4,
+  "git_commit": "8aad2f0b8171c67a8d2055a57a35e919d3230f2c",
+  "models": [
+    "qwen27",
+    "gemma4",
+    "qwen35"
+  ],
+  "modes": [
+    "mtp",
+    "mtp-hierarchical"
+  ],
+  "predict": 128,
+  "prompt_tokens": 32768,
+  "provisional_token_cap": 19,
+  "rs_checkpoint_stride": 4,
+  "schema_version": 1,
+  "seed": 1234,
+  "temperature": 0.0
+}

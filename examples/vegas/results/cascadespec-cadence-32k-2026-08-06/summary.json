@@ -1,0 +1,101 @@
+{
+  "all_cascadespec_state_checks_passed": true,
+  "all_output_hashes_equal": false,
+  "output_hash_note": "Advisory only: changing the dense verification batch length can change floating-point rounding and therefore greedy output, including between two plain-MTP gamma values.",
+  "runs": [
+    {
+      "cascadespec": {
+        "committed_per_dense_cycle": 8.46667,
+        "dense_ms": 946.988,
+        "direct_dense_rounds": 14,
+        "mtp_ms": 525.587,
+        "mtp_process_ms": 88.318,
+        "outer_cycles": 15,
+        "recurrent_checkpoint_copy_ms": 39.248,
+        "recurrent_checkpoint_ms": 55.428,
+        "recurrent_replay_conv_ms": 9.093,
+        "recurrent_replay_gdn_ms": 18.625,
+        "replayed_updates": 55,
+        "rollback_ms": 85.792,
+        "skipped_sparse_decodes": 14,
+        "sparse_ms": 2393.47,
+        "state_failures": 0,
+        "tokens_per_second": 30.771583,
+        "total_ms": 4159.682
+      },
+      "configuration": "qwen27",
+      "output_hash_equal": false,
+      "plain_mtp": {
+        "cycles": 33,
+        "draft_ms": 401.966,
+        "tokens_per_second": 55.256919,
+        "total_ms": 2316.452,
+        "verify_ms": 1889.898
+      },
+      "speedup_percent": -44.311801025315944
+    },
+    {
+      "cascadespec": {
+        "committed_per_dense_cycle": 7.9375,
+        "dense_ms": 1001.06,
+        "direct_dense_rounds": 13,
+        "mtp_ms": 515.189,
+        "mtp_process_ms": 0.561,
+        "outer_cycles": 16,
+        "recurrent_checkpoint_copy_ms": 0,
+        "recurrent_checkpoint_ms": 0,
+        "recurrent_replay_conv_ms": 0,
+        "recurrent_replay_gdn_ms": 0,
+        "replayed_updates": 0,
+        "rollback_ms": 1.059,
+        "skipped_sparse_decodes": 13,
+        "sparse_ms": 1966.6,
+        "state_failures": 0,
+        "tokens_per_second": 36.329485,
+        "total_ms": 3523.309
+      },
+      "configuration": "gemma4",
+      "output_hash_equal": false,
+      "plain_mtp": {
+        "cycles": 43,
+        "draft_ms": 410.735,
+        "tokens_per_second": 51.712847,
+        "total_ms": 2475.207,
+        "verify_ms": 2045.906
+      },
+      "speedup_percent": -29.7476601897397
+    },
+    {
+      "cascadespec": {
+        "committed_per_dense_cycle": 9.76923,
+        "dense_ms": 371.067,
+        "direct_dense_rounds": 12,
+        "mtp_ms": 254.065,
+        "mtp_process_ms": 50.137,
+        "outer_cycles": 13,
+        "recurrent_checkpoint_copy_ms": 17.637,
+        "recurrent_checkpoint_ms": 24.786,
+        "recurrent_replay_conv_ms": 4.494,
+        "recurrent_replay_gdn_ms": 7.558,
+        "replayed_updates": 54,
+        "rollback_ms": 40.231,
+        "skipped_sparse_decodes": 12,
+        "sparse_ms": 634.005,
+        "state_failures": 0,
+        "tokens_per_second": 90.141861,
+        "total_ms": 1419.984
+      },
+      "configuration": "qwen35",
+      "output_hash_equal": false,
+      "plain_mtp": {
+        "cycles": 34,
+        "draft_ms": 209.593,
+        "tokens_per_second": 168.023103,
+        "total_ms": 761.8,
+        "verify_ms": 525.274
+      },
+      "speedup_percent": -46.351507982803994
+    }
+  ],
+  "schema_version": 2
+}
