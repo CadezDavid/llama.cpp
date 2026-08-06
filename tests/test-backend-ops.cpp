@@ -10027,7 +10027,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // gathered causal mask. Dense comparison proves both numerical agreement
     // and that an earlier query cannot attend to later candidate tokens.
     for (int sparse_pattern : {1, 2, 3, 4}) {
-        for (int nb : {2, 4, 8, 21}) {
+        for (int nb : {2, 4, 8, 11, 16, 21}) {
             for (int hs : {256, 512}) {
                 const int gqa = hs == 256 ? 4 : 8;
                 for (const auto cache_types : {

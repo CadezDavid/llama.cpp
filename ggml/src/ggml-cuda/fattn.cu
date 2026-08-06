@@ -305,7 +305,11 @@ static bool ggml_cuda_flash_attn_ext_mma_indexed_normal(
         ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
-    if (Q->ne[0] != D || Q->ne[1] > 4 || Q->ne[2] % K->ne[2] != 0) {
+    // CascadeSpec's largest supported MTP proposal has 10 tokens, hence an
+    // 11-row sparse verification batch (the preceding token plus the draft).
+    // The MMA kernel tiles query rows, so the same 8- or 16-column instances
+    // cover this without one specialization per exact batch length.
+    if (Q->ne[0] != D || Q->ne[1] > 16 || Q->ne[2] % K->ne[2] != 0) {
         return false;
     }
 
@@ -315,8 +319,10 @@ static bool ggml_cuda_flash_attn_ext_mma_indexed_normal(
             ggml_cuda_flash_attn_ext_mma_turbo_case<D, D, 1, 8, type_K, type_V>(ctx, dst);
         } else if (Q->ne[1] <= 2) {
             ggml_cuda_flash_attn_ext_mma_turbo_case<D, D, 2, 8, type_K, type_V>(ctx, dst);
-        } else {
+        } else if (Q->ne[1] <= 4) {
             ggml_cuda_flash_attn_ext_mma_turbo_case<D, D, 4, 8, type_K, type_V>(ctx, dst);
+        } else {
+            ggml_cuda_flash_attn_ext_mma_turbo_case<D, D, 8, 8, type_K, type_V>(ctx, dst);
         }
         return true;
     }
@@ -324,8 +330,12 @@ static bool ggml_cuda_flash_attn_ext_mma_indexed_normal(
         if (gqa_ratio >= 4) {
             if (Q->ne[1] <= 2) {
                 ggml_cuda_flash_attn_ext_mma_turbo_case<D, D, 2, 4, type_K, type_V>(ctx, dst);
-            } else {
+            } else if (Q->ne[1] <= 4) {
                 ggml_cuda_flash_attn_ext_mma_turbo_case<D, D, 4, 4, type_K, type_V>(ctx, dst);
+            } else if (Q->ne[1] <= 8) {
+                ggml_cuda_flash_attn_ext_mma_turbo_case<D, D, 8, 4, type_K, type_V>(ctx, dst);
+            } else {
+                ggml_cuda_flash_attn_ext_mma_turbo_case<D, D, 16, 4, type_K, type_V>(ctx, dst);
             }
             return true;
         }
