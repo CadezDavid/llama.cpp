@@ -11,6 +11,7 @@ gated_delta_net_cuda(const float * q,
                                      const float * curr_state,
                                      float *       dst,
                                      float *       state,
+                                     float *       delta_log,
                                      int64_t       H,
                                      int64_t       n_tokens,
                                      int64_t       n_seqs,
@@ -95,6 +96,10 @@ gated_delta_net_cuda(const float * q,
             // delta[col] = (v[col] - g * kv[col]) * beta
             float delta_col = (v_t[col] - g_val * kv_col) * beta_val;
 
+            if (delta_log != nullptr && lane == 0) {
+                delta_log[(sequence * n_tokens * H + t * H + h_idx) * S_v + col] = delta_col;
+            }
+
             // fused: S[i][col] = g * S[i][col] + k[i] * delta[col]
             // attn[col] = (S^T @ q)[col] = sum_i S[i][col] * q[i]
             float attn_partial = 0.0f;
@@ -122,6 +127,10 @@ gated_delta_net_cuda(const float * q,
 
             // delta[col] = (v[col] - kv[col]) * beta
             float delta_col = (v_t[col] - kv_col) * beta_val;
+
+            if (delta_log != nullptr && lane == 0) {
+                delta_log[(sequence * n_tokens * H + t * H + h_idx) * S_v + col] = delta_col;
+            }
 
             // fused: S[i][col] = g[i] * S[i][col] + k[i] * delta[col]
             // attn[col] = (S^T @ q)[col] = sum_i S[i][col] * q[i]
@@ -170,7 +179,7 @@ template <bool KDA, bool keep_rs_t>
 static void launch_gated_delta_net(
         const float * q_d, const float * k_d, const float * v_d,
         const float * g_d, const float * b_d, const float * s_d,
-        float * dst_d, float * state_d,
+        float * dst_d, float * state_d, float * delta_log_d,
         int64_t S_v,   int64_t H, int64_t n_tokens, int64_t n_seqs,
         int64_t sq1,   int64_t sq2, int64_t sq3,
         int64_t sv1,   int64_t sv2, int64_t sv3,
@@ -190,26 +199,26 @@ static void launch_gated_delta_net(
     switch (S_v) {
         case 16:
             ggml_cuda_kernel_launch(gated_delta_net_cuda<16, KDA, keep_rs_t>, launch_params,
-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
+                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, delta_log_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
             break;
         case 32:
             ggml_cuda_kernel_launch(gated_delta_net_cuda<32, KDA, keep_rs_t>, launch_params,
-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
+                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, delta_log_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
             break;
         case 64: {
             ggml_cuda_kernel_launch(gated_delta_net_cuda<64, KDA, keep_rs_t>, launch_params,
-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
+                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, delta_log_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
             break;
         }
         case 128: {
             ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t>, launch_params,
-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
+                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, delta_log_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
             break;
@@ -285,6 +294,7 @@ static void ggml_cuda_op_gated_delta_net_impl(
     // K (snapshot slot count) is an op param; state holds s0 only [S_v, S_v, H, n_seqs].
     const int K = ggml_get_op_params_i32(dst, 0);
     const bool keep_rs = K > 1;
+    const bool log_delta = ggml_get_op_params_i32(dst, 1) != 0;
 
     // recurrent state -> gdn_out tail (after attention scores), or the cache when fusing
     float * state_d           = dst_d + S_v * H * n_tokens * n_seqs;
@@ -294,23 +304,26 @@ static void ggml_cuda_op_gated_delta_net_impl(
         state_slot_stride = cache->slot_stride;
     }
 
+    float * delta_log_d = log_delta ?
+            dst_d + S_v * H * n_tokens * n_seqs + K * S_v * S_v * H * n_seqs : nullptr;
+
     if (kda) {
         if (keep_rs) {
-            launch_gated_delta_net<true, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
+            launch_gated_delta_net<true, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, delta_log_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
         } else {
-            launch_gated_delta_net<true, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
+            launch_gated_delta_net<true, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, delta_log_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
         }
     } else {
         if (keep_rs) {
-            launch_gated_delta_net<false, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
+            launch_gated_delta_net<false, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, delta_log_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
         } else {
-            launch_gated_delta_net<false, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
+            launch_gated_delta_net<false, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, delta_log_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
         }
@@ -324,4 +337,139 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
 void ggml_cuda_op_gated_delta_net_fused_cache(
         ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_cuda_gated_delta_net_fused_cache cache) {
     ggml_cuda_op_gated_delta_net_impl(ctx, dst, &cache);
+}
+
+template <int S_v, bool KDA>
+__global__ void gated_delta_net_undo_cuda(
+        float       * state,
+        const float * k,
+        const float * delta,
+        const float * g,
+        int64_t       H,
+        int64_t       H_k,
+        int64_t       n_tokens,
+        int64_t       n_undo) {
+    const int h_idx    = blockIdx.x;
+    const int sequence = blockIdx.y;
+    const int lane     = threadIdx.x;
+    const int col      = blockIdx.z * blockDim.y + threadIdx.y;
+
+    if (col >= S_v) {
+        return;
+    }
+
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size() < S_v ?
+            ggml_cuda_get_physical_warp_size() : S_v;
+    constexpr int rows_per_lane = (S_v + warp_size - 1) / warp_size;
+    float s_shard[rows_per_lane];
+    float * state_col = state + (sequence * H + h_idx) * S_v * S_v + col * S_v;
+
+#pragma unroll
+    for (int r = 0; r < rows_per_lane; ++r) {
+        const int i = r * warp_size + lane;
+        s_shard[r] = state_col[i];
+    }
+
+    const int k_head = h_idx % H_k;
+    for (int64_t step = 0; step < n_undo; ++step) {
+        const int64_t t = n_tokens - 1 - step;
+        const float * k_t = k + (sequence * n_tokens * H_k + t * H_k + k_head) * S_v;
+        const float delta_col = delta[(sequence * n_tokens * H + t * H + h_idx) * S_v + col];
+        const float * g_t = g + (sequence * n_tokens * H + t * H + h_idx) * (KDA ? S_v : 1);
+
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; ++r) {
+            const int i = r * warp_size + lane;
+            const float decay = expf(g_t[KDA ? i : 0]);
+            s_shard[r] = (s_shard[r] - k_t[i] * delta_col) / decay;
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < rows_per_lane; ++r) {
+        const int i = r * warp_size + lane;
+        state_col[i] = s_shard[r];
+    }
+}
+
+template <bool KDA>
+static void launch_gated_delta_net_undo(
+        float       * state,
+        const float * k,
+        const float * delta,
+        const float * g,
+        int64_t S_v,
+        int64_t H,
+        int64_t H_k,
+        int64_t n_tokens,
+        int64_t n_seqs,
+        int64_t n_undo,
+        cudaStream_t stream) {
+    const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+    const int num_warps = 4;
+    const dim3 grid(H, n_seqs, (S_v + num_warps - 1) / num_warps);
+    const dim3 block(warp_size <= S_v ? warp_size : S_v, num_warps, 1);
+    const ggml_cuda_kernel_launch_params params(grid, block, 0, stream);
+
+#define LAUNCH_UNDO(SV) ggml_cuda_kernel_launch(gated_delta_net_undo_cuda<SV, KDA>, params, \
+        state, k, delta, g, H, H_k, n_tokens, n_undo)
+    switch (S_v) {
+        case 16:  LAUNCH_UNDO(16);  break;
+        case 32:  LAUNCH_UNDO(32);  break;
+        case 64:  LAUNCH_UNDO(64);  break;
+        case 128: LAUNCH_UNDO(128); break;
+        default: GGML_ABORT("unsupported gated-delta undo head size");
+    }
+#undef LAUNCH_UNDO
+}
+
+bool ggml_cuda_gated_delta_net_undo(
+        ggml_tensor       * state,
+        const ggml_tensor * k,
+        const ggml_tensor * delta,
+        const ggml_tensor * g,
+        int64_t             n_undo,
+        float             * elapsed_ms) {
+    GGML_ASSERT(state && k && delta && g);
+    GGML_ASSERT(state->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F32 &&
+                delta->type == GGML_TYPE_F32 && g->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(state) && ggml_is_contiguous(k) &&
+                ggml_is_contiguous(delta) && ggml_is_contiguous(g));
+
+    const int64_t S_v = state->ne[0];
+    const int64_t H = state->ne[2];
+    const int64_t n_seqs = state->ne[3];
+    const int64_t H_k = k->ne[1];
+    const int64_t n_tokens = k->ne[2];
+    GGML_ASSERT(state->ne[1] == S_v && delta->ne[0] == S_v && delta->ne[1] == H);
+    GGML_ASSERT(delta->ne[2] == n_tokens && delta->ne[3] == n_seqs);
+    GGML_ASSERT(k->ne[0] == S_v && k->ne[3] == n_seqs && H % H_k == 0);
+    GGML_ASSERT((g->ne[0] == 1 || g->ne[0] == S_v) && g->ne[1] == H &&
+                g->ne[2] == n_tokens && g->ne[3] == n_seqs);
+    GGML_ASSERT(n_undo >= 0 && n_undo <= n_tokens);
+
+    cudaEvent_t start;
+    cudaEvent_t stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+    CUDA_CHECK(cudaEventRecord(start, cudaStreamPerThread));
+
+    if (g->ne[0] == S_v) {
+        launch_gated_delta_net_undo<true>((float *) state->data, (const float *) k->data,
+                (const float *) delta->data, (const float *) g->data,
+                S_v, H, H_k, n_tokens, n_seqs, n_undo, cudaStreamPerThread);
+    } else {
+        launch_gated_delta_net_undo<false>((float *) state->data, (const float *) k->data,
+                (const float *) delta->data, (const float *) g->data,
+                S_v, H, H_k, n_tokens, n_seqs, n_undo, cudaStreamPerThread);
+    }
+
+    CUDA_CHECK(cudaEventRecord(stop, cudaStreamPerThread));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+    if (elapsed_ms) {
+        CUDA_CHECK(cudaEventElapsedTime(elapsed_ms, start, stop));
+    }
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+    return true;
 }

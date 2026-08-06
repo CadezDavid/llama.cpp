@@ -215,6 +215,15 @@ extern "C" {
     typedef ggml_backend_buffer_type_t * (*ggml_backend_dev_get_extra_bufts_t)(ggml_backend_dev_t device);
     // Set the abort callback for the backend
     typedef void                         (*ggml_backend_set_abort_callback_t)(ggml_backend_t backend, ggml_abort_callback abort_callback, void * abort_callback_data);
+
+    // Experimental CUDA hook for validating reversible gated-delta state updates.
+    typedef bool (*ggml_backend_gated_delta_net_undo_t)(
+            struct ggml_tensor       * state,
+            const struct ggml_tensor * k,
+            const struct ggml_tensor * delta,
+            const struct ggml_tensor * g,
+            int64_t                    n_undo,
+            float                    * elapsed_ms);
     // Get a list of feature flags supported by the backend (returns a NULL-terminated array)
     struct ggml_backend_feature {
         const char * name;

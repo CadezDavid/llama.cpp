@@ -2618,6 +2618,20 @@ extern "C" {
             struct ggml_tensor  * state,
             int64_t               K);
 
+    // Experimental variant used to validate reversible recurrent-state updates.
+    // When log_delta is true, the output appends the per-token delta vectors after
+    // the attention scores and K state snapshots.
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_ext(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state,
+            int64_t               K,
+            bool                  log_delta);
+
     // DSA lightning indexer
     //
     // q:       [n_embd_idx, n_head_idx, n_batch, ne3 ]
